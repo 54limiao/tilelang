@@ -28,6 +28,7 @@ from .loop import (
 )
 from .frame import has_let_value, get_let_value  # noqa: F401
 from .math_intrinsics import *  # noqa: F401
+from . import fix as fix  # noqa: F401
 from .kernel import (
     Kernel,  # noqa: F401
     ClusterKernel,  # noqa: F401
