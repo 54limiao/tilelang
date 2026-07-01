@@ -42,6 +42,10 @@ def dequant_qkv(trace):
     return q, k, v
 
 
+def dequant_rows(q, scale):
+    return q.float() * scale.float()[:, None] / Q15_16
+
+
 def attach_dequant_fp(weights: Qwen3BlockWeights):
     for name in ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"):
         packed = getattr(weights, name)
@@ -88,6 +92,16 @@ def main():
     qdq = dequant_qkv(itrace)
     for name, value in zip(("q_qdq", "k_qdq", "v_qdq"), qdq):
         base = name[:1]
+        cos, mse, rel = metrics(value, ftrace[base])
+        print(f"{name:14s} cos={cos:.8f} mse={mse:.8e} rel_mse={rel:.8e}")
+        cos, mse, rel = metrics(value, itrace[base])
+        print(f"{name + '_loss':14s} cos={cos:.8f} mse={mse:.8e} rel_mse={rel:.8e}")
+    for name, q_name, s_name, base in (
+        ("attn_qdq", "attn8", "attn_s8", "attn"),
+        ("post_qdq", "post8", "post_s8", "post_rms"),
+        ("gated_qdq", "gated8", "gated_s8", "gated"),
+    ):
+        value = dequant_rows(itrace[q_name], itrace[s_name])
         cos, mse, rel = metrics(value, ftrace[base])
         print(f"{name:14s} cos={cos:.8f} mse={mse:.8e} rel_mse={rel:.8e}")
         cos, mse, rel = metrics(value, itrace[base])

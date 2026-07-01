@@ -184,6 +184,8 @@ The split attention sub-trace compares `softmax_i16` and `pv_i16v8` against torc
 
 Current q/k/v QDQ loss is also small. On layer 1, `q_qdq_loss rel_mse=5.37294778e-04`, `k_qdq_loss rel_mse=1.07717264e-04`, and `v_qdq_loss rel_mse=8.31166573e-04`, while the pre-quant q/k/v tensors are already at `2-4%` rel_mse. That points to accumulated hidden-state error before q/k/v quantization rather than bad static q/k/v scales.
 
+Current MLP-side QDQ split shows the same pattern. On layer 1, `attn_qdq_loss rel_mse=4.93896310e-04` and `post_qdq_loss rel_mse=1.12665730e-04`, while `gated rel_mse=8.93671289e-02` and `gated_qdq_loss rel_mse=1.29515920e-02`. The next quality target is therefore the fixed-point SiLU/gate-up product path, not the surrounding dynamic quantization.
+
 Current same-machine single-layer 2048-token-class profile baseline (`--warmup 1 --repeat 5`):
 
 ```text
