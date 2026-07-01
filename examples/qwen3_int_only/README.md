@@ -2,7 +2,7 @@
 
 This example runs a Qwen3-0.6B inference path using Q15.16 activations, per-token dynamic quantization, int8 per-channel weights, int8 attention, and integer TileLang kernels for the default path.
 
-The committed TileLang path is W8A8: dynamic quant, int8 GEMM, fused Q15 RMSNorm, RoPE/R3, SiLU+mul+dynamic-quant, fixed-point attention with GQA/cache, fused attention residual+RMSNorm, and paired gate/up projection.
+The committed TileLang path is W8A8: dynamic quant, fused q/k/v int8 GEMM, fused Q15 RMSNorm, RoPE/R3, SiLU+mul+dynamic-quant, fixed-point attention with GQA/cache, fused attention residual+RMSNorm, and paired gate/up projection.
 
 The expected local model path is:
 
@@ -64,11 +64,9 @@ attention_i8_fixed     avg=102.163 ms total=510.814 ms 98.46%
 gate_up_proj_i8        avg=0.306 ms   total=1.528 ms   0.29%
 down_proj_i8           avg=0.168 ms   total=0.838 ms   0.16%
 o_proj_i8              avg=0.124 ms   total=0.618 ms   0.12%
-q_proj_i8              avg=0.120 ms   total=0.599 ms   0.12%
+qkv_proj_i8            avg=0.263 ms   total=1.315 ms   0.25%
 rms_q_q15              avg=0.088 ms   total=0.441 ms   0.08%
 silu_mul_dq8_mid       avg=0.080 ms   total=0.402 ms   0.08%
-k_proj_i8              avg=0.074 ms   total=0.372 ms   0.07%
 dq8_attn               avg=0.070 ms   total=0.349 ms   0.07%
-v_proj_i8              avg=0.069 ms   total=0.344 ms   0.07%
 total                  518.792 ms
 ```

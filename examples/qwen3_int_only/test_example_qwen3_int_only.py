@@ -21,6 +21,7 @@ from examples.qwen3_int_only.kernels import (
     flash_attention_i8_q15_16_gqa,
     flash_attention_i8_q15_16_gqa_cache,
     linear_dynamic_int8_pair_q15_16,
+    linear_dynamic_int8_qkv_q15_16,
     linear_dynamic_int8_q15_16,
     rope_rotate_q15_16,
     rmsnorm_q15_16_grouped_weighted,
@@ -143,6 +144,26 @@ def test_linear_i8_pair_tiled():
     ref1 = (acc1 >> 8) * ((xs[:, None].int() * ws1[None, :].int()) >> 8)
     torch.testing.assert_close(y0.to(torch.int64), ref0.to(torch.int64), rtol=0, atol=0)
     torch.testing.assert_close(y1.to(torch.int64), ref1.to(torch.int64), rtol=0, atol=0)
+
+
+@tilelang.testing.requires_cuda
+def test_linear_i8_qkv_matches_unfused():
+    torch.manual_seed(0)
+    rows, in_features, q_features, kv_features = 16, 64, 64, 32
+    x = torch.randint(-128, 127, (rows, in_features), device="cuda", dtype=torch.int8)
+    xs = torch.randint(1, 256, (rows,), device="cuda", dtype=torch.uint32)
+    wq = torch.randint(-128, 127, (q_features, in_features), device="cuda", dtype=torch.int8)
+    wk = torch.randint(-128, 127, (kv_features, in_features), device="cuda", dtype=torch.int8)
+    wv = torch.randint(-128, 127, (kv_features, in_features), device="cuda", dtype=torch.int8)
+    wsq = torch.randint(1, 512, (q_features,), device="cuda", dtype=torch.uint32)
+    wsk = torch.randint(1, 512, (kv_features,), device="cuda", dtype=torch.uint32)
+    wsv = torch.randint(1, 512, (kv_features,), device="cuda", dtype=torch.uint32)
+    q, k, v = compile_kernel(linear_dynamic_int8_qkv_q15_16(rows, in_features, q_features, kv_features), [8, 9, 10])(x, xs, wq, wsq, wk, wsk, wv, wsv)
+    ref_q = compile_kernel(linear_dynamic_int8_q15_16(rows, in_features, q_features), [4])(x, xs, wq, wsq)
+    ref_k, ref_v = compile_kernel(linear_dynamic_int8_pair_q15_16(rows, in_features, kv_features), [6, 7])(x, xs, wk, wsk, wv, wsv)
+    torch.testing.assert_close(q, ref_q, rtol=0, atol=0)
+    torch.testing.assert_close(k, ref_k, rtol=0, atol=0)
+    torch.testing.assert_close(v, ref_v, rtol=0, atol=0)
 
 
 @tilelang.testing.requires_cuda

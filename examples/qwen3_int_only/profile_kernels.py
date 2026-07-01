@@ -52,9 +52,12 @@ def run_block(block, x_q15_16, weights, cos_q15_16, sin_q15_16, r3_q15, prof):
     seq_len = block.seq_len
     norm = prof.time("rms_input_q15", lambda: block.rms_hidden_q15(x_q15_16, weights.input_layernorm, block.lut_rsqrt))
     x8, xs8 = prof.time("dq8_hidden", lambda: block.dq8_hidden(norm))
-    q = prof.time("q_proj_i8", lambda: block.q_proj(x8, xs8, weights.q_proj.weight, weights.q_proj.scale))
-    k = prof.time("k_proj_i8", lambda: block.k_proj(x8, xs8, weights.k_proj.weight, weights.k_proj.scale))
-    v = prof.time("v_proj_i8", lambda: block.v_proj(x8, xs8, weights.v_proj.weight, weights.v_proj.scale))
+    q, k, v = prof.time(
+        "qkv_proj_i8",
+        lambda: block.qkv_proj_i8(
+            x8, xs8, weights.q_proj.weight, weights.q_proj.scale, weights.k_proj.weight, weights.k_proj.scale, weights.v_proj.weight, weights.v_proj.scale
+        ),
+    )
     v_heads = v.reshape(seq_len * cfg.num_key_value_heads, cfg.head_dim)
     q_heads = prof.time("rms_q_q15", lambda: block.rms_q_q15(q, weights.q_norm, block.lut_rsqrt))
     k_heads = prof.time("rms_k_q15", lambda: block.rms_k_q15(k, weights.k_norm, block.lut_rsqrt))

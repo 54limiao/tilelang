@@ -17,6 +17,7 @@ from examples.qwen3_int_only.kernels import (
     flash_attention_i8_q15_16_gqa,
     flash_attention_i8_q15_16_gqa_cache,
     linear_dynamic_int8_pair_q15_16,
+    linear_dynamic_int8_qkv_q15_16,
     linear_dynamic_int8_q15_16,
     rmsnorm_q15_16_grouped_weighted,
     rmsnorm_q15_16_weighted,
@@ -267,9 +268,7 @@ class Qwen3IntOnlyBlock:
         self.dq8_q_head = compile_kernel(dynamic_quant_q15_16(seq_len * qh, hd, "int8"), [1, 2])
         self.dq8_kv_head = compile_kernel(dynamic_quant_q15_16(seq_len * kvh, hd, "int8"), [1, 2])
         self.dq8_q = compile_kernel(dynamic_quant_q15_16(seq_len, q_dim, "int8"), [1, 2])
-        self.q_proj = compile_kernel(linear_dynamic_int8_q15_16(seq_len, h, q_dim), [4])
-        self.k_proj = compile_kernel(linear_dynamic_int8_q15_16(seq_len, h, kv_dim), [4])
-        self.v_proj = compile_kernel(linear_dynamic_int8_q15_16(seq_len, h, kv_dim), [4])
+        self.qkv_proj_i8 = compile_kernel(linear_dynamic_int8_qkv_q15_16(seq_len, h, q_dim, kv_dim), [8, 9, 10])
         self.o_proj = compile_kernel(linear_dynamic_int8_q15_16(seq_len, q_dim, h), [4])
         self.gate_up_proj_i8 = compile_kernel(linear_dynamic_int8_pair_q15_16(seq_len, h, im), [6, 7])
         self.down_proj_i8 = compile_kernel(linear_dynamic_int8_q15_16(seq_len, im, h), [4])
@@ -288,9 +287,9 @@ class Qwen3IntOnlyBlock:
     def __call__(self, x_q15_16, weights: Qwen3BlockWeights, cos_q15_16, sin_q15_16, cache_k=None, cache_v=None, r3_q15=None):
         norm = self.rms_hidden_q15(x_q15_16, weights.input_layernorm, self.lut_rsqrt)
         x8, xs8 = self.dq8_hidden(norm)
-        q = self.q_proj(x8, xs8, weights.q_proj.weight, weights.q_proj.scale)
-        k = self.k_proj(x8, xs8, weights.k_proj.weight, weights.k_proj.scale)
-        v = self.v_proj(x8, xs8, weights.v_proj.weight, weights.v_proj.scale)
+        q, k, v = self.qkv_proj_i8(
+            x8, xs8, weights.q_proj.weight, weights.q_proj.scale, weights.k_proj.weight, weights.k_proj.scale, weights.v_proj.weight, weights.v_proj.scale
+        )
         v_heads = v.reshape(self.seq_len * self.config.num_key_value_heads, self.config.head_dim)
         q_heads = self.rms_q_q15(q, weights.q_norm, self.lut_rsqrt)
         k_heads = self.rms_k_q15(k, weights.k_norm, self.lut_rsqrt)

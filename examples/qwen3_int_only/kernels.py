@@ -420,6 +420,58 @@ def linear_dynamic_int8_pair_q15_16(rows, in_features, out_features, block_m=16,
     return main
 
 
+def linear_dynamic_int8_qkv_q15_16(rows, in_features, q_features, kv_features, block_m=16, block_n=32, block_k=64):
+    @T.prim_func
+    def main(
+        X: T.Tensor((rows, in_features), "int8"),
+        XS: T.Tensor((rows,), "uint32"),
+        WQ: T.Tensor((q_features, in_features), "int8"),
+        WSQ: T.Tensor((q_features,), "uint32"),
+        WK: T.Tensor((kv_features, in_features), "int8"),
+        WSK: T.Tensor((kv_features,), "uint32"),
+        WV: T.Tensor((kv_features, in_features), "int8"),
+        WSV: T.Tensor((kv_features,), "uint32"),
+        Q: T.Tensor((rows, q_features), "int32"),
+        K: T.Tensor((rows, kv_features), "int32"),
+        V: T.Tensor((rows, kv_features), "int32"),
+    ):
+        with T.Kernel(T.ceildiv(q_features, block_n), T.ceildiv(rows, block_m), threads=128) as (bo, br):
+            x_shared = T.alloc_shared((block_m, block_k), "int8")
+            wq_shared = T.alloc_shared((block_n, block_k), "int8")
+            wk_shared = T.alloc_shared((block_n, block_k), "int8")
+            wv_shared = T.alloc_shared((block_n, block_k), "int8")
+            acc_q = T.alloc_fragment((block_m, block_n), "int32")
+            acc_k = T.alloc_fragment((block_m, block_n), "int32")
+            acc_v = T.alloc_fragment((block_m, block_n), "int32")
+            T.clear(acc_q)
+            T.clear(acc_k)
+            T.clear(acc_v)
+            for ko in T.Pipelined(in_features // block_k, num_stages=2):
+                T.copy(X[br * block_m, ko * block_k], x_shared)
+                T.copy(WQ[bo * block_n, ko * block_k], wq_shared)
+                if bo * block_n < kv_features:
+                    T.copy(WK[bo * block_n, ko * block_k], wk_shared)
+                    T.copy(WV[bo * block_n, ko * block_k], wv_shared)
+                T.gemm(x_shared, wq_shared, acc_q, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+                if bo * block_n < kv_features:
+                    T.gemm(x_shared, wk_shared, acc_k, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+                    T.gemm(x_shared, wv_shared, acc_v, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+
+            for m, n in T.Parallel(block_m, block_n):
+                Q[br * block_m + m, bo * block_n + n] = (
+                    (acc_q[m, n] >> T.int32(8)) * T.cast((XS[br * block_m + m] * WSQ[bo * block_n + n]) >> T.int32(8), "int32")
+                )
+                if bo * block_n + n < kv_features:
+                    K[br * block_m + m, bo * block_n + n] = (
+                        (acc_k[m, n] >> T.int32(8)) * T.cast((XS[br * block_m + m] * WSK[bo * block_n + n]) >> T.int32(8), "int32")
+                    )
+                    V[br * block_m + m, bo * block_n + n] = (
+                        (acc_v[m, n] >> T.int32(8)) * T.cast((XS[br * block_m + m] * WSV[bo * block_n + n]) >> T.int32(8), "int32")
+                    )
+
+    return main
+
+
 def flash_attention_i8_q15_16(batch, seqlen, dim, block_n=64, score_shift=26, lut_scale=0.125):
     @T.prim_func
     def main(
