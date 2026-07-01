@@ -9,7 +9,7 @@ from safetensors.torch import load_file
 
 from examples.qwen3_int_only.kernels import (
     Q15_16,
-    add_dynamic_quant_q15_16,
+    add_rmsnorm_q15_16_weighted,
     add_q15_16,
     compile_kernel,
     dynamic_quant_q15_16,
@@ -18,7 +18,6 @@ from examples.qwen3_int_only.kernels import (
     flash_attention_i8_q15_16_gqa_cache,
     linear_dynamic_int8_pair_q15_16,
     linear_dynamic_int8_q15_16,
-    mul_q15_16,
     rmsnorm_i16_q15_16_weighted,
     rmsnorm_q15_16_weighted,
     rope_rotate_q15_16,
@@ -26,7 +25,6 @@ from examples.qwen3_int_only.kernels import (
     rsqrt_lut,
     sigmoid_lut,
     silu_mul_dynamic_quant_q15_16,
-    silu_q15_16,
 )
 from examples.qwen3_int_only.quarot import ROTATE_SEED, random_hadamard_rotation
 
@@ -261,18 +259,16 @@ class Qwen3IntOnlyBlock:
         h, hd, im = config.hidden_size, config.head_dim, config.intermediate_size
         qh, kvh = config.num_attention_heads, config.num_key_value_heads
         q_dim, kv_dim = config.q_size, config.kv_size
-        self.rms_hidden_dyn = compile_kernel(rmsnorm_i16_q15_16_weighted(seq_len, h), [3])
         self.rms_hidden_q15 = compile_kernel(rmsnorm_q15_16_weighted(seq_len, h), [3])
+        self.add_rms_hidden_q15 = compile_kernel(add_rmsnorm_q15_16_weighted(seq_len, h), [4, 5])
         self.rms_q_dyn = compile_kernel(rmsnorm_i16_q15_16_weighted(seq_len * qh, hd), [3])
         self.rms_k_dyn = compile_kernel(rmsnorm_i16_q15_16_weighted(seq_len * kvh, hd), [3])
         self.dq8_hidden = compile_kernel(dynamic_quant_q15_16(seq_len, h, "int8"), [1, 2])
         self.dq8_q_head = compile_kernel(dynamic_quant_q15_16(seq_len * qh, hd, "int8"), [1, 2])
         self.dq8_kv_head = compile_kernel(dynamic_quant_q15_16(seq_len * kvh, hd, "int8"), [1, 2])
-        self.dq16_hidden_norm = compile_kernel(dynamic_quant_q15_16(seq_len, h, "int16", 4095), [1, 2])
         self.dq16_q_norm = compile_kernel(dynamic_quant_q15_16(seq_len, q_dim, "int16", 4095), [1, 2])
         self.dq16_kv_norm = compile_kernel(dynamic_quant_q15_16(seq_len, kv_dim, "int16", 4095), [1, 2])
         self.dq8_q = compile_kernel(dynamic_quant_q15_16(seq_len, q_dim, "int8"), [1, 2])
-        self.dq8_mid = compile_kernel(dynamic_quant_q15_16(seq_len, im, "int8"), [1, 2])
         self.q_proj = compile_kernel(linear_dynamic_int8_q15_16(seq_len, h, q_dim), [4])
         self.k_proj = compile_kernel(linear_dynamic_int8_q15_16(seq_len, h, kv_dim), [4])
         self.v_proj = compile_kernel(linear_dynamic_int8_q15_16(seq_len, h, kv_dim), [4])
@@ -281,11 +277,8 @@ class Qwen3IntOnlyBlock:
         self.down_proj_i8 = compile_kernel(linear_dynamic_int8_q15_16(seq_len, im, h), [4])
         self.rope_q = compile_kernel(rope_rotate_q15_16(seq_len * qh, hd), [4]) if use_r3 else compile_kernel(rope_q15_16(seq_len * qh, hd), [3])
         self.rope_k = compile_kernel(rope_rotate_q15_16(seq_len * kvh, hd), [4]) if use_r3 else compile_kernel(rope_q15_16(seq_len * kvh, hd), [3])
-        self.silu_mid = compile_kernel(silu_q15_16(seq_len, im), [2])
-        self.mul_mid = compile_kernel(mul_q15_16(seq_len, im), [2])
         self.silu_mul_dq8_mid = compile_kernel(silu_mul_dynamic_quant_q15_16(seq_len, im), [3, 4, 5])
         self.add_hidden = compile_kernel(add_q15_16(seq_len, h), [2])
-        self.add_dq16_hidden = compile_kernel(add_dynamic_quant_q15_16(seq_len, h), [2, 3, 4])
         self.attn_i8_fixed = compile_kernel(flash_attention_i8_q15_16_gqa(qh, kvh, seq_len, hd), [7])
         self.attn_i8_fixed_cache = None
         if cache_len:
@@ -335,8 +328,7 @@ class Qwen3IntOnlyBlock:
         attn = attn.permute(1, 0, 2).reshape(self.seq_len, self.config.q_size)
         attn8, attn_s8 = self.dq8_q(attn)
         attn_out = self.o_proj(attn8, attn_s8, weights.o_proj.weight, weights.o_proj.scale)
-        h, h_norm16, _ = self.add_dq16_hidden(x_q15_16, attn_out)
-        post = self.rms_hidden_dyn(h_norm16, weights.post_attention_layernorm, self.lut_rsqrt)
+        h, post = self.add_rms_hidden_q15(x_q15_16, attn_out, weights.post_attention_layernorm, self.lut_rsqrt)
         h8, hs8 = self.dq8_hidden(post)
         gate, up = self.gate_up_proj_i8(h8, hs8, weights.gate_proj.weight, weights.gate_proj.scale, weights.up_proj.weight, weights.up_proj.scale)
         gated, gated8, gs8 = self.silu_mul_dq8_mid(gate, up, self.lut_sigmoid)

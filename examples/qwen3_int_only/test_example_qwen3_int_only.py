@@ -11,6 +11,7 @@ from examples.qwen3_int_only.kernels import (
     MASK,
     Q_MULTIPLIER_WIDTH,
     add_dynamic_quant_q15_16,
+    add_rmsnorm_q15_16_weighted,
     add_q15_16,
     compile_kernel,
     dynamic_quant_q15_16,
@@ -27,8 +28,6 @@ from examples.qwen3_int_only.kernels import (
     rsqrt_lut,
     sigmoid_lut,
     silu_mul_dynamic_quant_q15_16,
-    silu_q15_16,
-    mul_q15_16,
 )
 
 
@@ -95,6 +94,21 @@ def test_add_dynamic_quant_i16_matches_unfused():
     torch.testing.assert_close(y, ref_y, rtol=0, atol=0)
     torch.testing.assert_close(q, ref_q, rtol=0, atol=0)
     torch.testing.assert_close(s, ref_s, rtol=0, atol=0)
+
+
+@tilelang.testing.requires_cuda
+def test_add_rmsnorm_q15_matches_unfused():
+    torch.manual_seed(0)
+    rows, cols = 5, 128
+    a = torch.randint(-180000, 180001, (rows, cols), device="cuda", dtype=torch.int32)
+    b = torch.randint(-180000, 180001, (rows, cols), device="cuda", dtype=torch.int32)
+    wq = q15((torch.randn(cols, device="cuda") * 0.03 + 1.0).clamp(0.8, 1.2))
+    lut = torch.from_numpy(rsqrt_lut()).cuda()
+    y, n = compile_kernel(add_rmsnorm_q15_16_weighted(rows, cols), [4, 5])(a, b, wq, lut)
+    ref_y, ref_q, _ = compile_kernel(add_dynamic_quant_q15_16(rows, cols), [2, 3, 4])(a, b)
+    ref_n = compile_kernel(rmsnorm_i16_q15_16_weighted(rows, cols), [3])(ref_q, wq, lut)
+    torch.testing.assert_close(y, ref_y, rtol=0, atol=0)
+    torch.testing.assert_close(n, ref_n, rtol=0, atol=0)
 
 
 @tilelang.testing.requires_cuda
@@ -321,18 +335,6 @@ def test_attention_i8_q15_16_gqa_cache_matches_repeated_kv():
 
 
 @tilelang.testing.requires_cuda
-def test_silu_q15_16_sigmoid_lut():
-    rows, cols = 2, 64
-    x = torch.linspace(-9.0, 9.0, rows * cols, device="cuda").reshape(rows, cols)
-    xq = q15(x)
-    lut = torch.from_numpy(sigmoid_lut()).cuda()
-    y = compile_kernel(silu_q15_16(rows, cols), [2])(xq, lut)
-    sig = fix_lut_10bit(xq, lut, 1.0 / 1024.0)
-    ref = (xq >> 10) * sig
-    torch.testing.assert_close(y, ref, rtol=0, atol=0)
-
-
-@tilelang.testing.requires_cuda
 def test_silu_mul_dynamic_quant_matches_unfused():
     torch.manual_seed(0)
     rows, cols = 3, 64
@@ -340,8 +342,7 @@ def test_silu_mul_dynamic_quant_matches_unfused():
     up = torch.randint(-300000, 300001, (rows, cols), device="cuda", dtype=torch.int32)
     lut = torch.from_numpy(sigmoid_lut()).cuda()
     y, q, s = compile_kernel(silu_mul_dynamic_quant_q15_16(rows, cols), [3, 4, 5])(gate, up, lut)
-    silu = compile_kernel(silu_q15_16(rows, cols), [2])(gate, lut)
-    ref_y = compile_kernel(mul_q15_16(rows, cols), [2])(silu, up)
+    ref_y = ((((gate >> 10) * fix_lut_10bit(gate, lut, 1.0 / 1024.0)) >> 8) * (up >> 8)).to(torch.int32)
     ref_q, ref_s = compile_kernel(dynamic_quant_q15_16(rows, cols, "int8"), [1, 2])(ref_y)
     torch.testing.assert_close(y, ref_y, rtol=0, atol=0)
     torch.testing.assert_close(q, ref_q, rtol=0, atol=0)

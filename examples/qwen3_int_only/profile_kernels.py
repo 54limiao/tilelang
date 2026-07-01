@@ -85,8 +85,7 @@ def run_block(block, x_q15_16, weights, cos_q15_16, sin_q15_16, r3_q15, prof):
     attn = attn.permute(1, 0, 2).reshape(seq_len, cfg.q_size)
     attn8, attn_s8 = prof.time("dq8_attn", lambda: block.dq8_q(attn))
     attn_out = prof.time("o_proj_i8", lambda: block.o_proj(attn8, attn_s8, weights.o_proj.weight, weights.o_proj.scale))
-    h, h_norm16, _ = prof.time("residual_attn_dq16", lambda: block.add_dq16_hidden(x_q15_16, attn_out))
-    post = prof.time("rms_post", lambda: block.rms_hidden_dyn(h_norm16, weights.post_attention_layernorm, block.lut_rsqrt))
+    h, post = prof.time("residual_attn_rms_q15", lambda: block.add_rms_hidden_q15(x_q15_16, attn_out, weights.post_attention_layernorm, block.lut_rsqrt))
     h8, hs8 = prof.time("dq8_hidden_mlp", lambda: block.dq8_hidden(post))
     gate, up = prof.time(
         "gate_up_proj_i8",

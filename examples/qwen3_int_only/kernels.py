@@ -87,6 +87,65 @@ def add_dynamic_quant_q15_16(rows, cols, qmax=4095):
     return main
 
 
+def add_rmsnorm_q15_16_weighted(rows, cols, qmax=4095):
+    mean_shift = int(math.log2(cols))
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((rows, cols), "int32"),
+        B: T.Tensor((rows, cols), "int32"),
+        W: T.Tensor((cols,), "int32"),
+        RLUT: T.Tensor((1024,), "int16"),
+        Y: T.Tensor((rows, cols), "int32"),
+        N: T.Tensor((rows, cols), "int32"),
+    ):
+        with T.Kernel(rows, threads=128) as r:
+            q = T.alloc_fragment((1, cols), "int32")
+            xx = T.alloc_fragment((1, cols), "int32")
+            amax = T.alloc_fragment((1,), "int32")
+            scale = T.alloc_fragment((1,), "int32")
+            ss = T.alloc_fragment((1,), "int32")
+            ns = T.alloc_fragment((1,), "int32")
+            wk = T.alloc_fragment((1,), "int32")
+            inv = T.alloc_fragment((1,), "int32")
+            fold = T.alloc_fragment((1,), "int32")
+            qt = T.alloc_fragment((1,), "int32")
+            norm = T.alloc_fragment((cols,), "int32")
+            for c in T.Parallel(cols):
+                Y[r, c] = A[r, c] + B[r, c]
+                q[0, c] = Y[r, c]
+                if q[0, c] < T.int32(0):
+                    q[0, c] = T.int32(0) - q[0, c]
+            T.reduce_max(q, amax, dim=1, clear=True)
+            scale[0] = T.max(amax[0] // T.int32(qmax), T.int32(1))
+            for c in T.Parallel(cols):
+                q[0, c] = T.min(T.max(Y[r, c] // scale[0], T.int32(0 - qmax - 1)), T.int32(qmax))
+                xx[0, c] = (q[0, c] * q[0, c]) >> T.int32(mean_shift)
+            T.reduce_sum(xx, ss, dim=1, clear=True)
+            ss[0] += T.int32(1)
+            ns[0] = T.int32(0)
+            wk[0] = ss[0]
+            if (wk[0] & T.int32(-65536)) != T.int32(0):
+                ns[0] += T.int32(16)
+                wk[0] = wk[0] >> T.int32(16)
+            if (wk[0] & T.int32(0xFF00)) != T.int32(0):
+                ns[0] += T.int32(8)
+                wk[0] = wk[0] >> T.int32(8)
+            if (wk[0] & T.int32(0xF0)) != T.int32(0):
+                ns[0] += T.int32(4)
+                wk[0] = wk[0] >> T.int32(4)
+            if (wk[0] & T.int32(0xC)) != T.int32(0):
+                ns[0] += T.int32(2)
+            inv[0] = T.fix.lut_10bit(ss[0], RLUT, scale=(ns[0] << T.int32(Q_MULTIPLIER_WIDTH)) | T.int32(128), out_dtype="int32")
+            fold[0] = T.fix.quant(inv[0], scale=1024.0, out_dtype="int32")
+            qt[0] = ((T.int32(6) + (ns[0] >> T.int32(1))) << T.int32(Q_MULTIPLIER_WIDTH)) | ((fold[0] >> T.int32(4)) & T.int32(MASK))
+            for c in T.Parallel(cols):
+                norm[c] = T.fix.quant(q[0, c], scale=qt[0], out_dtype="int32")
+                N[r, c] = (norm[c] * (W[c] >> T.int32(8))) >> T.int32(2)
+
+    return main
+
+
 def rope_q15_16(rows, dim):
     @T.prim_func
     def main(
@@ -241,18 +300,6 @@ def rmsnorm_q15_16_weighted(rows, cols, qmax=4095):
     return main
 
 
-def silu_q15_16(rows, cols):
-    @T.prim_func
-    def main(X: T.Tensor((rows, cols), "int32"), LUT: T.Tensor((1024,), "int32"), Y: T.Tensor((rows, cols), "int32")):
-        with T.Kernel(rows, threads=128) as r:
-            sig = T.alloc_fragment((1, cols), "int32")
-            for c in T.Parallel(cols):
-                sig[0, c] = T.fix.lut_10bit(X[r, c], LUT, scale=1.0 / 1024.0, out_dtype="int32")
-                Y[r, c] = (X[r, c] >> T.int32(10)) * sig[0, c]
-
-    return main
-
-
 def silu_mul_dynamic_quant_q15_16(rows, cols):
     @T.prim_func
     def main(
@@ -290,16 +337,6 @@ def add_q15_16(rows, cols):
         with T.Kernel(rows, threads=128) as r:
             for c in T.Parallel(cols):
                 Y[r, c] = A[r, c] + B[r, c]
-
-    return main
-
-
-def mul_q15_16(rows, cols):
-    @T.prim_func
-    def main(A: T.Tensor((rows, cols), "int32"), B: T.Tensor((rows, cols), "int32"), Y: T.Tensor((rows, cols), "int32")):
-        with T.Kernel(rows, threads=128) as r:
-            for c in T.Parallel(cols):
-                Y[r, c] = ((A[r, c] >> T.int32(8)) * (B[r, c] >> T.int32(8)))
 
     return main
 
