@@ -78,16 +78,52 @@ backend=int-only tokens=1902 loss=3.317960 ppl=27.603982
 backend=int-only --split-attn tokens=1902 loss=3.361184 ppl=28.823308
 ```
 
-Current same-machine single-layer 2048-token-class profile baseline:
+Current same-machine single-layer 2048-token-class profile baseline (`--warmup 1 --repeat 5`):
 
 ```text
 default attention:
-attention_i8_fixed     avg=1.757 ms
-attention_norm         avg=0.049 ms
-total                  8.947 ms
+attention_i8_fixed     avg=   1.767 ms total=    8.834 ms  54.14%
+gate_up_proj_i8        avg=   0.187 ms total=    0.934 ms   5.73%
+qkv_proj_i8            avg=   0.171 ms total=    0.856 ms   5.24%
+down_proj_i8           avg=   0.121 ms total=    0.603 ms   3.70%
+o_proj_i8              avg=   0.107 ms total=    0.534 ms   3.27%
+rms_q_q15              avg=   0.095 ms total=    0.474 ms   2.90%
+residual_attn_rms_q15  avg=   0.087 ms total=    0.433 ms   2.65%
+silu_mul_dq8_mid       avg=   0.079 ms total=    0.394 ms   2.42%
+dq8_hidden_mlp         avg=   0.075 ms total=    0.376 ms   2.31%
+dq8_attn               avg=   0.075 ms total=    0.374 ms   2.29%
+attention_norm         avg=   0.074 ms total=    0.372 ms   2.28%
+dq8_q_head             avg=   0.062 ms total=    0.312 ms   1.91%
+rope_q                 avg=   0.059 ms total=    0.295 ms   1.81%
+rms_k_q15              avg=   0.056 ms total=    0.280 ms   1.72%
+rms_input_q15          avg=   0.051 ms total=    0.253 ms   1.55%
+dq8_kv_head            avg=   0.044 ms total=    0.219 ms   1.34%
+dq8_v_head             avg=   0.042 ms total=    0.208 ms   1.27%
+rope_k                 avg=   0.040 ms total=    0.199 ms   1.22%
+dq8_hidden             avg=   0.039 ms total=    0.197 ms   1.20%
+residual_mlp           avg=   0.034 ms total=    0.172 ms   1.06%
+total                     16.318 ms
 
 split attention:
-attention_softmax_i16  avg=0.510 ms
-attention_i16v8        avg=0.358 ms
-total                  6.168 ms
+attention_softmax_i16  avg=   0.522 ms total=    2.608 ms  24.95%
+attention_i16v8        avg=   0.361 ms total=    1.804 ms  17.26%
+gate_up_proj_i8        avg=   0.171 ms total=    0.856 ms   8.19%
+qkv_proj_i8            avg=   0.166 ms total=    0.829 ms   7.93%
+down_proj_i8           avg=   0.117 ms total=    0.586 ms   5.60%
+rms_q_q15              avg=   0.092 ms total=    0.462 ms   4.42%
+o_proj_i8              avg=   0.089 ms total=    0.445 ms   4.26%
+silu_mul_dq8_mid       avg=   0.072 ms total=    0.362 ms   3.46%
+dq8_q_head             avg=   0.057 ms total=    0.283 ms   2.71%
+rope_q                 avg=   0.055 ms total=    0.277 ms   2.65%
+rms_k_q15              avg=   0.052 ms total=    0.262 ms   2.50%
+rms_input_q15          avg=   0.046 ms total=    0.228 ms   2.18%
+dq8_kv_head            avg=   0.041 ms total=    0.203 ms   1.94%
+residual_attn_rms_q15  avg=   0.040 ms total=    0.198 ms   1.89%
+dq8_v_head             avg=   0.038 ms total=    0.192 ms   1.84%
+dq8_attn               avg=   0.037 ms total=    0.187 ms   1.79%
+rope_k                 avg=   0.037 ms total=    0.184 ms   1.76%
+dq8_hidden             avg=   0.035 ms total=    0.175 ms   1.67%
+dq8_hidden_mlp         avg=   0.033 ms total=    0.164 ms   1.57%
+residual_mlp           avg=   0.030 ms total=    0.149 ms   1.43%
+total                     10.453 ms
 ```
