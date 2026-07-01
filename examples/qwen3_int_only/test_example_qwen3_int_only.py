@@ -23,6 +23,7 @@ from examples.qwen3_int_only.kernels import (
     linear_dynamic_int8_q15_16,
     rope_rotate_q15_16,
     rmsnorm_i16_q15_16_weighted,
+    rmsnorm_q15_16_weighted,
     rsqrt_lut,
     sigmoid_lut,
     silu_mul_dynamic_quant_q15_16,
@@ -144,6 +145,19 @@ def test_rmsnorm_i16():
     ref = q15(q.float() / torch.sqrt(torch.mean(q.float() * q.float(), dim=-1, keepdim=True).clamp_min(1.0)) * w)
     rel = torch.sqrt(torch.mean((y.float() - ref.float()) ** 2)) / torch.sqrt(torch.mean(ref.float() ** 2))
     assert float(rel) < 0.012
+
+
+@tilelang.testing.requires_cuda
+def test_rmsnorm_q15_matches_dynamic_i16():
+    torch.manual_seed(0)
+    rows, cols = 6, 128
+    xq = torch.randint(-220000, 220001, (rows, cols), device="cuda", dtype=torch.int32)
+    wq = q15((torch.randn(cols, device="cuda") * 0.03 + 1.0).clamp(0.8, 1.2))
+    lut = torch.from_numpy(rsqrt_lut()).cuda()
+    y = compile_kernel(rmsnorm_q15_16_weighted(rows, cols), [3])(xq, wq, lut)
+    x16, _ = compile_kernel(dynamic_quant_q15_16(rows, cols, "int16", 4095), [1, 2])(xq)
+    ref = compile_kernel(rmsnorm_i16_q15_16_weighted(rows, cols), [3])(x16, wq, lut)
+    torch.testing.assert_close(y, ref, rtol=0, atol=0)
 
 
 @tilelang.testing.requires_cuda

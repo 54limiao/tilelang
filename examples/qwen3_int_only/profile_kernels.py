@@ -50,8 +50,7 @@ class Profiler:
 def run_block(block, x_q15_16, weights, cos_q15_16, sin_q15_16, r3_q15, prof):
     cfg = block.config
     seq_len = block.seq_len
-    x16, _ = prof.time("dq16_hidden_norm_0", lambda: block.dq16_hidden_norm(x_q15_16))
-    norm = prof.time("rms_input", lambda: block.rms_hidden_dyn(x16, weights.input_layernorm, block.lut_rsqrt))
+    norm = prof.time("rms_input_q15", lambda: block.rms_hidden_q15(x_q15_16, weights.input_layernorm, block.lut_rsqrt))
     x8, xs8 = prof.time("dq8_hidden", lambda: block.dq8_hidden(norm))
     q = prof.time("q_proj_i8", lambda: block.q_proj(x8, xs8, weights.q_proj.weight, weights.q_proj.scale))
     k = prof.time("k_proj_i8", lambda: block.k_proj(x8, xs8, weights.k_proj.weight, weights.k_proj.scale))

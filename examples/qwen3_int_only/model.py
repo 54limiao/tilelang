@@ -20,6 +20,7 @@ from examples.qwen3_int_only.kernels import (
     linear_dynamic_int8_q15_16,
     mul_q15_16,
     rmsnorm_i16_q15_16_weighted,
+    rmsnorm_q15_16_weighted,
     rope_rotate_q15_16,
     rope_q15_16,
     rsqrt_lut,
@@ -261,6 +262,7 @@ class Qwen3IntOnlyBlock:
         qh, kvh = config.num_attention_heads, config.num_key_value_heads
         q_dim, kv_dim = config.q_size, config.kv_size
         self.rms_hidden_dyn = compile_kernel(rmsnorm_i16_q15_16_weighted(seq_len, h), [3])
+        self.rms_hidden_q15 = compile_kernel(rmsnorm_q15_16_weighted(seq_len, h), [3])
         self.rms_q_dyn = compile_kernel(rmsnorm_i16_q15_16_weighted(seq_len * qh, hd), [3])
         self.rms_k_dyn = compile_kernel(rmsnorm_i16_q15_16_weighted(seq_len * kvh, hd), [3])
         self.dq8_hidden = compile_kernel(dynamic_quant_q15_16(seq_len, h, "int8"), [1, 2])
@@ -293,8 +295,7 @@ class Qwen3IntOnlyBlock:
         self.lut_exp = torch.from_numpy(exp_lut_neg()).cuda()
 
     def __call__(self, x_q15_16, weights: Qwen3BlockWeights, cos_q15_16, sin_q15_16, cache_k=None, cache_v=None, r3_q15=None):
-        x16, _ = self.dq16_hidden_norm(x_q15_16)
-        norm = self.rms_hidden_dyn(x16, weights.input_layernorm, self.lut_rsqrt)
+        norm = self.rms_hidden_q15(x_q15_16, weights.input_layernorm, self.lut_rsqrt)
         x8, xs8 = self.dq8_hidden(norm)
         q = self.q_proj(x8, xs8, weights.q_proj.weight, weights.q_proj.scale)
         k = self.k_proj(x8, xs8, weights.k_proj.weight, weights.k_proj.scale)
@@ -350,7 +351,7 @@ class Qwen3IntOnlyModel:
         self.config = config
         self.r3_q15 = q15_16(random_hadamard_rotation(config.head_dim, rotate_seed + 2)) if use_r3 else None
         self.block = Qwen3IntOnlyBlock(seq_len, config, cache_len=cache_len, use_r3=use_r3)
-        self.final_norm_kernel = compile_kernel(rmsnorm_i16_q15_16_weighted(seq_len, config.hidden_size), [3])
+        self.final_norm_kernel = compile_kernel(rmsnorm_q15_16_weighted(seq_len, config.hidden_size), [3])
         self.lut_rsqrt = torch.from_numpy(rsqrt_lut()).cuda()
         self.cos, self.sin, _ = rope_tables_q15_16(seq_len + cache_len, config.head_dim, config.rope_theta)
         if packed_dir is None:
@@ -377,8 +378,7 @@ class Qwen3IntOnlyModel:
             if verbose:
                 torch.cuda.synchronize()
                 print(f"int-only layer {layer_idx} done in {time.time() - t0:.3f}s", flush=True)
-        x16, _ = self.block.dq16_hidden_norm(x)
-        return self.final_norm_kernel(x16, self.final_norm, self.lut_rsqrt)
+        return self.final_norm_kernel(x, self.final_norm, self.lut_rsqrt)
 
     def logits(self, input_ids, layers=None, verbose=False, cache_kv=None):
         h = self.hidden(input_ids, layers=layers, verbose=verbose, cache_kv=cache_kv).float() / Q15_16
