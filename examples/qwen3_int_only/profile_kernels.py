@@ -12,6 +12,7 @@ from examples.qwen3_int_only.model import (
     q15_16,
     rope_tables_q15_16,
 )
+from examples.qwen3_int_only.kernels import attention_i8_q15_16_gqa_softmax_i16, attention_i16v8_q15_16_gqa, compile_kernel
 from examples.qwen3_int_only.quarot import ROTATE_SEED, random_hadamard_rotation
 
 
@@ -47,7 +48,7 @@ class Profiler:
 
 
 @torch.no_grad()
-def run_block(block, x_q15_16, weights, cos_q15_16, sin_q15_16, r3_q15, prof):
+def run_block(block, x_q15_16, weights, cos_q15_16, sin_q15_16, r3_q15, prof, split_attn=False):
     cfg = block.config
     seq_len = block.seq_len
     norm = prof.time("rms_input_q15", lambda: block.rms_hidden_q15(x_q15_16, weights.input_layernorm, block.lut_rsqrt))
@@ -80,8 +81,16 @@ def run_block(block, x_q15_16, weights, cos_q15_16, sin_q15_16, r3_q15, prof):
     qs_attn = qs8.reshape(seq_len, cfg.num_attention_heads).permute(1, 0).contiguous()
     ks_attn = ks8.reshape(seq_len, cfg.num_key_value_heads).permute(1, 0).contiguous()
     vs_attn = vs8.reshape(seq_len, cfg.num_key_value_heads).permute(1, 0).contiguous()
-    attn = prof.time("attention_i8_fixed", lambda: block.attn_i8_fixed(q_attn, k_attn, v_attn, qs_attn, ks_attn, vs_attn, block.lut_exp))
-    attn = attn.permute(1, 0, 2).reshape(seq_len, cfg.q_size)
+    if split_attn:
+        if getattr(block, "attn_softmax_i16", None) is None:
+            block.attn_softmax_i16 = compile_kernel(attention_i8_q15_16_gqa_softmax_i16(cfg.num_attention_heads, cfg.num_key_value_heads, seq_len, cfg.head_dim), [5])
+            block.attn_i16v8 = compile_kernel(attention_i16v8_q15_16_gqa(cfg.num_attention_heads, cfg.num_key_value_heads, seq_len, cfg.head_dim), [3])
+        prob_i16 = prof.time("attention_softmax_i16", lambda: block.attn_softmax_i16(q_attn, k_attn, qs_attn, ks_attn, block.lut_exp))
+        attn = prof.time("attention_i16v8", lambda: block.attn_i16v8(prob_i16, v_attn, vs_attn))
+    else:
+        attn_num, attn_den = prof.time("attention_i8_fixed", lambda: block.attn_i8_fixed(q_attn, k_attn, v_attn, qs_attn, ks_attn, vs_attn, block.lut_exp))
+        attn = prof.time("attention_norm", lambda: block.attn_norm(attn_num, attn_den))
+        attn = attn.permute(1, 0, 2).reshape(seq_len, cfg.q_size)
     attn8, attn_s8 = prof.time("dq8_attn", lambda: block.dq8_q(attn))
     attn_out = prof.time("o_proj_i8", lambda: block.o_proj(attn8, attn_s8, weights.o_proj.weight, weights.o_proj.scale))
     h, post = prof.time("residual_attn_rms_q15", lambda: block.add_rms_hidden_q15(x_q15_16, attn_out, weights.post_attention_layernorm, block.lut_rsqrt))
@@ -103,6 +112,7 @@ def main():
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--repeat", type=int, default=10)
     parser.add_argument("--use-r3", action="store_true")
+    parser.add_argument("--split-attn", action="store_true")
     args = parser.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir, local_files_only=True, trust_remote_code=True)
@@ -119,7 +129,7 @@ def main():
     def run_layers(prof):
         x = q15_16(embed[ids])
         for layer_idx in range(args.layers):
-            x = run_block(block, x, weights[layer_idx], cos, sin, r3_q15, prof)
+            x = run_block(block, x, weights[layer_idx], cos, sin, r3_q15, prof, args.split_attn)
         return x
 
     for _ in range(args.warmup):

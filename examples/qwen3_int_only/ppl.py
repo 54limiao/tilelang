@@ -19,9 +19,11 @@ TEXT_PATH = Path(__file__).resolve().parent / "data" / "declaration_of_independe
 
 
 def packed_flags(packed_dir):
+    if packed_dir is None:
+        return False, False
     with safe_open(f"{packed_dir}/qwen3_int_only.safetensors", framework="pt", device="cpu") as f:
         metadata = f.metadata() or {}
-    return metadata.get("use_r2") == "1"
+    return metadata.get("use_r1") == "1", metadata.get("use_r2") == "1"
 
 
 def input_tokens(tokenizer, max_tokens, device):
@@ -64,7 +66,7 @@ def local_float_ppl(model_dir, max_tokens, layers, verbose):
 
 
 @torch.no_grad()
-def int_only_ppl(model_dir, packed_dir, max_tokens, layers, verbose, cache_prompt, use_r2, use_r3):
+def int_only_ppl(model_dir, packed_dir, max_tokens, layers, verbose, cache_prompt, use_r2, use_r3, split_attn):
     tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True, trust_remote_code=True)
     ids = input_tokens(tokenizer, max_tokens, "cuda")
     cache_kv = None
@@ -91,7 +93,7 @@ def int_only_ppl(model_dir, packed_dir, max_tokens, layers, verbose, cache_promp
                 v = (v.to(torch.float64) @ r2.to(torch.float64)).to(torch.float32)
             cache_kv.append((quant_i8_q15_16(k), quant_i8_q15_16(v)))
         del hf_model
-    model = Qwen3IntOnlyModel(ids.numel() - 1, model_dir=model_dir, packed_dir=packed_dir, cache_len=cache_len, use_r3=use_r3)
+    model = Qwen3IntOnlyModel(ids.numel() - 1, model_dir=model_dir, packed_dir=packed_dir, cache_len=cache_len, use_r3=use_r3, split_attn=split_attn)
     return ppl_from_logits(model.logits(ids[:-1], layers=layers, verbose=verbose, cache_kv=cache_kv).float(), ids[1:])
 
 
@@ -107,6 +109,7 @@ def main():
     parser.add_argument("--use-r1", action="store_true")
     parser.add_argument("--use-r2", action="store_true")
     parser.add_argument("--use-r3", action="store_true")
+    parser.add_argument("--split-attn", action="store_true")
     args = parser.parse_args()
 
     if args.backend == "hf":
@@ -114,7 +117,7 @@ def main():
     elif args.backend == "local-float":
         ppl, loss, ntokens = local_float_ppl(args.model_dir, args.max_tokens, args.layers, args.verbose)
     else:
-        packed_r2 = packed_flags(args.packed_dir)
+        _packed_r1, packed_r2 = packed_flags(args.packed_dir)
         ppl, loss, ntokens = int_only_ppl(
             args.model_dir,
             args.packed_dir,
@@ -124,6 +127,7 @@ def main():
             args.cache_prompt,
             args.use_r2 or packed_r2,
             args.use_r3,
+            args.split_attn,
         )
     print(f"backend={args.backend} tokens={ntokens} loss={loss:.6f} ppl={ppl:.6f}")
 

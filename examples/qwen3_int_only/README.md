@@ -10,6 +10,12 @@ The expected local model path is:
 /code/Qwen3-0.6B
 ```
 
+Use a packed directory with QuaRot metadata, for example:
+
+```bash
+/tmp/Qwen3-0.6B-int-only-r12
+```
+
 Run perplexity on the bundled Declaration of Independence text:
 
 ```bash
@@ -50,23 +56,38 @@ Run the single-layer kernel profile baseline. Use this no-cache single-layer pro
   --repeat 5
 ```
 
+Run the split attention profile that materializes `softmax_i16` and uses the `int16 x int8` PV GEMM path:
+
+```bash
+/root/venv/bin/python examples/qwen3_int_only/profile_kernels.py \
+  --model-dir /code/Qwen3-0.6B \
+  --max-tokens 2049 \
+  --layers 1 \
+  --warmup 2 \
+  --repeat 5 \
+  --split-attn
+```
+
+`--split-attn` is wired for both no-cache and prefix/cache PPL paths.
+
 Recent 2048-token-class Declaration PPL record:
 
 ```text
 backend=hf tokens=1902 loss=3.106583 ppl=22.344565
 backend=int-only tokens=1902 loss=3.317960 ppl=27.603982
+backend=int-only --split-attn tokens=1902 loss=3.361184 ppl=28.823308
 ```
 
-Current single-layer 2048-token-class profile baseline after the RMSNorm/residual fusions:
+Current same-machine single-layer 2048-token-class profile baseline:
 
 ```text
-attention_i8_fixed     avg=102.163 ms total=510.814 ms 98.46%
-gate_up_proj_i8        avg=0.306 ms   total=1.528 ms   0.29%
-down_proj_i8           avg=0.168 ms   total=0.838 ms   0.16%
-o_proj_i8              avg=0.124 ms   total=0.618 ms   0.12%
-qkv_proj_i8            avg=0.263 ms   total=1.315 ms   0.25%
-rms_q_q15              avg=0.088 ms   total=0.441 ms   0.08%
-silu_mul_dq8_mid       avg=0.080 ms   total=0.402 ms   0.08%
-dq8_attn               avg=0.070 ms   total=0.349 ms   0.07%
-total                  518.792 ms
+default attention:
+attention_i8_fixed     avg=1.757 ms
+attention_norm         avg=0.049 ms
+total                  8.947 ms
+
+split attention:
+attention_softmax_i16  avg=0.510 ms
+attention_i16v8        avg=0.358 ms
+total                  6.168 ms
 ```
