@@ -23,6 +23,20 @@ For reproducible static-quantization experiments, use the shared model and datas
 /publicdata/huggingface.co/datasets/
 ```
 
+Static attention activation scales are packed with the weights. The current packed scale slots are per-head `q_pre_rope_i16`, `k_pre_rope_i16`, `q_post_rope_i8`, `k_post_rope_i8`, and `v_i8`; runtime kernels should read these scales instead of calibrating.
+
+```bash
+/root/venv/bin/python examples/qwen3_int_only/prepack.py \
+  --model-dir /publicdata/huggingface.co/Qwen/Qwen3-0.6B \
+  --out-dir /tmp/Qwen3-0.6B-int-only-static \
+  --use-r1 \
+  --use-r2 \
+  --use-r3 \
+  --calib-parquet /publicdata/huggingface.co/datasets/HuggingFaceFW/fineweb/sample/10BT/000_00000.parquet \
+  --calib-column text \
+  --calib-tokens 4096
+```
+
 Run perplexity on the bundled Declaration of Independence text:
 
 ```bash

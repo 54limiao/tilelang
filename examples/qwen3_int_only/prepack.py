@@ -4,8 +4,9 @@ from pathlib import Path
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
+from transformers import AutoTokenizer
 
-from examples.qwen3_int_only.model import QWEN3_0_6B, per_channel_i8_weight, q15_16
+from examples.qwen3_int_only.model import QWEN3_0_6B, per_channel_i8_weight, q15_16, rmsnorm_torch, rope_tables_q15_16, rope_torch
 from examples.qwen3_int_only.quarot import (
     ROTATE_SEED,
     random_hadamard_rotation,
@@ -17,6 +18,75 @@ from examples.qwen3_int_only.quarot import (
 )
 
 
+TEXT_PATH = Path(__file__).resolve().parent / "data" / "declaration_of_independence.txt"
+
+
+def static_head_scale(x, qmax):
+    return torch.div(x.abs().amax(dim=(0, 2)), qmax, rounding_mode="floor").clamp(min=1).to(torch.uint32)
+
+
+def load_calib_ids(model_dir, calib_text, calib_parquet, calib_column, tokens, device):
+    tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True, trust_remote_code=True)
+    if calib_parquet:
+        import pyarrow.parquet as pq
+
+        ids = []
+        parquet = pq.ParquetFile(calib_parquet)
+        for batch in parquet.iter_batches(batch_size=256, columns=[calib_column]):
+            for item in batch.column(calib_column).to_pylist():
+                if item:
+                    ids.extend(tokenizer(str(item), add_special_tokens=False).input_ids)
+                    if len(ids) >= tokens:
+                        return torch.tensor(ids[:tokens], device=device, dtype=torch.long)
+    else:
+        text = Path(calib_text).read_text(encoding="utf-8")
+        ids = tokenizer(text, add_special_tokens=False).input_ids[:tokens]
+    return torch.tensor(ids, device=device, dtype=torch.long)
+
+
+@torch.no_grad()
+def calibrate_attention_scales(embed, layer_weights, norm_weights, ids, config, r3=None):
+    cos_q15, sin_q15, _ = rope_tables_q15_16(ids.numel(), config.head_dim, config.rope_theta, ids.device)
+    cos, sin = cos_q15.float() / 65536.0, sin_q15.float() / 65536.0
+    x = embed[ids]
+    scales = []
+    for w, norms in zip(layer_weights, norm_weights):
+        input_norm, post_norm, q_norm, k_norm = norms
+        h = rmsnorm_torch(x, input_norm)
+        q = h @ w["q_proj"].T
+        k = h @ w["k_proj"].T
+        v = h @ w["v_proj"].T
+        q = rmsnorm_torch(q.reshape(-1, config.num_attention_heads, config.head_dim), q_norm)
+        k = rmsnorm_torch(k.reshape(-1, config.num_key_value_heads, config.head_dim), k_norm)
+        q_rope = rope_torch(q.reshape(-1, config.q_size), cos, sin, config.num_attention_heads, config.head_dim).reshape(-1, config.num_attention_heads, config.head_dim)
+        k_rope = rope_torch(k.reshape(-1, config.kv_size), cos, sin, config.num_key_value_heads, config.head_dim).reshape(-1, config.num_key_value_heads, config.head_dim)
+        if r3 is not None:
+            q_rope = (q_rope.to(torch.float64) @ r3.to(torch.float64)).to(torch.float32)
+            k_rope = (k_rope.to(torch.float64) @ r3.to(torch.float64)).to(torch.float32)
+        v = v.reshape(-1, config.num_key_value_heads, config.head_dim)
+        scales.append(
+            {
+                "q_pre_rope_i16": static_head_scale(q15_16(q), 32767),
+                "k_pre_rope_i16": static_head_scale(q15_16(k), 32767),
+                "q_post_rope_i8": static_head_scale(q15_16(q_rope), 127),
+                "k_post_rope_i8": static_head_scale(q15_16(k_rope), 127),
+                "v_i8": static_head_scale(q15_16(v), 127),
+            }
+        )
+        group = config.num_attention_heads // config.num_key_value_heads
+        q_attn = q_rope.permute(1, 0, 2)
+        k_attn = k_rope.repeat_interleave(group, dim=1).permute(1, 0, 2)
+        v_attn = v.repeat_interleave(group, dim=1).permute(1, 0, 2)
+        score = q_attn @ k_attn.transpose(-1, -2) / (config.head_dim**0.5)
+        mask = torch.ones(score.shape[-2:], device=score.device, dtype=torch.bool).tril()
+        attn = torch.softmax(score.masked_fill(~mask, torch.finfo(score.dtype).min), dim=-1) @ v_attn
+        attn = attn.permute(1, 0, 2).reshape(x.shape[0], config.q_size)
+        x = x + attn @ w["o_proj"].T
+        m = rmsnorm_torch(x, post_norm)
+        x = x + (torch.nn.functional.silu(m @ w["gate_proj"].T) * (m @ w["up_proj"].T)) @ w["down_proj"].T
+    return scales
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-dir", default="/code/Qwen3-0.6B")
@@ -24,14 +94,22 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--use-r1", action="store_true")
     parser.add_argument("--use-r2", action="store_true")
+    parser.add_argument("--use-r3", action="store_true")
     parser.add_argument("--rotate-seed", type=int, default=ROTATE_SEED)
+    parser.add_argument("--calib-text", default=str(TEXT_PATH))
+    parser.add_argument("--calib-parquet")
+    parser.add_argument("--calib-column", default="text")
+    parser.add_argument("--calib-tokens", type=int, default=0)
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     tensors = {}
+    calib_weights = []
+    calib_norms = []
     r1 = random_hadamard_rotation(QWEN3_0_6B.hidden_size, args.rotate_seed, args.device) if args.use_r1 else None
     r2 = random_hadamard_rotation(QWEN3_0_6B.head_dim, args.rotate_seed + 1, args.device) if args.use_r2 else None
+    r3 = random_hadamard_rotation(QWEN3_0_6B.head_dim, args.rotate_seed + 2, args.device) if args.use_r3 else None
     with safe_open(f"{args.model_dir}/model.safetensors", framework="pt", device="cpu") as f:
         def tensor(name, device=args.device):
             return f.get_tensor(name).to(torch.float32).to(device)
@@ -51,6 +129,7 @@ def main():
             dst = f"layers.{layer_idx}"
             input_norm = tensor(f"{src}.input_layernorm.weight")
             post_norm = tensor(f"{src}.post_attention_layernorm.weight")
+            layer_float = {}
             for name in ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"):
                 owner = "self_attn" if name in ("q_proj", "k_proj", "v_proj", "o_proj") else "mlp"
                 weight = tensor(f"{src}.{owner}.{name}.weight")
@@ -64,6 +143,7 @@ def main():
                     weight = rotate_head_input(weight, QWEN3_0_6B.head_dim, r2)
                 if args.use_r1 and name in ("o_proj", "down_proj"):
                     weight = rotate_output(weight, r1)
+                layer_float[name] = weight
                 w, s = per_channel_i8_weight(weight)
                 tensors[f"{dst}.{name}.weight"] = w.cpu().contiguous()
                 tensors[f"{dst}.{name}.scale"] = s.cpu().contiguous()
@@ -72,11 +152,26 @@ def main():
                 post_norm = torch.ones_like(post_norm)
             tensors[f"{dst}.input_layernorm"] = q15_16(input_norm).cpu()
             tensors[f"{dst}.post_attention_layernorm"] = q15_16(post_norm).cpu()
-            tensors[f"{dst}.q_norm"] = q15_16(tensor(f"{src}.self_attn.q_norm.weight")).cpu()
-            tensors[f"{dst}.k_norm"] = q15_16(tensor(f"{src}.self_attn.k_norm.weight")).cpu()
+            q_norm = tensor(f"{src}.self_attn.q_norm.weight")
+            k_norm = tensor(f"{src}.self_attn.k_norm.weight")
+            tensors[f"{dst}.q_norm"] = q15_16(q_norm).cpu()
+            tensors[f"{dst}.k_norm"] = q15_16(k_norm).cpu()
+            calib_weights.append(layer_float)
+            calib_norms.append((input_norm, post_norm, q_norm, k_norm))
+
+    if args.calib_tokens:
+        ids = load_calib_ids(args.model_dir, args.calib_text, args.calib_parquet, args.calib_column, args.calib_tokens, args.device)
+        for layer_idx, scales in enumerate(calibrate_attention_scales(embed, calib_weights, calib_norms, ids, QWEN3_0_6B, r3)):
+            dst = f"layers.{layer_idx}"
+            for name, scale in scales.items():
+                tensors[f"{dst}.{name}.scale"] = scale.cpu().contiguous()
 
     path = out_dir / "qwen3_int_only.safetensors"
-    save_file(tensors, str(path), metadata={"use_r1": str(int(args.use_r1)), "use_r2": str(int(args.use_r2))})
+    save_file(
+        tensors,
+        str(path),
+        metadata={"use_r1": str(int(args.use_r1)), "use_r2": str(int(args.use_r2)), "use_r3": str(int(args.use_r3)), "calib_tokens": str(args.calib_tokens)},
+    )
     print(path)
 
 

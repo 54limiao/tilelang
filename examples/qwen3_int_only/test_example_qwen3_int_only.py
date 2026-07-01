@@ -36,6 +36,7 @@ from examples.qwen3_int_only.kernels import (
     rsqrt_lut,
     sigmoid_lut,
     silu_mul_dynamic_quant_q15_16,
+    static_quant_q15_16_per_head,
 )
 
 
@@ -88,6 +89,28 @@ def test_dynamic_quant_i16():
     ref_y = torch.div(xq, ref_s.int()[:, None], rounding_mode="floor").clamp(-32768, 32767).to(torch.int16)
     torch.testing.assert_close(s, ref_s, rtol=0, atol=0)
     torch.testing.assert_close(y, ref_y, rtol=0, atol=0)
+
+
+@tilelang.testing.requires_cuda
+def test_static_quant_per_head_i16():
+    torch.manual_seed(0)
+    tokens, heads, head_dim = 7, 5, 64
+    x = torch.randint(-900000, 900001, (tokens, heads, head_dim), device="cuda", dtype=torch.int32)
+    scale = torch.div(x.abs().amax(dim=(0, 2)), 32767, rounding_mode="floor").clamp(min=1).to(torch.uint32)
+    y = compile_kernel(static_quant_q15_16_per_head(tokens, heads, head_dim, "int16"), [2])(x, scale)
+    ref = torch.div(x, scale.int()[None, :, None], rounding_mode="floor").clamp(-32768, 32767).to(torch.int16)
+    torch.testing.assert_close(y, ref, rtol=0, atol=0)
+
+
+@tilelang.testing.requires_cuda
+def test_static_quant_per_head_i8():
+    torch.manual_seed(0)
+    tokens, heads, head_dim = 7, 5, 64
+    x = torch.randint(-900000, 900001, (tokens, heads, head_dim), device="cuda", dtype=torch.int32)
+    scale = torch.div(x.abs().amax(dim=(0, 2)), 127, rounding_mode="floor").clamp(min=1).to(torch.uint32)
+    y = compile_kernel(static_quant_q15_16_per_head(tokens, heads, head_dim, "int8"), [2])(x, scale)
+    ref = torch.div(x, scale.int()[None, :, None], rounding_mode="floor").clamp(-128, 127).to(torch.int8)
+    torch.testing.assert_close(y, ref, rtol=0, atol=0)
 
 
 @tilelang.testing.requires_cuda

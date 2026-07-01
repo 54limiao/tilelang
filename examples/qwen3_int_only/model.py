@@ -100,6 +100,11 @@ class Qwen3BlockWeights:
     post_attention_layernorm: torch.Tensor
     q_norm: torch.Tensor
     k_norm: torch.Tensor
+    q_pre_rope_i16_scale: torch.Tensor | None = None
+    k_pre_rope_i16_scale: torch.Tensor | None = None
+    q_post_rope_i8_scale: torch.Tensor | None = None
+    k_post_rope_i8_scale: torch.Tensor | None = None
+    v_i8_scale: torch.Tensor | None = None
     q_proj_fp: torch.Tensor | None = None
     k_proj_fp: torch.Tensor | None = None
     v_proj_fp: torch.Tensor | None = None
@@ -145,6 +150,11 @@ class Qwen3BlockWeights:
             q15_16(post_attention_layernorm),
             q15_16(q_norm),
             q15_16(k_norm),
+            None,
+            None,
+            None,
+            None,
+            None,
             q_proj,
             k_proj,
             v_proj,
@@ -200,6 +210,9 @@ def load_final_norm(model_dir="/code/Qwen3-0.6B", device="cuda"):
 def load_packed_qwen3(packed_dir, config=QWEN3_0_6B, device="cuda"):
     tensors = load_file(f"{packed_dir}/qwen3_int_only.safetensors", device=device)
     blocks = []
+    def optional(name):
+        return tensors[name] if name in tensors else None
+
     for layer_idx in range(config.num_hidden_layers):
         p = f"layers.{layer_idx}"
         blocks.append(
@@ -215,6 +228,11 @@ def load_packed_qwen3(packed_dir, config=QWEN3_0_6B, device="cuda"):
                 tensors[f"{p}.post_attention_layernorm"],
                 tensors[f"{p}.q_norm"],
                 tensors[f"{p}.k_norm"],
+                optional(f"{p}.q_pre_rope_i16.scale"),
+                optional(f"{p}.k_pre_rope_i16.scale"),
+                optional(f"{p}.q_post_rope_i8.scale"),
+                optional(f"{p}.k_post_rope_i8.scale"),
+                optional(f"{p}.v_i8.scale"),
             )
         )
     return tensors["model.embed_tokens.weight"], tensors["lm_head.weight"], tensors["model.norm.weight"], blocks

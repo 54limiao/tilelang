@@ -57,6 +57,28 @@ def dynamic_quant_q15_16(rows, cols, out_dtype="int8", qmax_override=None):
     return main
 
 
+def static_quant_q15_16_per_head(tokens, heads, head_dim, out_dtype="int8", qmax_override=None):
+    qmax = 127 if out_dtype == "int8" else 32767
+    if qmax_override is not None:
+        qmax = qmax_override
+
+    @T.prim_func
+    def main(
+        X: T.Tensor((tokens, heads, head_dim), "int32"),
+        S: T.Tensor((heads,), "uint32"),
+        Y: T.Tensor((tokens, heads, head_dim), out_dtype),
+    ):
+        with T.Kernel(tokens, heads, threads=128) as (t, h):
+            scale = T.alloc_fragment((1,), "int32")
+            vals = T.alloc_fragment((head_dim,), "int32")
+            scale[0] = T.max(T.cast(S[h], "int32"), T.int32(1))
+            for d in T.Parallel(head_dim):
+                vals[d] = T.min(T.max(X[t, h, d] // scale[0], T.int32(0 - qmax - 1)), T.int32(qmax))
+                Y[t, h, d] = T.cast(vals[d], out_dtype)
+
+    return main
+
+
 def add_dynamic_quant_q15_16(rows, cols, qmax=4095):
     @T.prim_func
     def main(
