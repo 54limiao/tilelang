@@ -5,7 +5,13 @@ from pathlib import Path
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from examples.qwen3_int_only.model import Qwen3FloatModel, Qwen3IntOnlyModel
+from examples.qwen3_int_only.model import (
+    Q15_16,
+    QWEN3_0_6B,
+    Qwen3FloatModel,
+    Qwen3IntOnlyModel,
+)
+from examples.qwen3_int_only.quarot import ROTATE_SEED, random_hadamard_rotation
 
 
 TEXT_PATH = Path(__file__).resolve().parent / "data" / "declaration_of_independence.txt"
@@ -38,11 +44,36 @@ def local_float_ppl(model_dir, max_tokens, layers, verbose):
 
 
 @torch.no_grad()
-def int_only_ppl(model_dir, packed_dir, max_tokens, layers, verbose):
+def int_only_ppl(model_dir, packed_dir, max_tokens, layers, verbose, cache_prompt, quarot_cache):
     tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True, trust_remote_code=True)
     ids = input_tokens(tokenizer, max_tokens, "cuda")
-    model = Qwen3IntOnlyModel(ids.numel() - 1, model_dir=model_dir, packed_dir=packed_dir)
-    return ppl_from_logits(model.logits(ids[:-1], layers=layers, verbose=verbose).float(), ids[1:])
+    cache_kv = None
+    cache_len = 0
+    if cache_prompt:
+        cache_ids = torch.tensor(tokenizer(cache_prompt, add_special_tokens=False).input_ids, device="cuda", dtype=torch.long)
+        cache_len = int(cache_ids.numel())
+        hf_model = AutoModelForCausalLM.from_pretrained(model_dir, local_files_only=True, trust_remote_code=True, dtype=torch.bfloat16).to("cuda")
+        past = hf_model(cache_ids[None, :], use_cache=True).past_key_values
+        if hasattr(past, "layers"):
+            past = [(layer.keys, layer.values) for layer in past.layers]
+        elif hasattr(past, "to_legacy_cache"):
+            past = past.to_legacy_cache()
+        n_layers = QWEN3_0_6B.num_hidden_layers if layers is None else layers
+        group = QWEN3_0_6B.num_attention_heads // QWEN3_0_6B.num_key_value_heads
+        r2 = random_hadamard_rotation(QWEN3_0_6B.head_dim, ROTATE_SEED + 1, "cuda") if quarot_cache else None
+        cache_kv = []
+        for k, v in past[:n_layers]:
+            k = k[0].float().repeat_interleave(group, dim=0).contiguous()
+            v = v[0].float().repeat_interleave(group, dim=0).contiguous()
+            if r2 is not None:
+                v = (v.to(torch.float64) @ r2.to(torch.float64)).to(torch.float32)
+            cache_kv.append((
+                torch.clamp(torch.round(k * Q15_16), -(1 << 31), (1 << 31) - 1).to(torch.int32),
+                torch.clamp(torch.round(v * Q15_16), -(1 << 31), (1 << 31) - 1).to(torch.int32),
+            ))
+        del hf_model
+    model = Qwen3IntOnlyModel(ids.numel() - 1, model_dir=model_dir, packed_dir=packed_dir, cache_len=cache_len)
+    return ppl_from_logits(model.logits(ids[:-1], layers=layers, verbose=verbose, cache_kv=cache_kv).float(), ids[1:])
 
 
 def main():
@@ -53,6 +84,8 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=2049)
     parser.add_argument("--layers", type=int)
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--cache-prompt")
+    parser.add_argument("--quarot-cache", action="store_true")
     args = parser.parse_args()
 
     if args.backend == "hf":
@@ -60,7 +93,7 @@ def main():
     elif args.backend == "local-float":
         ppl, loss, ntokens = local_float_ppl(args.model_dir, args.max_tokens, args.layers, args.verbose)
     else:
-        ppl, loss, ntokens = int_only_ppl(args.model_dir, args.packed_dir, args.max_tokens, args.layers, args.verbose)
+        ppl, loss, ntokens = int_only_ppl(args.model_dir, args.packed_dir, args.max_tokens, args.layers, args.verbose, args.cache_prompt, args.quarot_cache)
     print(f"backend={args.backend} tokens={ntokens} loss={loss:.6f} ppl={ppl:.6f}")
 
 
