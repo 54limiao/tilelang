@@ -16,6 +16,7 @@ from examples.qwen3_int_only.quarot import ROTATE_SEED, random_hadamard_rotation
 
 
 TEXT_PATH = Path(__file__).resolve().parent / "data" / "declaration_of_independence.txt"
+FINEWEB_PATH = "/publicdata/huggingface.co/datasets/HuggingFaceFW/fineweb/sample/10BT/000_00000.parquet"
 
 
 def packed_flags(packed_dir):
@@ -26,9 +27,30 @@ def packed_flags(packed_dir):
     return metadata.get("use_r1") == "1", metadata.get("use_r2") == "1"
 
 
-def input_tokens(tokenizer, max_tokens, device):
-    ids = tokenizer(TEXT_PATH.read_text(encoding="utf-8"), add_special_tokens=False).input_ids[:max_tokens]
+def load_ids(tokenizer, args, total_tokens, device):
+    if args.eval_parquet:
+        import pyarrow.parquet as pq
+
+        ids = []
+        parquet = pq.ParquetFile(args.eval_parquet)
+        for batch in parquet.iter_batches(batch_size=256, columns=[args.eval_column]):
+            for item in batch.column(args.eval_column).to_pylist():
+                if item:
+                    ids.extend(tokenizer(str(item), add_special_tokens=False).input_ids)
+                    if len(ids) >= total_tokens:
+                        return torch.tensor(ids[:total_tokens], device=device, dtype=torch.long)
+    text = Path(args.eval_text).read_text(encoding="utf-8")
+    ids = tokenizer(text, add_special_tokens=False).input_ids[:total_tokens]
     return torch.tensor(ids, device=device, dtype=torch.long)
+
+
+def eval_windows(tokenizer, args, device):
+    windows = args.batch_size * args.num_batches
+    ids = load_ids(tokenizer, args, args.max_tokens * windows, device)
+    if ids.numel() < args.max_tokens:
+        return ids[None, :]
+    windows = min(windows, ids.numel() // args.max_tokens)
+    return ids[: args.max_tokens * windows].reshape(windows, args.max_tokens)
 
 
 def quant_i8_q15_16(x):
@@ -38,63 +60,134 @@ def quant_i8_q15_16(x):
     return y, scale
 
 
-def ppl_from_logits(logits, labels):
-    loss = torch.nn.functional.cross_entropy(logits, labels)
-    return math.exp(float(loss)), float(loss), int(labels.numel())
+def add_metrics(acc, logits, labels, golden=None):
+    logits = logits.float()
+    labels = labels.reshape(-1)
+    flat = logits.reshape(-1, logits.shape[-1])
+    loss_sum = torch.nn.functional.cross_entropy(flat, labels, reduction="sum")
+    acc["loss_sum"] += float(loss_sum)
+    acc["tokens"] += int(labels.numel())
+    if golden is not None:
+        ref = golden.float().reshape(-1)
+        got = logits.reshape(-1)
+        diff = got - ref
+        acc["dot"] += float(torch.dot(got, ref))
+        acc["got2"] += float(torch.dot(got, got))
+        acc["ref2"] += float(torch.dot(ref, ref))
+        acc["se"] += float(torch.dot(diff, diff))
+        acc["logits"] += int(got.numel())
+
+
+def finish_metrics(acc):
+    loss = acc["loss_sum"] / acc["tokens"]
+    out = {"tokens": acc["tokens"], "loss": loss, "ppl": math.exp(loss)}
+    if acc["logits"]:
+        out["cos"] = acc["dot"] / math.sqrt(max(acc["got2"] * acc["ref2"], 1e-30))
+        out["mse"] = acc["se"] / acc["logits"]
+        out["rel_mse"] = acc["se"] / max(acc["ref2"], 1e-30)
+    return out
+
+
+def print_metrics(backend, metrics, compare_backend):
+    msg = f"backend={backend} tokens={metrics['tokens']} loss={metrics['loss']:.6f} ppl={metrics['ppl']:.6f}"
+    if "cos" in metrics:
+        msg += f" compare={compare_backend} cos={metrics['cos']:.8f} mse={metrics['mse']:.8e} rel_mse={metrics['rel_mse']:.8e}"
+    print(msg)
 
 
 @torch.no_grad()
-def hf_ppl(model_dir, max_tokens, cache_prompt):
-    tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(model_dir, local_files_only=True, trust_remote_code=True, dtype=torch.bfloat16).to("cuda")
-    ids = input_tokens(tokenizer, max_tokens, model.device).unsqueeze(0)
+def hf_logits(model, windows, cache_prompt, tokenizer):
     if cache_prompt:
-        prefix = torch.tensor(tokenizer(cache_prompt, add_special_tokens=False).input_ids, device=model.device, dtype=torch.long).unsqueeze(0)
-        full = torch.cat((prefix, ids), dim=1)
-        logits = model(full[:, :-1]).logits.float()[:, prefix.size(1) :]
+        prefix = torch.tensor(tokenizer(cache_prompt, add_special_tokens=False).input_ids, device=windows.device, dtype=torch.long)
+        prefix = prefix[None, :].expand(windows.shape[0], prefix.numel())
+        full = torch.cat((prefix, windows), dim=1)
+        return model(full[:, :-1]).logits.float()[:, prefix.shape[1] :]
+    return model(windows[:, :-1]).logits.float()
+
+
+@torch.no_grad()
+def local_float_logits(model, window, layers, verbose):
+    return model.logits(window[:-1], layers=layers, verbose=verbose).float()
+
+
+@torch.no_grad()
+def build_cache_kv(hf_model, tokenizer, cache_prompt, layers, use_r2, use_r3):
+    if not cache_prompt:
+        return None, 0
+    cache_ids = torch.tensor(tokenizer(cache_prompt, add_special_tokens=False).input_ids, device="cuda", dtype=torch.long)
+    past = hf_model(cache_ids[None, :], use_cache=True).past_key_values
+    if hasattr(past, "layers"):
+        past = [(layer.keys, layer.values) for layer in past.layers]
+    elif hasattr(past, "to_legacy_cache"):
+        past = past.to_legacy_cache()
+    n_layers = QWEN3_0_6B.num_hidden_layers if layers is None else layers
+    r2 = random_hadamard_rotation(QWEN3_0_6B.head_dim, ROTATE_SEED + 1, "cuda") if use_r2 else None
+    r3 = random_hadamard_rotation(QWEN3_0_6B.head_dim, ROTATE_SEED + 2, "cuda") if use_r3 else None
+    cache_kv = []
+    for k, v in past[:n_layers]:
+        k = k[0].float().contiguous()
+        v = v[0].float().contiguous()
+        if r3 is not None:
+            k = (k.to(torch.float64) @ r3.to(torch.float64)).to(torch.float32)
+        if r2 is not None:
+            v = (v.to(torch.float64) @ r2.to(torch.float64)).to(torch.float32)
+        cache_kv.append((quant_i8_q15_16(k), quant_i8_q15_16(v)))
+    return cache_kv, int(cache_ids.numel())
+
+
+@torch.no_grad()
+def run_eval(args):
+    tokenizer = AutoTokenizer.from_pretrained(args.model_dir, local_files_only=True, trust_remote_code=True)
+    windows = eval_windows(tokenizer, args, "cuda")
+    seq_len = windows.shape[1] - 1
+    need_hf = args.backend == "hf" or args.compare_backend == "hf" or (args.backend == "int-only" and args.cache_prompt)
+    hf_model = None
+    if need_hf:
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            args.model_dir, local_files_only=True, trust_remote_code=True, dtype=torch.bfloat16
+        ).to("cuda")
+    local_model = None
+    if args.backend == "local-float" or args.compare_backend == "local-float":
+        local_model = Qwen3FloatModel(seq_len, model_dir=args.model_dir)
+
+    cache_kv, cache_len = None, 0
+    if args.backend == "int-only":
+        _packed_r1, packed_r2 = packed_flags(args.packed_dir)
+        cache_kv, cache_len = build_cache_kv(hf_model, tokenizer, args.cache_prompt, args.layers, args.use_r2 or packed_r2, args.use_r3)
+        int_model = Qwen3IntOnlyModel(
+            seq_len,
+            model_dir=args.model_dir,
+            packed_dir=args.packed_dir,
+            cache_len=cache_len,
+            use_r3=args.use_r3,
+            split_attn=args.split_attn,
+        )
     else:
-        logits = model(ids[:, :-1]).logits.float()
-    return ppl_from_logits(logits.reshape(-1, model.config.vocab_size), ids[:, 1:].reshape(-1))
+        int_model = None
 
+    acc = {"loss_sum": 0.0, "tokens": 0, "dot": 0.0, "got2": 0.0, "ref2": 0.0, "se": 0.0, "logits": 0}
+    for start in range(0, windows.shape[0], args.batch_size):
+        batch = windows[start : start + args.batch_size]
+        golden = None
+        if args.compare_backend == "hf":
+            golden = hf_logits(hf_model, batch, args.cache_prompt, tokenizer)
+        elif args.compare_backend == "local-float":
+            golden = torch.stack([local_float_logits(local_model, row, args.layers, False) for row in batch])
 
-@torch.no_grad()
-def local_float_ppl(model_dir, max_tokens, layers, verbose):
-    tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True, trust_remote_code=True)
-    ids = input_tokens(tokenizer, max_tokens, "cuda")
-    model = Qwen3FloatModel(ids.numel() - 1, model_dir=model_dir)
-    return ppl_from_logits(model.logits(ids[:-1], layers=layers, verbose=verbose).float(), ids[1:])
-
-
-@torch.no_grad()
-def int_only_ppl(model_dir, packed_dir, max_tokens, layers, verbose, cache_prompt, use_r2, use_r3, split_attn):
-    tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True, trust_remote_code=True)
-    ids = input_tokens(tokenizer, max_tokens, "cuda")
-    cache_kv = None
-    cache_len = 0
-    if cache_prompt:
-        cache_ids = torch.tensor(tokenizer(cache_prompt, add_special_tokens=False).input_ids, device="cuda", dtype=torch.long)
-        cache_len = int(cache_ids.numel())
-        hf_model = AutoModelForCausalLM.from_pretrained(model_dir, local_files_only=True, trust_remote_code=True, dtype=torch.bfloat16).to("cuda")
-        past = hf_model(cache_ids[None, :], use_cache=True).past_key_values
-        if hasattr(past, "layers"):
-            past = [(layer.keys, layer.values) for layer in past.layers]
-        elif hasattr(past, "to_legacy_cache"):
-            past = past.to_legacy_cache()
-        n_layers = QWEN3_0_6B.num_hidden_layers if layers is None else layers
-        r2 = random_hadamard_rotation(QWEN3_0_6B.head_dim, ROTATE_SEED + 1, "cuda") if use_r2 else None
-        r3 = random_hadamard_rotation(QWEN3_0_6B.head_dim, ROTATE_SEED + 2, "cuda") if use_r3 else None
-        cache_kv = []
-        for k, v in past[:n_layers]:
-            k = k[0].float().contiguous()
-            v = v[0].float().contiguous()
-            if r3 is not None:
-                k = (k.to(torch.float64) @ r3.to(torch.float64)).to(torch.float32)
-            if r2 is not None:
-                v = (v.to(torch.float64) @ r2.to(torch.float64)).to(torch.float32)
-            cache_kv.append((quant_i8_q15_16(k), quant_i8_q15_16(v)))
-        del hf_model
-    model = Qwen3IntOnlyModel(ids.numel() - 1, model_dir=model_dir, packed_dir=packed_dir, cache_len=cache_len, use_r3=use_r3, split_attn=split_attn)
-    return ppl_from_logits(model.logits(ids[:-1], layers=layers, verbose=verbose, cache_kv=cache_kv).float(), ids[1:])
+        if args.backend == "hf":
+            logits = hf_logits(hf_model, batch, args.cache_prompt, tokenizer)
+            add_metrics(acc, logits, batch[:, 1:], golden)
+        elif args.backend == "local-float":
+            for idx, row in enumerate(batch):
+                logits = local_float_logits(local_model, row, args.layers, args.verbose)
+                ref = None if golden is None else golden[idx]
+                add_metrics(acc, logits, row[1:], ref)
+        else:
+            for idx, row in enumerate(batch):
+                logits = int_model.logits(row[:-1], layers=args.layers, verbose=args.verbose, cache_kv=cache_kv).float()
+                ref = None if golden is None else golden[idx]
+                add_metrics(acc, logits, row[1:], ref)
+    return finish_metrics(acc)
 
 
 def main():
@@ -102,7 +195,13 @@ def main():
     parser.add_argument("--model-dir", default="/code/Qwen3-0.6B")
     parser.add_argument("--packed-dir")
     parser.add_argument("--backend", choices=["hf", "local-float", "int-only"], default="local-float")
+    parser.add_argument("--compare-backend", choices=["none", "hf", "local-float"], default="none")
     parser.add_argument("--max-tokens", type=int, default=2049)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--num-batches", type=int, default=1)
+    parser.add_argument("--eval-text", default=str(TEXT_PATH))
+    parser.add_argument("--eval-parquet", default="")
+    parser.add_argument("--eval-column", default="text")
     parser.add_argument("--layers", type=int)
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--cache-prompt")
@@ -111,25 +210,10 @@ def main():
     parser.add_argument("--use-r3", action="store_true")
     parser.add_argument("--split-attn", action="store_true")
     args = parser.parse_args()
-
-    if args.backend == "hf":
-        ppl, loss, ntokens = hf_ppl(args.model_dir, args.max_tokens, args.cache_prompt)
-    elif args.backend == "local-float":
-        ppl, loss, ntokens = local_float_ppl(args.model_dir, args.max_tokens, args.layers, args.verbose)
-    else:
-        _packed_r1, packed_r2 = packed_flags(args.packed_dir)
-        ppl, loss, ntokens = int_only_ppl(
-            args.model_dir,
-            args.packed_dir,
-            args.max_tokens,
-            args.layers,
-            args.verbose,
-            args.cache_prompt,
-            args.use_r2 or packed_r2,
-            args.use_r3,
-            args.split_attn,
-        )
-    print(f"backend={args.backend} tokens={ntokens} loss={loss:.6f} ppl={ppl:.6f}")
+    if args.eval_parquet == "fineweb":
+        args.eval_parquet = FINEWEB_PATH
+    metrics = run_eval(args)
+    print_metrics(args.backend, metrics, args.compare_backend)
 
 
 if __name__ == "__main__":

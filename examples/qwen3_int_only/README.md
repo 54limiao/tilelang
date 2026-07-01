@@ -39,7 +39,7 @@ Static attention activation scales are packed with the weights. The current pack
   --calib-prefix-tokens 512
 ```
 
-Run perplexity on the bundled Declaration of Independence text:
+Run a quick perplexity smoke on the bundled Declaration of Independence text:
 
 ```bash
 /root/venv/bin/python examples/qwen3_int_only/ppl.py \
@@ -53,14 +53,34 @@ Run perplexity on the bundled Declaration of Independence text:
   --use-r3
 ```
 
-Reference backends:
+Run the real-text PPL/cos/MSE baseline on FineWeb windows. HF runs as a torch batch; the TileLang int-only path currently keeps the single-sequence kernel ABI and streams the same windows while accumulating the same metrics.
 
 ```bash
 /root/venv/bin/python examples/qwen3_int_only/ppl.py \
   --backend hf \
   --model-dir /code/Qwen3-0.6B \
+  --eval-parquet fineweb \
   --max-tokens 2049 \
+  --batch-size 2 \
+  --num-batches 1 \
   --cache-prompt "你是一个有用而无害的聊天助手。"
+```
+
+```bash
+/root/venv/bin/python examples/qwen3_int_only/ppl.py \
+  --backend int-only \
+  --model-dir /code/Qwen3-0.6B \
+  --packed-dir /tmp/Qwen3-0.6B-int-only-static \
+  --eval-parquet fineweb \
+  --max-tokens 2049 \
+  --batch-size 2 \
+  --num-batches 1 \
+  --cache-prompt "你是一个有用而无害的聊天助手。" \
+  --use-r1 \
+  --use-r2 \
+  --use-r3 \
+  --split-attn \
+  --compare-backend hf
 ```
 
 Run the focused tests:
@@ -102,6 +122,13 @@ Recent 2048-token-class Declaration PPL record:
 backend=hf tokens=1902 loss=3.106583 ppl=22.344565
 backend=int-only --use-r1 --use-r2 --use-r3 tokens=1902 loss=3.372760 ppl=29.158889
 backend=int-only --use-r1 --use-r2 --use-r3 --split-attn tokens=1902 loss=3.365579 ppl=28.950245
+```
+
+Current FineWeb 2x2048-token baseline with the Chinese cache prompt and static 32x2048 calibration pack:
+
+```text
+backend=hf tokens=4096 loss=3.451550 ppl=31.549241
+backend=int-only --use-r1 --use-r2 --use-r3 --split-attn tokens=4096 loss=3.628089 ppl=37.640823 compare=hf cos=0.93488973 mse=1.55581174e+00 rel_mse=1.25986741e-01
 ```
 
 Current same-machine single-layer 2048-token-class profile baseline (`--warmup 1 --repeat 5`):

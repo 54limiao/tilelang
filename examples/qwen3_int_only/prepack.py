@@ -56,29 +56,32 @@ def run_calib_segment(x, w, norms, cos, sin, config, r3, prefix_tokens):
     q = h @ w["q_proj"].T
     k = h @ w["k_proj"].T
     v = h @ w["v_proj"].T
-    q = rmsnorm_torch(q.reshape(-1, config.num_attention_heads, config.head_dim), q_norm)
-    k = rmsnorm_torch(k.reshape(-1, config.num_key_value_heads, config.head_dim), k_norm)
-    q_rope = rope_torch(q.reshape(-1, config.q_size), cos, sin, config.num_attention_heads, config.head_dim).reshape(-1, config.num_attention_heads, config.head_dim)
-    k_rope = rope_torch(k.reshape(-1, config.kv_size), cos, sin, config.num_key_value_heads, config.head_dim).reshape(-1, config.num_key_value_heads, config.head_dim)
+    batch, seq_len = x.shape[:2]
+    cos_b = cos[None, :, :].expand(batch, seq_len, config.head_dim // 2).reshape(batch * seq_len, config.head_dim // 2)
+    sin_b = sin[None, :, :].expand(batch, seq_len, config.head_dim // 2).reshape(batch * seq_len, config.head_dim // 2)
+    q = rmsnorm_torch(q.reshape(batch, seq_len, config.num_attention_heads, config.head_dim), q_norm)
+    k = rmsnorm_torch(k.reshape(batch, seq_len, config.num_key_value_heads, config.head_dim), k_norm)
+    q_rope = rope_torch(q.reshape(batch * seq_len, config.q_size), cos_b, sin_b, config.num_attention_heads, config.head_dim).reshape(batch, seq_len, config.num_attention_heads, config.head_dim)
+    k_rope = rope_torch(k.reshape(batch * seq_len, config.kv_size), cos_b, sin_b, config.num_key_value_heads, config.head_dim).reshape(batch, seq_len, config.num_key_value_heads, config.head_dim)
     if r3 is not None:
         q_rope = (q_rope.to(torch.float64) @ r3.to(torch.float64)).to(torch.float32)
         k_rope = (k_rope.to(torch.float64) @ r3.to(torch.float64)).to(torch.float32)
-    v = v.reshape(-1, config.num_key_value_heads, config.head_dim)
+    v = v.reshape(batch, seq_len, config.num_key_value_heads, config.head_dim)
     stats = {
-        "q_pre_rope_i16": q15_16(q[prefix_tokens:]),
-        "k_pre_rope_i16": q15_16(k[prefix_tokens:]),
-        "q_post_rope_i8": q15_16(q_rope[prefix_tokens:]),
-        "k_post_rope_i8": q15_16(k_rope[prefix_tokens:]),
-        "v_i8": q15_16(v[prefix_tokens:]),
+        "q_pre_rope_i16": q15_16(q[:, prefix_tokens:]).reshape(-1, config.num_attention_heads, config.head_dim),
+        "k_pre_rope_i16": q15_16(k[:, prefix_tokens:]).reshape(-1, config.num_key_value_heads, config.head_dim),
+        "q_post_rope_i8": q15_16(q_rope[:, prefix_tokens:]).reshape(-1, config.num_attention_heads, config.head_dim),
+        "k_post_rope_i8": q15_16(k_rope[:, prefix_tokens:]).reshape(-1, config.num_key_value_heads, config.head_dim),
+        "v_i8": q15_16(v[:, prefix_tokens:]).reshape(-1, config.num_key_value_heads, config.head_dim),
     }
     group = config.num_attention_heads // config.num_key_value_heads
-    q_attn = q_rope.permute(1, 0, 2)
-    k_attn = k_rope.repeat_interleave(group, dim=1).permute(1, 0, 2)
-    v_attn = v.repeat_interleave(group, dim=1).permute(1, 0, 2)
+    q_attn = q_rope.permute(0, 2, 1, 3)
+    k_attn = k_rope.repeat_interleave(group, dim=2).permute(0, 2, 1, 3)
+    v_attn = v.repeat_interleave(group, dim=2).permute(0, 2, 1, 3)
     score = q_attn @ k_attn.transpose(-1, -2) / (config.head_dim**0.5)
     mask = torch.ones(score.shape[-2:], device=score.device, dtype=torch.bool).tril()
     attn = torch.softmax(score.masked_fill(~mask, torch.finfo(score.dtype).min), dim=-1) @ v_attn
-    attn = attn.permute(1, 0, 2).reshape(x.shape[0], config.q_size)
+    attn = attn.permute(0, 2, 1, 3).reshape(batch, seq_len, config.q_size)
     x = x + attn @ w["o_proj"].T
     m = rmsnorm_torch(x, post_norm)
     return x + (torch.nn.functional.silu(m @ w["gate_proj"].T) * (m @ w["up_proj"].T)) @ w["down_proj"].T, stats
@@ -88,16 +91,11 @@ def run_calib_segment(x, w, norms, cos, sin, config, r3, prefix_tokens):
 def calibrate_attention_scales(embed, layer_weights, norm_weights, ids, config, r3=None, prefix_tokens=0, seq_len=2048):
     cos_q15, sin_q15, _ = rope_tables_q15_16(seq_len, config.head_dim, config.rope_theta, ids.device)
     cos, sin = cos_q15.float() / 65536.0, sin_q15.float() / 65536.0
-    segments = ids.reshape(-1, seq_len)
+    x = embed[ids.reshape(-1, seq_len)]
     scales = [None for _ in layer_weights]
-    for segment in segments:
-        x = embed[segment]
-        for layer_idx, (w, norms) in enumerate(zip(layer_weights, norm_weights)):
-            x, stats = run_calib_segment(x, w, norms, cos, sin, config, r3, prefix_tokens)
-            if scales[layer_idx] is None:
-                scales[layer_idx] = {name: None for name in stats}
-            for name, value in stats.items():
-                scales[layer_idx][name] = update_head_amax(scales[layer_idx][name], value)
+    for layer_idx, (w, norms) in enumerate(zip(layer_weights, norm_weights)):
+        x, stats = run_calib_segment(x, w, norms, cos, sin, config, r3, prefix_tokens)
+        scales[layer_idx] = {name: update_head_amax(None, value) for name, value in stats.items()}
     return [
         {
             "q_pre_rope_i16": scale_from_amax(layer["q_pre_rope_i16"], 32767),
