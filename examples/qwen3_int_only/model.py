@@ -255,7 +255,12 @@ def causal_softmax(score):
     return torch.softmax(score.masked_fill(~mask, torch.finfo(score.dtype).min), dim=-1)
 
 
-def block_torch(x, weights: Qwen3BlockWeights, cos_q15_16, sin_q15_16, config=QWEN3_0_6B):
+def block_torch(x, weights: Qwen3BlockWeights, cos_q15_16, sin_q15_16, config=QWEN3_0_6B, r3=None):
+    trace = block_torch_trace(x, weights, cos_q15_16, sin_q15_16, config, r3)
+    return trace["layer_out"]
+
+
+def block_torch_trace(x, weights: Qwen3BlockWeights, cos_q15_16, sin_q15_16, config=QWEN3_0_6B, r3=None):
     cos, sin = cos_q15_16.float() / Q15_16, sin_q15_16.float() / Q15_16
     h = rmsnorm_torch(x, weights.input_layernorm.float() / Q15_16)
     q = h @ weights.q_proj_fp.T
@@ -263,17 +268,39 @@ def block_torch(x, weights: Qwen3BlockWeights, cos_q15_16, sin_q15_16, config=QW
     v = h @ weights.v_proj_fp.T
     q = rmsnorm_torch(q.reshape(-1, config.num_attention_heads, config.head_dim), weights.q_norm.float() / Q15_16).reshape(-1, config.q_size)
     k = rmsnorm_torch(k.reshape(-1, config.num_key_value_heads, config.head_dim), weights.k_norm.float() / Q15_16).reshape(-1, config.kv_size)
-    q = rope_torch(q, cos, sin, config.num_attention_heads, config.head_dim).reshape(-1, config.num_attention_heads, config.head_dim).permute(1, 0, 2)
+    q = rope_torch(q, cos, sin, config.num_attention_heads, config.head_dim).reshape(-1, config.num_attention_heads, config.head_dim)
     k = rope_torch(k, cos, sin, config.num_key_value_heads, config.head_dim).reshape(-1, config.num_key_value_heads, config.head_dim)
+    if r3 is not None:
+        q = (q.to(torch.float64) @ r3.to(torch.float64)).to(torch.float32)
+        k = (k.to(torch.float64) @ r3.to(torch.float64)).to(torch.float32)
+    q = q.permute(1, 0, 2)
     group = config.num_attention_heads // config.num_key_value_heads
     k = k.repeat_interleave(group, dim=1).permute(1, 0, 2)
     v = v.reshape(-1, config.num_key_value_heads, config.head_dim).repeat_interleave(group, dim=1).permute(1, 0, 2)
     attn = causal_softmax((q @ k.transpose(-1, -2)) / (config.head_dim**0.5)) @ v
     attn = attn.permute(1, 0, 2).reshape(x.shape[0], config.q_size)
-    x = x + attn @ weights.o_proj_fp.T
-    m = rmsnorm_torch(x, weights.post_attention_layernorm.float() / Q15_16)
-    x = x + (torch.nn.functional.silu(m @ weights.gate_proj_fp.T) * (m @ weights.up_proj_fp.T)) @ weights.down_proj_fp.T
-    return x
+    attn_out = attn @ weights.o_proj_fp.T
+    h = x + attn_out
+    post = rmsnorm_torch(h, weights.post_attention_layernorm.float() / Q15_16)
+    gate = post @ weights.gate_proj_fp.T
+    up = post @ weights.up_proj_fp.T
+    gated = torch.nn.functional.silu(gate) * up
+    mlp = gated @ weights.down_proj_fp.T
+    return {
+        "input_rms": h.new_tensor(0) + rmsnorm_torch(x, weights.input_layernorm.float() / Q15_16),
+        "q": q.permute(1, 0, 2).reshape(x.shape[0], config.q_size),
+        "k": k.permute(1, 0, 2).reshape(x.shape[0], config.q_size),
+        "v": v.permute(1, 0, 2).reshape(x.shape[0], config.q_size),
+        "attn": attn,
+        "attn_out": attn_out,
+        "attn_residual": h,
+        "post_rms": post,
+        "gate": gate,
+        "up": up,
+        "gated": gated,
+        "mlp": mlp,
+        "layer_out": h + mlp,
+    }
 
 
 class Qwen3IntOnlyBlock:
@@ -321,6 +348,9 @@ class Qwen3IntOnlyBlock:
         self.lut_exp = torch.from_numpy(exp_lut_neg()).cuda()
 
     def __call__(self, x_q15_16, weights: Qwen3BlockWeights, cos_q15_16, sin_q15_16, cache_k=None, cache_v=None, r3_q15=None):
+        return self.trace(x_q15_16, weights, cos_q15_16, sin_q15_16, cache_k, cache_v, r3_q15, collect=False)
+
+    def trace(self, x_q15_16, weights: Qwen3BlockWeights, cos_q15_16, sin_q15_16, cache_k=None, cache_v=None, r3_q15=None, collect=True):
         norm = self.rms_hidden_q15(x_q15_16, weights.input_layernorm, self.lut_rsqrt)
         x8, xs8 = self.dq8_hidden(norm)
         q, k, v = self.qkv_proj_i8(
@@ -380,7 +410,32 @@ class Qwen3IntOnlyBlock:
         gate, up = self.gate_up_proj_i8(h8, hs8, weights.gate_proj.weight, weights.gate_proj.scale, weights.up_proj.weight, weights.up_proj.scale)
         gated, gated8, gs8 = self.silu_mul_dq8_mid(gate, up, self.lut_sigmoid)
         mlp = self.down_proj_i8(gated8, gs8, weights.down_proj.weight, weights.down_proj.scale)
-        return self.add_hidden(h, mlp)
+        layer_out = self.add_hidden(h, mlp)
+        if not collect:
+            return layer_out
+        q_trace = qr.reshape(self.seq_len, self.config.num_attention_heads, self.config.head_dim).reshape(self.seq_len, self.config.q_size)
+        k_trace = kr.reshape(self.seq_len, self.config.num_key_value_heads, self.config.head_dim).repeat_interleave(
+            self.config.num_attention_heads // self.config.num_key_value_heads, dim=1
+        ).reshape(self.seq_len, self.config.q_size)
+        v_trace = v_heads.reshape(self.seq_len, self.config.num_key_value_heads, self.config.head_dim).repeat_interleave(
+            self.config.num_attention_heads // self.config.num_key_value_heads, dim=1
+        ).reshape(self.seq_len, self.config.q_size)
+        return {
+            "input_rms": norm.float() / Q15_16,
+            "q": q_trace.float() / Q15_16,
+            "k": k_trace.float() / Q15_16,
+            "v": v_trace.float() / Q15_16,
+            "attn": attn.float() / Q15_16,
+            "attn_out": attn_out.float() / Q15_16,
+            "attn_residual": h.float() / Q15_16,
+            "post_rms": post.float() / Q15_16,
+            "gate": gate.float() / Q15_16,
+            "up": up.float() / Q15_16,
+            "gated": gated.float() / Q15_16,
+            "mlp": mlp.float() / Q15_16,
+            "layer_out": layer_out.float() / Q15_16,
+            "layer_out_q15": layer_out,
+        }
 
 
 class Qwen3IntOnlyModel:

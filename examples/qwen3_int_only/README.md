@@ -102,6 +102,19 @@ Run a cumulative layer sweep against the local float path to locate where fixed-
   --layer-sweep 1,2,4,8
 ```
 
+Trace a single block against the dequantized packed-weight float path. This compares the same packed weights and rotations, so the numbers isolate TileLang fixed-point op error instead of QuaRot basis changes:
+
+```bash
+/root/venv/bin/python examples/qwen3_int_only/trace_block.py \
+  --model-dir /code/Qwen3-0.6B \
+  --packed-dir /tmp/Qwen3-0.6B-int-only-static \
+  --eval-parquet fineweb \
+  --max-tokens 65 \
+  --layer 0 \
+  --use-r3 \
+  --split-attn
+```
+
 Run the focused tests:
 
 ```bash
@@ -157,6 +170,14 @@ layers=1 backend=int-only tokens=256 loss=14.241476 ppl=1531067.953902 compare=l
 layers=2 backend=int-only tokens=256 loss=12.809982 ppl=365851.319804 compare=local-float cos=0.99526169 mse=4.73308714e-01 rel_mse=9.70253042e-03
 layers=4 backend=int-only tokens=256 loss=12.286460 ppl=216741.336274 compare=local-float cos=0.99096497 mse=9.77206377e-01 rel_mse=1.87624521e-02
 layers=8 backend=int-only tokens=256 loss=11.688217 ppl=119159.375157 compare=local-float cos=0.98516666 mse=2.15970396e+00 rel_mse=3.20034156e-02
+```
+
+Current 64-token block trace highlights:
+
+```text
+layer=0 input_rms rel_mse=1.06552034e-06 q rel_mse=7.91176164e-04 attn rel_mse=2.00207401e-02 mlp rel_mse=4.60865684e-02 layer_out rel_mse=1.74910743e-02
+layer=1 input_rms rel_mse=2.37806290e-02 q rel_mse=2.27384176e-02 attn rel_mse=9.51652229e-02 mlp rel_mse=9.14253369e-02 layer_out rel_mse=3.40638570e-02
+layer=2 input_rms rel_mse=3.90793644e-02 q rel_mse=4.33117785e-02 attn rel_mse=9.49960873e-02 mlp rel_mse=1.28384978e-02 layer_out rel_mse=1.28336456e-02
 ```
 
 Current same-machine single-layer 2048-token-class profile baseline (`--warmup 1 --repeat 5`):
