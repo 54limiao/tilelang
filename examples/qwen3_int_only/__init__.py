@@ -1,1 +1,1 @@
-"""Integer-only Qwen3 inference prototypes."""
+"""Integer-only Qwen3 inference example."""

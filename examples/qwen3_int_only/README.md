@@ -13,15 +13,14 @@ Run perplexity on the bundled Declaration of Independence text:
 ```bash
 /root/venv/bin/python examples/qwen3_int_only/ppl.py \
   --backend int-only \
-  --corpus declaration \
   --max-tokens 2049
 ```
 
 Reference backends:
 
 ```bash
-/root/venv/bin/python examples/qwen3_int_only/ppl.py --backend local-float --corpus declaration --max-tokens 2049
-/root/venv/bin/python examples/qwen3_int_only/ppl.py --backend proto-stage --stage down --corpus declaration --max-tokens 2049
+/root/venv/bin/python examples/qwen3_int_only/ppl.py --backend local-float --max-tokens 2049
+/root/venv/bin/python examples/qwen3_int_only/ppl.py --backend hf --max-tokens 2049
 ```
 
 Run the focused tests:
@@ -33,5 +32,5 @@ Run the focused tests:
 Recent 2048-token-class Declaration run:
 
 ```text
-backend=int-only hybrid=int12-attn-q15 tokens=1902 loss=3.172896 ppl=23.876540
+backend=int-only tokens=1902 loss=3.172896 ppl=23.876540
 ```
