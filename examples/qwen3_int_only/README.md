@@ -83,6 +83,25 @@ Run the real-text PPL/cos/MSE baseline on FineWeb windows. HF runs as a torch ba
   --compare-backend hf
 ```
 
+Run a cumulative layer sweep against the local float path to locate where fixed-point error starts accumulating:
+
+```bash
+/root/venv/bin/python examples/qwen3_int_only/ppl.py \
+  --backend int-only \
+  --model-dir /code/Qwen3-0.6B \
+  --packed-dir /tmp/Qwen3-0.6B-int-only-static \
+  --eval-parquet fineweb \
+  --max-tokens 257 \
+  --batch-size 1 \
+  --num-batches 1 \
+  --use-r1 \
+  --use-r2 \
+  --use-r3 \
+  --split-attn \
+  --compare-backend local-float \
+  --layer-sweep 1,2,4,8
+```
+
 Run the focused tests:
 
 ```bash
@@ -129,6 +148,15 @@ Current FineWeb 2x2048-token baseline with the Chinese cache prompt and static 3
 ```text
 backend=hf tokens=4096 loss=3.451550 ppl=31.549241
 backend=int-only --use-r1 --use-r2 --use-r3 --split-attn tokens=4096 loss=3.628089 ppl=37.640823 compare=hf cos=0.93488973 mse=1.55581174e+00 rel_mse=1.25986741e-01
+```
+
+Current FineWeb 256-token cumulative layer sweep against local float:
+
+```text
+layers=1 backend=int-only tokens=256 loss=14.241476 ppl=1531067.953902 compare=local-float cos=0.99556057 mse=3.10909846e-01 rel_mse=8.94781789e-03
+layers=2 backend=int-only tokens=256 loss=12.809982 ppl=365851.319804 compare=local-float cos=0.99526169 mse=4.73308714e-01 rel_mse=9.70253042e-03
+layers=4 backend=int-only tokens=256 loss=12.286460 ppl=216741.336274 compare=local-float cos=0.99096497 mse=9.77206377e-01 rel_mse=1.87624521e-02
+layers=8 backend=int-only tokens=256 loss=11.688217 ppl=119159.375157 compare=local-float cos=0.98516666 mse=2.15970396e+00 rel_mse=3.20034156e-02
 ```
 
 Current same-machine single-layer 2048-token-class profile baseline (`--warmup 1 --repeat 5`):

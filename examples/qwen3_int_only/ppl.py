@@ -95,6 +95,20 @@ def print_metrics(backend, metrics, compare_backend):
     print(msg)
 
 
+def parse_layer_sweep(value, default_layers):
+    if not value:
+        return [default_layers]
+    if value == "all":
+        return list(range(1, default_layers + 1))
+    layers = []
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        layers.append(default_layers if item == "full" else int(item))
+    return layers
+
+
 @torch.no_grad()
 def hf_logits(model, windows, cache_prompt, tokenizer):
     if cache_prompt:
@@ -136,10 +150,11 @@ def build_cache_kv(hf_model, tokenizer, cache_prompt, layers, use_r2, use_r3):
 
 
 @torch.no_grad()
-def run_eval(args):
+def prepare_eval(args):
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir, local_files_only=True, trust_remote_code=True)
     windows = eval_windows(tokenizer, args, "cuda")
     seq_len = windows.shape[1] - 1
+    layer_sweep = parse_layer_sweep(args.layer_sweep, QWEN3_0_6B.num_hidden_layers if args.layers is None else args.layers)
     need_hf = args.backend == "hf" or args.compare_backend == "hf" or (args.backend == "int-only" and args.cache_prompt)
     hf_model = None
     if need_hf:
@@ -153,7 +168,9 @@ def run_eval(args):
     cache_kv, cache_len = None, 0
     if args.backend == "int-only":
         _packed_r1, packed_r2 = packed_flags(args.packed_dir)
-        cache_kv, cache_len = build_cache_kv(hf_model, tokenizer, args.cache_prompt, args.layers, args.use_r2 or packed_r2, args.use_r3)
+        cache_kv, cache_len = build_cache_kv(
+            hf_model, tokenizer, args.cache_prompt, max(layer_sweep), args.use_r2 or packed_r2, args.use_r3
+        )
         int_model = Qwen3IntOnlyModel(
             seq_len,
             model_dir=args.model_dir,
@@ -164,7 +181,11 @@ def run_eval(args):
         )
     else:
         int_model = None
+    return tokenizer, windows, hf_model, local_model, int_model, cache_kv, layer_sweep
 
+
+@torch.no_grad()
+def run_eval(args, tokenizer, windows, hf_model, local_model, int_model, cache_kv, layers):
     acc = {"loss_sum": 0.0, "tokens": 0, "dot": 0.0, "got2": 0.0, "ref2": 0.0, "se": 0.0, "logits": 0}
     for start in range(0, windows.shape[0], args.batch_size):
         batch = windows[start : start + args.batch_size]
@@ -172,19 +193,19 @@ def run_eval(args):
         if args.compare_backend == "hf":
             golden = hf_logits(hf_model, batch, args.cache_prompt, tokenizer)
         elif args.compare_backend == "local-float":
-            golden = torch.stack([local_float_logits(local_model, row, args.layers, False) for row in batch])
+            golden = torch.stack([local_float_logits(local_model, row, layers, False) for row in batch])
 
         if args.backend == "hf":
             logits = hf_logits(hf_model, batch, args.cache_prompt, tokenizer)
             add_metrics(acc, logits, batch[:, 1:], golden)
         elif args.backend == "local-float":
             for idx, row in enumerate(batch):
-                logits = local_float_logits(local_model, row, args.layers, args.verbose)
+                logits = local_float_logits(local_model, row, layers, args.verbose)
                 ref = None if golden is None else golden[idx]
                 add_metrics(acc, logits, row[1:], ref)
         else:
             for idx, row in enumerate(batch):
-                logits = int_model.logits(row[:-1], layers=args.layers, verbose=args.verbose, cache_kv=cache_kv).float()
+                logits = int_model.logits(row[:-1], layers=layers, verbose=args.verbose, cache_kv=cache_kv).float()
                 ref = None if golden is None else golden[idx]
                 add_metrics(acc, logits, row[1:], ref)
     return finish_metrics(acc)
@@ -203,6 +224,7 @@ def main():
     parser.add_argument("--eval-parquet", default="")
     parser.add_argument("--eval-column", default="text")
     parser.add_argument("--layers", type=int)
+    parser.add_argument("--layer-sweep", default="")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--cache-prompt")
     parser.add_argument("--use-r1", action="store_true")
@@ -212,8 +234,12 @@ def main():
     args = parser.parse_args()
     if args.eval_parquet == "fineweb":
         args.eval_parquet = FINEWEB_PATH
-    metrics = run_eval(args)
-    print_metrics(args.backend, metrics, args.compare_backend)
+    tokenizer, windows, hf_model, local_model, int_model, cache_kv, layer_sweep = prepare_eval(args)
+    for layers in layer_sweep:
+        metrics = run_eval(args, tokenizer, windows, hf_model, local_model, int_model, cache_kv, layers)
+        if args.layer_sweep:
+            print(f"layers={layers} ", end="")
+        print_metrics(args.backend, metrics, args.compare_backend)
 
 
 if __name__ == "__main__":
