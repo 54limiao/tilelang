@@ -116,6 +116,19 @@ Trace a single block against the dequantized packed-weight float path. This comp
   --split-attn
 ```
 
+Trace multiple layers in one model run with `--layers`:
+
+```bash
+/root/venv/bin/python examples/qwen3_int_only/trace_block.py \
+  --model-dir /code/Qwen3-0.6B \
+  --packed-dir /tmp/Qwen3-0.6B-int-only-static \
+  --eval-parquet fineweb \
+  --max-tokens 65 \
+  --layers 4,7 \
+  --use-r3 \
+  --split-attn
+```
+
 Run the focused tests:
 
 ```bash
@@ -192,6 +205,8 @@ The deeper MLP trace shows the SiLU kernel itself is accurate against torch usin
 Residual/RMSNorm trace now splits kernel-local error from input drift. `attn_resid_add` and `layer_out_add` are exact on layers 0 and 1. Dynamic quantization now uses no-clip ceil amax scales; this removes the previous RMSNorm-local max clipping error. Layer 0 has `post_rms_kern rel_mse=5.62097284e-07` while `post_rms_int rel_mse=1.22313248e-02`; layer 1 has `post_rms_kern rel_mse=6.15960857e-07` while `post_rms_int rel_mse=2.08080132e-02`. Layer 1 input RMSNorm has the same split: `input_rms_kern rel_mse=6.40880103e-07` and `input_rms_int rel_mse=1.60594936e-02`. So residual add and RMSNorm kernels are no longer quality sources; the remaining larger error is already present in the int hidden state entering RMSNorm.
 
 Repacking the static attention calibration with the same no-clip ceil scale rule makes the serialized q/k/v scales consistent, but it is not the main quality lever on the current FineWeb 256-token sweep. With `/tmp/Qwen3-0.6B-static-ceil-calib-32x2048`, the layer sweep was `layers=1 rel_mse=6.17165126e-03`, `layers=2 rel_mse=5.93324587e-03`, `layers=4 rel_mse=1.59930011e-02`, and `layers=8 rel_mse=3.27977759e-02`. The main RMSNorm improvement comes from runtime dynamic no-clip scale, while deeper-layer drift still needs attention/MLP hidden-state work.
+
+Deeper block traces should be read with the `*_out` normalized metrics, not only branch-local rel_mse. On layer 4, `attn_out rel_mse=3.04542363e-01` and `mlp rel_mse=2.01169401e-01`, but their contribution relative to final hidden energy is only `attn_out_out rel_to_out=1.13196293e-05` and `mlp_out rel_to_out=2.01086641e-05`; `hidden_in_out rel_to_out=1.36730000e-02` already matches the final `layer_out rel_mse=1.36817088e-02`. Layer 7 is similar: `hidden_in_out rel_to_out=1.37537895e-02`, while `attn_out_out rel_to_out=2.94227393e-05` and `mlp_out rel_to_out=9.25156637e-05`. This means the large branch-local rel_mse is mostly a small-energy branch effect; the final hidden drift is inherited from earlier layers.
 
 Current same-machine single-layer 2048-token-class profile baseline (`--warmup 1 --repeat 5`):
 
