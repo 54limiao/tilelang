@@ -18,6 +18,7 @@ MASK = (1 << Q_MULTIPLIER_WIDTH) - 1
 PROB_SHIFT = 11
 SOFTMAX_PROB_NUM = (1 << (15 + PROB_SHIFT)) - 1
 EXP_TO_Q7 = 1.0 / 8.0
+Q15_16 = 1 << 16
 
 
 def exp_lut():
@@ -28,6 +29,10 @@ def rsqrt_lut():
     return np.array([0 if i < 640 else np.clip(round(1024.0 / math.sqrt(i / 128.0 - 4.0)), 0, 1023) for i in range(1024)], dtype=np.int16)
 
 
+def silu_lut():
+    return np.array([round((x / 256.0) / (1.0 + math.exp(-(x / 256.0))) * Q15_16) for x in range(-2048, 2048)], dtype=np.int32)
+
+
 def fake_quant(x, scale, dtype=torch.int16):
     info = torch.iinfo(dtype)
     scale = torch.as_tensor(scale, dtype=torch.float32, device=x.device)
@@ -36,6 +41,10 @@ def fake_quant(x, scale, dtype=torch.int16):
 
 def pack(scales):
     return torch.tensor([pack_scale(float(s)) for s in scales], dtype=torch.uint32, device="cuda")
+
+
+def recip_lut():
+    return np.array([0 if i == 0 else min((127 << 9) // i, MASK) for i in range(4096)], dtype=np.uint32)
 
 
 def quant_kernel(n, scalar_scale):
@@ -53,6 +62,112 @@ def quant_kernel(n, scalar_scale):
                 A[i] = T.fix.quant(X[i], scale=scalar_scale, out_dtype="int16")
                 B[i] = T.fix.quant(X[i], scale=S0[0], out_dtype="int16")
                 C[i] = T.fix.quant(X[i], scale=SV[i], out_dtype="int16")
+
+    return main
+
+
+def dynamic_quant_kernel(rows, cols):
+    @T.prim_func
+    def main(
+        X: T.Tensor((rows, cols), "int32"),
+        LUT: T.Tensor((4096,), "uint32"),
+        Y: T.Tensor((rows, cols), "int8"),
+        S: T.Tensor((rows,), "uint32"),
+    ):
+        with T.Kernel(rows, threads=128) as r:
+            xa = T.alloc_fragment((1, cols), "int32")
+            amax = T.alloc_fragment((1,), "int32")
+            idx = T.alloc_fragment((1,), "int32")
+            qt = T.alloc_fragment((1,), "int32")
+            for c in T.Parallel(cols):
+                xa[0, c] = T.abs(X[r, c])
+            T.reduce_max(xa, amax, dim=1, clear=True)
+            idx[0] = amax[0] >> T.int32(10)
+            if idx[0] > T.int32(4095):
+                idx[0] = T.int32(4095)
+            if idx[0] < T.int32(1):
+                idx[0] = T.int32(1)
+            qt[0] = (T.int32(19) << T.int32(Q_MULTIPLIER_WIDTH)) | (T.cast(LUT[idx[0]], "int32") & T.int32(MASK))
+            S[r] = T.cast(amax[0] // T.int32(127), "uint32")
+            for c in T.Parallel(cols):
+                Y[r, c] = T.fix.quant(X[r, c], scale=qt[0], out_dtype="int8")
+
+    return main
+
+
+def rope_q15_16_kernel(rows, dim):
+    @T.prim_func
+    def main(
+        X: T.Tensor((rows, dim), "int32"),
+        COS: T.Tensor((rows, dim // 2), "int32"),
+        SIN: T.Tensor((rows, dim // 2), "int32"),
+        Y: T.Tensor((rows, dim), "int32"),
+    ):
+        with T.Kernel(rows, threads=128) as r:
+            a = T.alloc_fragment((dim // 2,), "int32")
+            b = T.alloc_fragment((dim // 2,), "int32")
+            for d in T.Parallel(dim // 2):
+                a[d] = (X[r, d] >> T.int32(8)) * (COS[r, d] >> T.int32(8))
+                b[d] = (X[r, d + dim // 2] >> T.int32(8)) * (SIN[r, d] >> T.int32(8))
+                Y[r, d] = a[d] - b[d]
+                a[d] = (X[r, d] >> T.int32(8)) * (SIN[r, d] >> T.int32(8))
+                b[d] = (X[r, d + dim // 2] >> T.int32(8)) * (COS[r, d] >> T.int32(8))
+                Y[r, d + dim // 2] = a[d] + b[d]
+
+    return main
+
+
+def rms_q15_16_kernel(rows, cols):
+    mean_shift = int(math.log2(cols))
+
+    @T.prim_func
+    def main(X: T.Tensor((rows, cols), "int32"), LUT: T.Tensor((1024,), "int16"), Y: T.Tensor((rows, cols), "int32")):
+        with T.Kernel(rows, threads=128) as r:
+            xx = T.alloc_fragment((1, cols), "int32")
+            ss = T.alloc_fragment((1,), "int32")
+            ns = T.alloc_fragment((1,), "int32")
+            wk = T.alloc_fragment((1,), "int32")
+            inv = T.alloc_fragment((1,), "int32")
+            fold = T.alloc_fragment((1,), "int32")
+            qt = T.alloc_fragment((1,), "int32")
+            for c in T.Parallel(cols):
+                xx[0, c] = ((X[r, c] >> T.int32(8)) * (X[r, c] >> T.int32(8))) >> T.int32(mean_shift)
+            T.reduce_sum(xx, ss, dim=1, clear=True)
+            ss[0] += T.int32(1)
+            ns[0] = T.int32(0)
+            wk[0] = ss[0]
+            if (wk[0] & T.int32(-65536)) != T.int32(0):
+                ns[0] += T.int32(16)
+                wk[0] = wk[0] >> T.int32(16)
+            if (wk[0] & T.int32(0xFF00)) != T.int32(0):
+                ns[0] += T.int32(8)
+                wk[0] = wk[0] >> T.int32(8)
+            if (wk[0] & T.int32(0xF0)) != T.int32(0):
+                ns[0] += T.int32(4)
+                wk[0] = wk[0] >> T.int32(4)
+            if (wk[0] & T.int32(0xC)) != T.int32(0):
+                ns[0] += T.int32(2)
+            inv[0] = T.fix.quant_lut(ss[0], LUT, scale=(ns[0] << T.int32(Q_MULTIPLIER_WIDTH)) | T.int32(128), index_dtype="int10", out_dtype="int32")
+            fold[0] = T.fix.quant(inv[0], scale=1024.0, out_dtype="int32")
+            qt[0] = ((T.int32(6) + (ns[0] >> T.int32(1))) << T.int32(Q_MULTIPLIER_WIDTH)) | ((fold[0] >> T.int32(4)) & T.int32(MASK))
+            for c in T.Parallel(cols):
+                Y[r, c] = T.fix.quant(X[r, c] >> T.int32(8), scale=qt[0], out_dtype="int32") << T.int32(6)
+
+    return main
+
+
+def silu_q15_16_kernel(rows, cols):
+    @T.prim_func
+    def main(X: T.Tensor((rows, cols), "int32"), LUT: T.Tensor((4096,), "int32"), Y: T.Tensor((rows, cols), "int32")):
+        with T.Kernel(rows, threads=128) as r:
+            idx = T.alloc_fragment((1, cols), "int32")
+            for c in T.Parallel(cols):
+                idx[0, c] = (X[r, c] >> T.int32(8)) + T.int32(2048)
+                if idx[0, c] < T.int32(0):
+                    idx[0, c] = T.int32(0)
+                if idx[0, c] > T.int32(4095):
+                    idx[0, c] = T.int32(4095)
+                Y[r, c] = LUT[idx[0, c]]
 
     return main
 
@@ -81,6 +196,8 @@ def softmax_kernel(rows, cols, scale):
 
 
 def rms_kernel(rows, cols):
+    mean_shift = int(math.log2(cols))
+
     @T.prim_func
     def main(X: T.Tensor((rows, cols), "int16"), LUT: T.Tensor((1024,), "int16"), Y: T.Tensor((rows, cols), "int16")):
         with T.Kernel(rows, threads=128) as r:
@@ -92,7 +209,7 @@ def rms_kernel(rows, cols):
             fold = T.alloc_fragment((1,), "int32")
             qt = T.alloc_fragment((1,), "int32")
             for c in T.Parallel(cols):
-                xx[0, c] = (T.cast(X[r, c], "int32") * T.cast(X[r, c], "int32")) >> T.int32(3)
+                xx[0, c] = (T.cast(X[r, c], "int32") * T.cast(X[r, c], "int32")) >> T.int32(mean_shift)
             T.reduce_sum(xx, ss, dim=1)
             ss[0] += T.int32(1)
             ns[0] = T.int32(0)
@@ -189,6 +306,49 @@ def test_fix_quant_qdq_cuda():
     torch.testing.assert_close(a.float() * out_scale, x, rtol=0, atol=out_scale)
     torch.testing.assert_close(b.float() * out_scale, x, rtol=0, atol=out_scale)
     torch.testing.assert_close(c.float() * vec_out_scale, x, rtol=0, atol=float(vec_out_scale.max()))
+
+
+@tilelang.testing.requires_cuda
+def test_dynamic_quant_q15_16_cuda():
+    x = torch.stack((
+        torch.linspace(-1.2, 1.1, 128, device="cuda"),
+        torch.cos(torch.arange(128, device="cuda").float() * 0.09) * 0.8,
+    ))
+    qx = fake_quant(x, 1.0 / Q15_16, torch.int32)
+    y, s = tilelang.compile(dynamic_quant_kernel(*qx.shape), out_idx=[2, 3], target="cuda")(qx, torch.from_numpy(recip_lut()).cuda())
+    row_scale = qx.abs().amax(dim=-1).clamp(min=1).float() / 127.0 / Q15_16
+    golden = torch.round(x / row_scale[:, None]).clamp(-128, 127).to(torch.int8).float() * row_scale[:, None]
+    torch.testing.assert_close(y.float() * row_scale[:, None], golden, rtol=0, atol=float(row_scale.max() * 2.01))
+    src = tilelang.compile(dynamic_quant_kernel(*qx.shape), out_idx=[2, 3], target="cuda").get_kernel_source()
+    assert "int64_t)X" not in src and "int64_t)amax" not in src and "int64_t)qt" not in src
+
+
+@tilelang.testing.requires_cuda
+def test_rope_q15_16_cuda():
+    x = torch.linspace(-0.8, 0.9, 64, device="cuda").reshape(2, 32)
+    theta = torch.arange(16, device="cuda").float()[None, :] * torch.tensor([[0.05], [0.11]], device="cuda")
+    cos, sin = torch.cos(theta), torch.sin(theta)
+    qx, qcos, qsin = fake_quant(x, 1.0 / Q15_16, torch.int32), fake_quant(cos, 1.0 / Q15_16, torch.int32), fake_quant(sin, 1.0 / Q15_16, torch.int32)
+    y = tilelang.compile(rope_q15_16_kernel(*qx.shape), out_idx=[3], target="cuda")(qx, qcos, qsin)
+    golden = torch.cat((x[:, :16] * cos - x[:, 16:] * sin, x[:, :16] * sin + x[:, 16:] * cos), dim=-1)
+    torch.testing.assert_close(y.float() / Q15_16, golden, rtol=0, atol=0.012)
+
+
+@tilelang.testing.requires_cuda
+def test_rmsnorm_q15_16_cuda():
+    x = torch.tensor([[-1.2, -0.3, 0.2, 0.5, 1.1, 0.7, -0.8, 0.1], [0.6, -1.0, 1.3, -1.5, 0.2, -0.4, 0.3, -0.2]], device="cuda")
+    qx = fake_quant(x, 1.0 / Q15_16, torch.int32)
+    y = tilelang.compile(rms_q15_16_kernel(*qx.shape), out_idx=[2], target="cuda")(qx, torch.from_numpy(rsqrt_lut()).cuda())
+    golden = x / torch.sqrt(torch.mean(x * x, dim=-1, keepdim=True))
+    torch.testing.assert_close(y.float() / Q15_16, golden, rtol=0, atol=0.1)
+
+
+@tilelang.testing.requires_cuda
+def test_silu_q15_16_cuda():
+    x = torch.linspace(-6.0, 6.0, 256, device="cuda").reshape(2, 128)
+    qx = fake_quant(x, 1.0 / Q15_16, torch.int32)
+    y = tilelang.compile(silu_q15_16_kernel(*qx.shape), out_idx=[2], target="cuda")(qx, torch.from_numpy(silu_lut()).cuda())
+    torch.testing.assert_close(y.float() / Q15_16, torch.nn.functional.silu(x), rtol=0, atol=0.018)
 
 
 @tilelang.testing.requires_cuda
