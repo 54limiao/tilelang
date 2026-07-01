@@ -113,8 +113,8 @@ def test_add_rmsnorm_q15_matches_unfused():
     wq = q15((torch.randn(cols, device="cuda") * 0.03 + 1.0).clamp(0.8, 1.2))
     lut = torch.from_numpy(rsqrt_lut()).cuda()
     y, n = compile_kernel(add_rmsnorm_q15_16_weighted(rows, cols), [4, 5])(a, b, wq, lut)
-    ref_y, ref_q, _ = compile_kernel(add_dynamic_quant_q15_16(rows, cols), [2, 3, 4])(a, b)
-    ref_n = compile_kernel(rmsnorm_q15_16_weighted(rows, cols), [3])(ref_q.to(torch.int32), wq, lut)
+    ref_y = compile_kernel(add_q15_16(rows, cols), [2])(a, b)
+    ref_n = compile_kernel(rmsnorm_q15_16_weighted(rows, cols), [3])(ref_y, wq, lut)
     torch.testing.assert_close(y, ref_y, rtol=0, atol=0)
     torch.testing.assert_close(n, ref_n, rtol=0, atol=0)
 
@@ -196,8 +196,8 @@ def test_rmsnorm_q15_matches_float_reference():
     w = (torch.randn(cols, device="cuda") * 0.03 + 1.0).clamp(0.8, 1.2)
     xq = q15(x)
     y = compile_kernel(rmsnorm_q15_16_weighted(rows, cols), [3])(xq, q15(w), torch.from_numpy(rsqrt_lut()).cuda())
-    scale = torch.div(xq.abs().amax(dim=-1), 4095, rounding_mode="floor").clamp_min(1)
-    q = torch.div(xq, scale[:, None], rounding_mode="floor").clamp(-4096, 4095)
+    scale = torch.div(xq.abs().amax(dim=-1), 32767, rounding_mode="floor").clamp_min(1)
+    q = torch.div(xq, scale[:, None], rounding_mode="floor").clamp(-32768, 32767)
     ref = q15(q.float() / torch.sqrt(torch.mean(q.float() * q.float(), dim=-1, keepdim=True).clamp_min(1.0)) * w)
     rel = torch.sqrt(torch.mean((y.float() - ref.float()) ** 2)) / torch.sqrt(torch.mean(ref.float() ** 2))
     assert float(rel) < 0.012
@@ -211,7 +211,7 @@ def test_rmsnorm_q15_matches_dynamic_i16():
     wq = q15((torch.randn(cols, device="cuda") * 0.03 + 1.0).clamp(0.8, 1.2))
     lut = torch.from_numpy(rsqrt_lut()).cuda()
     y = compile_kernel(rmsnorm_q15_16_weighted(rows, cols), [3])(xq, wq, lut)
-    x16, _ = compile_kernel(dynamic_quant_q15_16(rows, cols, "int16", 4095), [1, 2])(xq)
+    x16, _ = compile_kernel(dynamic_quant_q15_16(rows, cols, "int16"), [1, 2])(xq)
     ref = compile_kernel(rmsnorm_q15_16_weighted(rows, cols), [3])(x16.to(torch.int32), wq, lut)
     torch.testing.assert_close(y, ref, rtol=0, atol=0)
 
@@ -224,8 +224,8 @@ def test_rmsnorm_q15_grouped_matches_dynamic_i16():
     wq = q15((torch.randn(cols, device="cuda") * 0.03 + 1.0).clamp(0.8, 1.2))
     lut = torch.from_numpy(rsqrt_lut()).cuda()
     y = compile_kernel(rmsnorm_q15_16_grouped_weighted(rows, groups, cols), [3])(xq, wq, lut)
-    x16, _ = compile_kernel(dynamic_quant_q15_16(rows, groups * cols, "int16", 4095), [1, 2])(xq)
-    ref = compile_kernel(rmsnorm_q15_16_weighted(rows * groups, cols, qmax=4095), [3])(x16.reshape(rows * groups, cols).to(torch.int32), wq, lut)
+    x16, _ = compile_kernel(dynamic_quant_q15_16(rows, groups * cols, "int16"), [1, 2])(xq)
+    ref = compile_kernel(rmsnorm_q15_16_weighted(rows * groups, cols), [3])(x16.reshape(rows * groups, cols).to(torch.int32), wq, lut)
     torch.testing.assert_close(y, ref, rtol=0, atol=0)
 
 

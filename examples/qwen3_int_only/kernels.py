@@ -87,7 +87,7 @@ def add_dynamic_quant_q15_16(rows, cols, qmax=4095):
     return main
 
 
-def add_rmsnorm_q15_16_weighted(rows, cols, qmax=4095):
+def add_rmsnorm_q15_16_weighted(rows, cols, qmax=32767):
     mean_shift = int(math.log2(cols))
 
     @T.prim_func
@@ -136,7 +136,7 @@ def add_rmsnorm_q15_16_weighted(rows, cols, qmax=4095):
                 wk[0] = wk[0] >> T.int32(4)
             if (wk[0] & T.int32(0xC)) != T.int32(0):
                 ns[0] += T.int32(2)
-            inv[0] = T.fix.lut_10bit(ss[0], RLUT, scale=(ns[0] << T.int32(Q_MULTIPLIER_WIDTH)) | T.int32(128), out_dtype="int32")
+            inv[0] = T.fix.lut_10bit(ss[0], RLUT, scale=((ns[0] - T.int32(7)) << T.int32(Q_MULTIPLIER_WIDTH)) | T.int32(1), out_dtype="int32")
             fold[0] = T.fix.quant(inv[0], scale=1024.0, out_dtype="int32")
             qt[0] = ((T.int32(6) + (ns[0] >> T.int32(1))) << T.int32(Q_MULTIPLIER_WIDTH)) | ((fold[0] >> T.int32(4)) & T.int32(MASK))
             for c in T.Parallel(cols):
@@ -198,7 +198,7 @@ def rope_rotate_q15_16(rows, dim):
     return main
 
 
-def rmsnorm_q15_16_weighted(rows, cols, qmax=4095):
+def rmsnorm_q15_16_weighted(rows, cols, qmax=32767):
     mean_shift = int(math.log2(cols))
 
     @T.prim_func
@@ -244,7 +244,7 @@ def rmsnorm_q15_16_weighted(rows, cols, qmax=4095):
                 wk[0] = wk[0] >> T.int32(4)
             if (wk[0] & T.int32(0xC)) != T.int32(0):
                 ns[0] += T.int32(2)
-            inv[0] = T.fix.lut_10bit(ss[0], RLUT, scale=(ns[0] << T.int32(Q_MULTIPLIER_WIDTH)) | T.int32(128), out_dtype="int32")
+            inv[0] = T.fix.lut_10bit(ss[0], RLUT, scale=((ns[0] - T.int32(7)) << T.int32(Q_MULTIPLIER_WIDTH)) | T.int32(1), out_dtype="int32")
             fold[0] = T.fix.quant(inv[0], scale=1024.0, out_dtype="int32")
             qt[0] = ((T.int32(6) + (ns[0] >> T.int32(1))) << T.int32(Q_MULTIPLIER_WIDTH)) | ((fold[0] >> T.int32(4)) & T.int32(MASK))
             for c in T.Parallel(cols):
@@ -254,7 +254,7 @@ def rmsnorm_q15_16_weighted(rows, cols, qmax=4095):
     return main
 
 
-def rmsnorm_q15_16_grouped_weighted(rows, groups, group_cols, qmax=4095):
+def rmsnorm_q15_16_grouped_weighted(rows, groups, group_cols, qmax=32767):
     cols = groups * group_cols
     mean_shift = int(math.log2(group_cols))
 
@@ -302,7 +302,7 @@ def rmsnorm_q15_16_grouped_weighted(rows, groups, group_cols, qmax=4095):
                 wk[0] = wk[0] >> T.int32(4)
             if (wk[0] & T.int32(0xC)) != T.int32(0):
                 ns[0] += T.int32(2)
-            inv[0] = T.fix.lut_10bit(ss[0], RLUT, scale=(ns[0] << T.int32(Q_MULTIPLIER_WIDTH)) | T.int32(128), out_dtype="int32")
+            inv[0] = T.fix.lut_10bit(ss[0], RLUT, scale=((ns[0] - T.int32(7)) << T.int32(Q_MULTIPLIER_WIDTH)) | T.int32(1), out_dtype="int32")
             fold[0] = T.fix.quant(inv[0], scale=1024.0, out_dtype="int32")
             qt[0] = ((T.int32(6) + (ns[0] >> T.int32(1))) << T.int32(Q_MULTIPLIER_WIDTH)) | ((fold[0] >> T.int32(4)) & T.int32(MASK))
             for c in T.Parallel(group_cols):
