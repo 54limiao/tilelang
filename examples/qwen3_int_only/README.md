@@ -188,6 +188,8 @@ Current MLP-side QDQ split shows the same pattern. On layer 1, `attn_qdq_loss re
 
 The deeper MLP trace shows the SiLU kernel itself is accurate against torch using the same fixed-point gate/up inputs: `silu_mul rel_mse=4.55698144e-04` on layer 0 and `2.64857546e-04` on layer 1. Gate/up projection from post-RMS QDQ is also small (`gate_from_post_qdq rel_mse=2.11212205e-06`, `up_from_post_qdq rel_mse=2.06542627e-05` on layer 1). The large gated-vs-float error is therefore inherited from earlier hidden-state/residual/RMSNorm drift, not the SiLU or gate/up kernels.
 
+Residual/RMSNorm trace now splits kernel-local error from input drift. `attn_resid_add` and `layer_out_add` are exact on layers 0 and 1. RMSNorm kernel-local error is smaller than the total post-RMS error: layer 0 has `post_rms_kern rel_mse=8.72641162e-04` while `post_rms_int rel_mse=1.41499536e-02`; layer 1 has `post_rms_kern rel_mse=7.91632757e-03` while `post_rms_int rel_mse=2.53415368e-02`. Layer 1 input RMSNorm has the same split: `input_rms_kern rel_mse=6.16508350e-03` and `input_rms_int rel_mse=1.79218818e-02`. So the residual add kernels are not a quality source; Q15 dynamic RMSNorm approximation is measurable, but the larger error is already present in the int hidden state entering RMSNorm.
+
 Current same-machine single-layer 2048-token-class profile baseline (`--warmup 1 --repeat 5`):
 
 ```text

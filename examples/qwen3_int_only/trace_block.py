@@ -3,7 +3,16 @@ import argparse
 import torch
 from transformers import AutoTokenizer
 
-from examples.qwen3_int_only.model import Q15_16, Qwen3BlockWeights, Qwen3IntOnlyModel, block_torch, block_torch_trace, load_packed_qwen3, q15_16
+from examples.qwen3_int_only.model import (
+    Q15_16,
+    Qwen3BlockWeights,
+    Qwen3IntOnlyModel,
+    block_torch,
+    block_torch_trace,
+    load_packed_qwen3,
+    q15_16,
+    rmsnorm_torch,
+)
 from examples.qwen3_int_only.ppl import FINEWEB_PATH, load_ids
 from examples.qwen3_int_only.quarot import ROTATE_SEED, random_hadamard_rotation
 
@@ -59,6 +68,11 @@ def attach_dequant_fp(weights: Qwen3BlockWeights):
     return weights
 
 
+def print_metric(name, value, ref):
+    cos, mse, rel = metrics(value, ref)
+    print(f"{name:14s} cos={cos:.8f} mse={mse:.8e} rel_mse={rel:.8e}")
+
+
 @torch.no_grad()
 def main():
     parser = argparse.ArgumentParser()
@@ -91,42 +105,43 @@ def main():
         xi = imodel.block(xi, imodel.layers[layer_idx], imodel.cos, imodel.sin, r3_q15=imodel.r3_q15)
     ftrace = block_torch_trace(xf, fweights[args.layer], imodel.cos, imodel.sin, imodel.config, r3)
     itrace = imodel.block.trace(xi, imodel.layers[args.layer], imodel.cos, imodel.sin, r3_q15=imodel.r3_q15)
+    layer = imodel.layers[args.layer]
+    x_int = xi.float() / Q15_16
     print(f"layer={args.layer} tokens={seq_len}")
     for name in ("input_rms", "q", "k", "v", "attn", "attn_out", "attn_residual", "post_rms", "gate", "up", "gated", "mlp", "layer_out"):
-        cos, mse, rel = metrics(itrace[name], ftrace[name])
-        print(f"{name:14s} cos={cos:.8f} mse={mse:.8e} rel_mse={rel:.8e}")
+        print_metric(name, itrace[name], ftrace[name])
+    input_rms_ref = rmsnorm_torch(x_int, layer.input_layernorm.float() / Q15_16)
+    post_rms_ref = rmsnorm_torch(itrace["attn_residual"], layer.post_attention_layernorm.float() / Q15_16)
+    print_metric("input_rms_kern", itrace["input_rms"], input_rms_ref)
+    print_metric("input_rms_int", input_rms_ref, ftrace["input_rms"])
+    print_metric("attn_resid_add", itrace["attn_residual"], x_int + itrace["attn_out"])
+    print_metric("post_rms_kern", itrace["post_rms"], post_rms_ref)
+    print_metric("post_rms_int", post_rms_ref, ftrace["post_rms"])
+    print_metric("layer_out_add", itrace["layer_out"], itrace["attn_residual"] + itrace["mlp"])
     qdq = dequant_qkv(itrace)
     for name, value in zip(("q_qdq", "k_qdq", "v_qdq"), qdq):
         base = name[:1]
-        cos, mse, rel = metrics(value, ftrace[base])
-        print(f"{name:14s} cos={cos:.8f} mse={mse:.8e} rel_mse={rel:.8e}")
-        cos, mse, rel = metrics(value, itrace[base])
-        print(f"{name + '_loss':14s} cos={cos:.8f} mse={mse:.8e} rel_mse={rel:.8e}")
+        print_metric(name, value, ftrace[base])
+        print_metric(name + "_loss", value, itrace[base])
     for name, q_name, s_name, base in (
         ("attn_qdq", "attn8", "attn_s8", "attn"),
         ("post_qdq", "post8", "post_s8", "post_rms"),
         ("gated_qdq", "gated8", "gated_s8", "gated"),
     ):
         value = dequant_rows(itrace[q_name], itrace[s_name])
-        cos, mse, rel = metrics(value, ftrace[base])
-        print(f"{name:14s} cos={cos:.8f} mse={mse:.8e} rel_mse={rel:.8e}")
-        cos, mse, rel = metrics(value, itrace[base])
-        print(f"{name + '_loss':14s} cos={cos:.8f} mse={mse:.8e} rel_mse={rel:.8e}")
+        print_metric(name, value, ftrace[base])
+        print_metric(name + "_loss", value, itrace[base])
     post_qdq = dequant_rows(itrace["post8"], itrace["post_s8"])
     gate_qdq_ref = linear_ref(post_qdq, imodel.layers[args.layer], "gate_proj")
     up_qdq_ref = linear_ref(post_qdq, imodel.layers[args.layer], "up_proj")
     for name, value, ref in (("gate_from_post_qdq", itrace["gate"], gate_qdq_ref), ("up_from_post_qdq", itrace["up"], up_qdq_ref)):
-        cos, mse, rel = metrics(value, ref)
-        print(f"{name:14s} cos={cos:.8f} mse={mse:.8e} rel_mse={rel:.8e}")
+        print_metric(name, value, ref)
     silu_ref = torch.nn.functional.silu(itrace["gate"]) * itrace["up"]
-    cos, mse, rel = metrics(itrace["gated"], silu_ref)
-    print(f"{'silu_mul':14s} cos={cos:.8f} mse={mse:.8e} rel_mse={rel:.8e}")
+    print_metric("silu_mul", itrace["gated"], silu_ref)
     if itrace["prob_i16"] is not None:
         prob_ref, pv_ref = attention_refs(itrace)
-        cos, mse, rel = metrics(itrace["prob_i16"].float() / 16383.0, prob_ref)
-        print(f"{'softmax_i16':14s} cos={cos:.8f} mse={mse:.8e} rel_mse={rel:.8e}")
-        cos, mse, rel = metrics(itrace["attn"], pv_ref)
-        print(f"{'pv_i16v8':14s} cos={cos:.8f} mse={mse:.8e} rel_mse={rel:.8e}")
+        print_metric("softmax_i16", itrace["prob_i16"].float() / 16383.0, prob_ref)
+        print_metric("pv_i16v8", itrace["attn"], pv_ref)
 
 
 if __name__ == "__main__":
