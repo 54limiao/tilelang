@@ -31,13 +31,10 @@ def rsqrt_lut():
 
 def sigmoid_lut():
     def sigmoid(x):
-        if x <= -7.0:
-            return 0.0
-        if x >= 7.0:
-            return 1.0
+        x = min(max(x, -7.0), 7.0)
         return 1.0 / (1.0 + math.exp(-x))
 
-    return np.array([round(sigmoid((i - 512) / 64.0) * Q15_16) for i in range(1024)], dtype=np.int32)
+    return np.array([round(sigmoid((i - 512) / 64.0) * 1024.0) for i in range(1024)], dtype=np.int32)
 
 
 def fake_quant(x, scale, dtype=torch.int16):
@@ -160,7 +157,7 @@ def silu_q15_16_kernel(rows, cols):
             sig = T.alloc_fragment((1, cols), "int32")
             for c in T.Parallel(cols):
                 sig[0, c] = T.fix.lut_10bit(X[r, c], LUT, scale=1.0 / 1024.0, out_dtype="int32")
-                Y[r, c] = (X[r, c] >> T.int32(8)) * (sig[0, c] >> T.int32(8))
+                Y[r, c] = (X[r, c] >> T.int32(10)) * sig[0, c]
 
     return main
 
@@ -339,12 +336,12 @@ def test_rmsnorm_q15_16_cuda():
 
 @tilelang.testing.requires_cuda
 def test_silu_q15_16_cuda():
-    x = torch.linspace(-6.0, 6.0, 256, device="cuda").reshape(2, 128)
+    x = torch.linspace(-9.0, 9.0, 256, device="cuda").reshape(2, 128)
     qx = fake_quant(x, 1.0 / Q15_16, torch.int32)
     lut = torch.from_numpy(sigmoid_lut()).cuda()
     y = tilelang.compile(silu_q15_16_kernel(*qx.shape), out_idx=[2], target="cuda")(qx, lut)
     sig = lut[torch.round(qx.float() / 1024.0).clamp(-512, 511).int() + 512]
-    ref = (qx >> 8) * (sig >> 8)
+    ref = (qx >> 10) * sig
     torch.testing.assert_close(y, ref, rtol=0, atol=0)
 
 

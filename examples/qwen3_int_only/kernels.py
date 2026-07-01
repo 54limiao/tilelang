@@ -22,13 +22,10 @@ def rsqrt_lut():
 
 def sigmoid_lut():
     def sigmoid(x):
-        if x <= -7.0:
-            return 0.0
-        if x >= 7.0:
-            return 1.0
+        x = min(max(x, -7.0), 7.0)
         return 1.0 / (1.0 + math.exp(-x))
 
-    return np.array([round(sigmoid((i - 512) / 64.0) * Q15_16) for i in range(1024)], dtype=np.int32)
+    return np.array([round(sigmoid((i - 512) / 64.0) * 1024.0) for i in range(1024)], dtype=np.int32)
 
 
 def dynamic_quant_q15_16(rows, cols, out_dtype="int8", qmax_override=None):
@@ -135,7 +132,7 @@ def silu_q15_16(rows, cols):
             sig = T.alloc_fragment((1, cols), "int32")
             for c in T.Parallel(cols):
                 sig[0, c] = T.fix.lut_10bit(X[r, c], LUT, scale=1.0 / 1024.0, out_dtype="int32")
-                Y[r, c] = (X[r, c] >> T.int32(8)) * (sig[0, c] >> T.int32(8))
+                Y[r, c] = (X[r, c] >> T.int32(10)) * sig[0, c]
 
     return main
 

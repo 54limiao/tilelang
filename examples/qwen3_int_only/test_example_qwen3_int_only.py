@@ -165,5 +165,5 @@ def test_silu_q15_16_sigmoid_lut():
     lut = torch.from_numpy(sigmoid_lut()).cuda()
     y = compile_kernel(silu_q15_16(rows, cols), [2])(xq, lut)
     sig = fix_lut_10bit(xq, lut, 1.0 / 1024.0)
-    ref = (xq >> 8) * (sig >> 8)
+    ref = (xq >> 10) * sig
     torch.testing.assert_close(y, ref, rtol=0, atol=0)
