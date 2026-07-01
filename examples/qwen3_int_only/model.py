@@ -5,9 +5,12 @@ import time
 
 import torch
 from safetensors import safe_open
+from safetensors.torch import load_file
 
 from examples.qwen3_int_only.kernels import (
     Q15_16,
+    MASK,
+    Q_MULTIPLIER_WIDTH,
     add_q15_16,
     compile_kernel,
     dynamic_quant_q15_16,
@@ -16,7 +19,6 @@ from examples.qwen3_int_only.kernels import (
     linear_dynamic_int8_q15_16,
     linear_dynamic_int16_q15_16,
     mul_q15_16,
-    packed_scale_matrix,
     rmsnorm_i16_q15_16_weighted,
     rope_q15_16,
     rsqrt_lut,
@@ -63,6 +65,13 @@ def rope_tables_q15_16(seq_len, head_dim, rope_theta=1_000_000.0, device="cuda")
     inv = rope_theta ** (-(2.0 * dim) / head_dim)
     theta = pos * inv
     return q15_16(torch.cos(theta)), q15_16(torch.sin(theta)), theta
+
+
+def packed_scale_matrix_torch(scales):
+    frac, exp = torch.frexp(scales.to(torch.float64).clamp_min(1e-12))
+    shift = (Q_MULTIPLIER_WIDTH - exp).to(torch.int64)
+    mul = torch.round(frac * MASK).to(torch.int64)
+    return ((shift << Q_MULTIPLIER_WIDTH) | (mul & MASK)).to(torch.uint32)
 
 
 @dataclass
@@ -186,6 +195,29 @@ def load_final_norm(model_dir="/code/Qwen3-0.6B", device="cuda"):
         return q15_16(f.get_tensor("model.norm.weight").to(torch.float32).to(device))
 
 
+def load_packed_qwen3(packed_dir, config=QWEN3_0_6B, device="cuda"):
+    tensors = load_file(f"{packed_dir}/qwen3_int_only.safetensors", device=device)
+    blocks = []
+    for layer_idx in range(config.num_hidden_layers):
+        p = f"layers.{layer_idx}"
+        blocks.append(
+            Qwen3BlockWeights(
+                Int8LinearWeight(tensors[f"{p}.q_proj.weight"], tensors[f"{p}.q_proj.scale"]),
+                Int8LinearWeight(tensors[f"{p}.k_proj.weight"], tensors[f"{p}.k_proj.scale"]),
+                Int8LinearWeight(tensors[f"{p}.v_proj.weight"], tensors[f"{p}.v_proj.scale"]),
+                Int8LinearWeight(tensors[f"{p}.o_proj.weight"], tensors[f"{p}.o_proj.scale"]),
+                Int8LinearWeight(tensors[f"{p}.gate_proj.weight"], tensors[f"{p}.gate_proj.scale"]),
+                Int8LinearWeight(tensors[f"{p}.up_proj.weight"], tensors[f"{p}.up_proj.scale"]),
+                Int8LinearWeight(tensors[f"{p}.down_proj.weight"], tensors[f"{p}.down_proj.scale"]),
+                tensors[f"{p}.input_layernorm"],
+                tensors[f"{p}.post_attention_layernorm"],
+                tensors[f"{p}.q_norm"],
+                tensors[f"{p}.k_norm"],
+            )
+        )
+    return tensors["model.embed_tokens.weight"], tensors["lm_head.weight"], tensors["model.norm.weight"], blocks
+
+
 def rmsnorm_torch(x, weight):
     return x / torch.sqrt(torch.mean(x * x, dim=-1, keepdim=True) + 1e-6) * weight
 
@@ -285,7 +317,7 @@ class Qwen3IntOnlyBlock:
         group = self.config.num_attention_heads // self.config.num_key_value_heads
         q_scale = qrs12.reshape(self.seq_len, self.config.num_attention_heads).permute(1, 0).to(torch.float64) / Q15_16
         k_scale = krs12.reshape(self.seq_len, self.config.num_key_value_heads).repeat_interleave(group, dim=1).permute(1, 0).to(torch.float64) / Q15_16
-        score_q = torch.from_numpy(packed_scale_matrix(q_scale[:, :, None] * k_scale[:, None, :] / (self.config.head_dim**0.5) * 64.0).reshape(-1)).cuda()
+        score_q = packed_scale_matrix_torch(q_scale[:, :, None] * k_scale[:, None, :] / (self.config.head_dim**0.5) * 64.0).reshape(-1).contiguous()
         q12_attn = qr12.reshape(self.seq_len, self.config.num_attention_heads, self.config.head_dim).permute(1, 0, 2).contiguous()
         k12_attn = kr12.reshape(self.seq_len, self.config.num_key_value_heads, self.config.head_dim).repeat_interleave(group, dim=1).permute(1, 0, 2).contiguous()
         v12_attn = v12.reshape(self.seq_len, self.config.num_key_value_heads, self.config.head_dim).repeat_interleave(group, dim=1).permute(1, 0, 2).contiguous()
@@ -307,17 +339,20 @@ class Qwen3IntOnlyBlock:
 
 
 class Qwen3IntOnlyModel:
-    def __init__(self, seq_len, model_dir="/code/Qwen3-0.6B", config=QWEN3_0_6B):
+    def __init__(self, seq_len, model_dir="/code/Qwen3-0.6B", packed_dir=None, config=QWEN3_0_6B):
         self.seq_len = seq_len
         self.config = config
         self.block = Qwen3IntOnlyBlock(seq_len, config)
         self.final_norm_kernel = compile_kernel(rmsnorm_i16_q15_16_weighted(seq_len, config.hidden_size), [3])
         self.lut_rsqrt = torch.from_numpy(rsqrt_lut()).cuda()
         self.cos, self.sin, _ = rope_tables_q15_16(seq_len, config.head_dim, config.rope_theta)
-        self.final_norm = load_final_norm(model_dir)
-        self.embed = load_embed_tokens(model_dir)
-        self.lm_head = load_lm_head(model_dir)
-        self.layers = load_all_qwen3_block_weights(model_dir, config)
+        if packed_dir is None:
+            self.final_norm = load_final_norm(model_dir)
+            self.embed = load_embed_tokens(model_dir)
+            self.lm_head = load_lm_head(model_dir)
+            self.layers = load_all_qwen3_block_weights(model_dir, config)
+        else:
+            self.embed, self.lm_head, self.final_norm, self.layers = load_packed_qwen3(packed_dir, config)
 
     def embed_input(self, input_ids):
         return q15_16(self.embed[input_ids])

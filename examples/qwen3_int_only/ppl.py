@@ -38,16 +38,17 @@ def local_float_ppl(model_dir, max_tokens, layers, verbose):
 
 
 @torch.no_grad()
-def int_only_ppl(model_dir, max_tokens, layers, verbose):
+def int_only_ppl(model_dir, packed_dir, max_tokens, layers, verbose):
     tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True, trust_remote_code=True)
     ids = input_tokens(tokenizer, max_tokens, "cuda")
-    model = Qwen3IntOnlyModel(ids.numel() - 1, model_dir=model_dir)
+    model = Qwen3IntOnlyModel(ids.numel() - 1, model_dir=model_dir, packed_dir=packed_dir)
     return ppl_from_logits(model.logits(ids[:-1], layers=layers, verbose=verbose).float(), ids[1:])
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-dir", default="/code/Qwen3-0.6B")
+    parser.add_argument("--packed-dir")
     parser.add_argument("--backend", choices=["hf", "local-float", "int-only"], default="local-float")
     parser.add_argument("--max-tokens", type=int, default=2049)
     parser.add_argument("--layers", type=int)
@@ -59,7 +60,7 @@ def main():
     elif args.backend == "local-float":
         ppl, loss, ntokens = local_float_ppl(args.model_dir, args.max_tokens, args.layers, args.verbose)
     else:
-        ppl, loss, ntokens = int_only_ppl(args.model_dir, args.max_tokens, args.layers, args.verbose)
+        ppl, loss, ntokens = int_only_ppl(args.model_dir, args.packed_dir, args.max_tokens, args.layers, args.verbose)
     print(f"backend={args.backend} tokens={ntokens} loss={loss:.6f} ppl={ppl:.6f}")
 
 
