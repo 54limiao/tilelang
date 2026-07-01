@@ -46,6 +46,12 @@ def dequant_rows(q, scale):
     return q.float() * scale.float()[:, None] / Q15_16
 
 
+def linear_ref(x, weights, name):
+    packed = getattr(weights, name)
+    w = packed.weight.float() * (packed.scale.float() / Q15_16)[:, None]
+    return x @ w.T
+
+
 def attach_dequant_fp(weights: Qwen3BlockWeights):
     for name in ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"):
         packed = getattr(weights, name)
@@ -106,6 +112,15 @@ def main():
         print(f"{name:14s} cos={cos:.8f} mse={mse:.8e} rel_mse={rel:.8e}")
         cos, mse, rel = metrics(value, itrace[base])
         print(f"{name + '_loss':14s} cos={cos:.8f} mse={mse:.8e} rel_mse={rel:.8e}")
+    post_qdq = dequant_rows(itrace["post8"], itrace["post_s8"])
+    gate_qdq_ref = linear_ref(post_qdq, imodel.layers[args.layer], "gate_proj")
+    up_qdq_ref = linear_ref(post_qdq, imodel.layers[args.layer], "up_proj")
+    for name, value, ref in (("gate_from_post_qdq", itrace["gate"], gate_qdq_ref), ("up_from_post_qdq", itrace["up"], up_qdq_ref)):
+        cos, mse, rel = metrics(value, ref)
+        print(f"{name:14s} cos={cos:.8f} mse={mse:.8e} rel_mse={rel:.8e}")
+    silu_ref = torch.nn.functional.silu(itrace["gate"]) * itrace["up"]
+    cos, mse, rel = metrics(itrace["gated"], silu_ref)
+    print(f"{'silu_mul':14s} cos={cos:.8f} mse={mse:.8e} rel_mse={rel:.8e}")
     if itrace["prob_i16"] is not None:
         prob_ref, pv_ref = attention_refs(itrace)
         cos, mse, rel = metrics(itrace["prob_i16"].float() / 16383.0, prob_ref)

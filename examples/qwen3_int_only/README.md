@@ -186,6 +186,8 @@ Current q/k/v QDQ loss is also small. On layer 1, `q_qdq_loss rel_mse=5.37294778
 
 Current MLP-side QDQ split shows the same pattern. On layer 1, `attn_qdq_loss rel_mse=4.93896310e-04` and `post_qdq_loss rel_mse=1.12665730e-04`, while `gated rel_mse=8.93671289e-02` and `gated_qdq_loss rel_mse=1.29515920e-02`. The next quality target is therefore the fixed-point SiLU/gate-up product path, not the surrounding dynamic quantization.
 
+The deeper MLP trace shows the SiLU kernel itself is accurate against torch using the same fixed-point gate/up inputs: `silu_mul rel_mse=4.55698144e-04` on layer 0 and `2.64857546e-04` on layer 1. Gate/up projection from post-RMS QDQ is also small (`gate_from_post_qdq rel_mse=2.11212205e-06`, `up_from_post_qdq rel_mse=2.06542627e-05` on layer 1). The large gated-vs-float error is therefore inherited from earlier hidden-state/residual/RMSNorm drift, not the SiLU or gate/up kernels.
+
 Current same-machine single-layer 2048-token-class profile baseline (`--warmup 1 --repeat 5`):
 
 ```text
