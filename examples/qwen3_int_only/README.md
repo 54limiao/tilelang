@@ -24,6 +24,7 @@ For reproducible static-quantization experiments, use the shared model and datas
 ```
 
 Static attention activation scales are packed with the weights. The current packed scale slots are per-head `q_pre_rope_i16`, `k_pre_rope_i16`, `q_post_rope_i8`, `k_post_rope_i8`, and `v_i8`; runtime kernels should read these scales instead of calibrating.
+Quantization scales use no-clip ceil amax: `(amax + qmax - 1) // qmax`, clamped to at least 1. Re-run `prepack.py` after changing this scale rule because static attention scales are serialized into the pack.
 
 ```bash
 /root/venv/bin/python examples/qwen3_int_only/prepack.py \
@@ -189,6 +190,8 @@ Current MLP-side QDQ split shows the same pattern. On layer 1, `attn_qdq_loss re
 The deeper MLP trace shows the SiLU kernel itself is accurate against torch using the same fixed-point gate/up inputs: `silu_mul rel_mse=4.55698144e-04` on layer 0 and `2.64857546e-04` on layer 1. Gate/up projection from post-RMS QDQ is also small (`gate_from_post_qdq rel_mse=2.11212205e-06`, `up_from_post_qdq rel_mse=2.06542627e-05` on layer 1). The large gated-vs-float error is therefore inherited from earlier hidden-state/residual/RMSNorm drift, not the SiLU or gate/up kernels.
 
 Residual/RMSNorm trace now splits kernel-local error from input drift. `attn_resid_add` and `layer_out_add` are exact on layers 0 and 1. Dynamic quantization now uses no-clip ceil amax scales; this removes the previous RMSNorm-local max clipping error. Layer 0 has `post_rms_kern rel_mse=5.62097284e-07` while `post_rms_int rel_mse=1.22313248e-02`; layer 1 has `post_rms_kern rel_mse=6.15960857e-07` while `post_rms_int rel_mse=2.08080132e-02`. Layer 1 input RMSNorm has the same split: `input_rms_kern rel_mse=6.40880103e-07` and `input_rms_int rel_mse=1.60594936e-02`. So residual add and RMSNorm kernels are no longer quality sources; the remaining larger error is already present in the int hidden state entering RMSNorm.
+
+Repacking the static attention calibration with the same no-clip ceil scale rule makes the serialized q/k/v scales consistent, but it is not the main quality lever on the current FineWeb 256-token sweep. With `/tmp/Qwen3-0.6B-static-ceil-calib-32x2048`, the layer sweep was `layers=1 rel_mse=6.17165126e-03`, `layers=2 rel_mse=5.93324587e-03`, `layers=4 rel_mse=1.59930011e-02`, and `layers=8 rel_mse=3.27977759e-02`. The main RMSNorm improvement comes from runtime dynamic no-clip scale, while deeper-layer drift still needs attention/MLP hidden-state work.
 
 Current same-machine single-layer 2048-token-class profile baseline (`--warmup 1 --repeat 5`):
 
