@@ -48,7 +48,7 @@ def dynamic_quant_q15_16(rows, cols, out_dtype="int8", qmax_override=None):
                 if abs_x[0, c] < T.int32(0):
                     abs_x[0, c] = T.int32(0) - abs_x[0, c]
             T.reduce_max(abs_x, amax, dim=1, clear=True)
-            scale[0] = T.max(amax[0] // T.int32(qmax), T.int32(1))
+            scale[0] = T.max((amax[0] + T.int32(qmax - 1)) // T.int32(qmax), T.int32(1))
             S[r] = T.cast(scale[0], "uint32")
             for c in T.Parallel(cols):
                 abs_x[0, c] = T.min(T.max(X[r, c] // scale[0], T.int32(0 - qmax - 1)), T.int32(qmax))
@@ -99,7 +99,7 @@ def add_dynamic_quant_q15_16(rows, cols, qmax=4095):
                 if abs_x[0, c] < T.int32(0):
                     abs_x[0, c] = T.int32(0) - abs_x[0, c]
             T.reduce_max(abs_x, amax, dim=1, clear=True)
-            scale[0] = T.max(amax[0] // T.int32(qmax), T.int32(1))
+            scale[0] = T.max((amax[0] + T.int32(qmax - 1)) // T.int32(qmax), T.int32(1))
             S[r] = T.cast(scale[0], "uint32")
             for c in T.Parallel(cols):
                 Y[r, c] = vals[0, c]
@@ -139,7 +139,7 @@ def add_rmsnorm_q15_16_weighted(rows, cols, qmax=32767):
                 if q[0, c] < T.int32(0):
                     q[0, c] = T.int32(0) - q[0, c]
             T.reduce_max(q, amax, dim=1, clear=True)
-            scale[0] = T.max(amax[0] // T.int32(qmax), T.int32(1))
+            scale[0] = T.max((amax[0] + T.int32(qmax - 1)) // T.int32(qmax), T.int32(1))
             for c in T.Parallel(cols):
                 q[0, c] = T.min(T.max(Y[r, c] // scale[0], T.int32(0 - qmax - 1)), T.int32(qmax))
                 xx[0, c] = (q[0, c] * q[0, c]) >> T.int32(mean_shift)
@@ -247,7 +247,7 @@ def rmsnorm_q15_16_weighted(rows, cols, qmax=32767):
                 if q[0, c] < T.int32(0):
                     q[0, c] = T.int32(0) - q[0, c]
             T.reduce_max(q, amax, dim=1, clear=True)
-            scale[0] = T.max(amax[0] // T.int32(qmax), T.int32(1))
+            scale[0] = T.max((amax[0] + T.int32(qmax - 1)) // T.int32(qmax), T.int32(1))
             for c in T.Parallel(cols):
                 q[0, c] = T.min(T.max(X[r, c] // scale[0], T.int32(0 - qmax - 1)), T.int32(qmax))
                 xx[0, c] = (q[0, c] * q[0, c]) >> T.int32(mean_shift)
@@ -305,7 +305,7 @@ def rmsnorm_q15_16_grouped_weighted(rows, groups, group_cols, qmax=32767):
                 if abs_x[0, c] < T.int32(0):
                     abs_x[0, c] = T.int32(0) - abs_x[0, c]
             T.reduce_max(abs_x, amax, dim=1, clear=True)
-            scale[0] = T.max(amax[0] // T.int32(qmax), T.int32(1))
+            scale[0] = T.max((amax[0] + T.int32(qmax - 1)) // T.int32(qmax), T.int32(1))
             for c in T.Parallel(group_cols):
                 q[0, c] = T.min(T.max(X[r, g * group_cols + c] // scale[0], T.int32(0 - qmax - 1)), T.int32(qmax))
                 xx[0, c] = (q[0, c] * q[0, c]) >> T.int32(mean_shift)
@@ -355,7 +355,7 @@ def silu_mul_dynamic_quant_q15_16(rows, cols):
                 if abs_x[0, c] < T.int32(0):
                     abs_x[0, c] = T.int32(0) - abs_x[0, c]
             T.reduce_max(abs_x, amax, dim=1, clear=True)
-            scale[0] = T.max(amax[0] // T.int32(127), T.int32(1))
+            scale[0] = T.max((amax[0] + T.int32(126)) // T.int32(127), T.int32(1))
             S[r] = T.cast(scale[0], "uint32")
             for c in T.Parallel(cols):
                 Y[r, c] = vals[0, c]

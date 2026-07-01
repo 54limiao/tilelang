@@ -166,17 +166,17 @@ backend=int-only --use-r1 --use-r2 --use-r3 --split-attn tokens=4096 loss=3.6280
 Current FineWeb 256-token cumulative layer sweep against local float:
 
 ```text
-layers=1 backend=int-only tokens=256 loss=14.241476 ppl=1531067.953902 compare=local-float cos=0.99556057 mse=3.10909846e-01 rel_mse=8.94781789e-03
-layers=2 backend=int-only tokens=256 loss=12.809982 ppl=365851.319804 compare=local-float cos=0.99526169 mse=4.73308714e-01 rel_mse=9.70253042e-03
-layers=4 backend=int-only tokens=256 loss=12.286460 ppl=216741.336274 compare=local-float cos=0.99096497 mse=9.77206377e-01 rel_mse=1.87624521e-02
-layers=8 backend=int-only tokens=256 loss=11.688217 ppl=119159.375157 compare=local-float cos=0.98516666 mse=2.15970396e+00 rel_mse=3.20034156e-02
+layers=1 backend=int-only tokens=256 loss=14.217113 ppl=1494216.491091 compare=local-float cos=0.99699614 mse=2.13716682e-01 rel_mse=6.15065098e-03
+layers=2 backend=int-only tokens=256 loss=12.797936 ppl=361470.762677 compare=local-float cos=0.99711432 mse=2.89199071e-01 rel_mse=5.92839873e-03
+layers=4 backend=int-only tokens=256 loss=12.280800 ppl=215518.033190 compare=local-float cos=0.99232234 mse=8.13625268e-01 rel_mse=1.56216798e-02
+layers=8 backend=int-only tokens=256 loss=11.599915 ppl=109088.477353 compare=local-float cos=0.98492364 mse=2.16168671e+00 rel_mse=3.20327968e-02
 ```
 
 Current 64-token block trace highlights:
 
 ```text
-layer=0 input_rms rel_mse=1.06552034e-06 q rel_mse=7.91176164e-04 attn rel_mse=2.00207401e-02 softmax_i16 rel_mse=8.68347660e-03 pv_i16v8 rel_mse=2.60004634e-03 mlp rel_mse=4.60865684e-02 layer_out rel_mse=1.74910743e-02
-layer=1 input_rms rel_mse=2.37806290e-02 q rel_mse=2.27384176e-02 attn rel_mse=9.51652229e-02 softmax_i16 rel_mse=1.78841676e-03 pv_i16v8 rel_mse=1.32548052e-03 mlp rel_mse=9.14253369e-02 layer_out rel_mse=3.40638570e-02
+layer=0 input_rms rel_mse=1.06552034e-06 q rel_mse=7.68633152e-04 attn rel_mse=1.80518553e-02 softmax_i16 rel_mse=8.43968149e-03 pv_i16v8 rel_mse=2.41573271e-03 mlp rel_mse=4.08283882e-02 layer_out rel_mse=1.56490020e-02
+layer=1 input_rms rel_mse=1.60626341e-02 q rel_mse=1.56723578e-02 attn rel_mse=7.03484714e-02 softmax_i16 rel_mse=1.81590114e-03 pv_i16v8 rel_mse=1.28780154e-03 mlp rel_mse=6.44694865e-02 layer_out rel_mse=2.50392985e-02
 layer=2 input_rms rel_mse=3.90793644e-02 q rel_mse=4.33117785e-02 attn rel_mse=9.49960873e-02 mlp rel_mse=1.28384978e-02 layer_out rel_mse=1.28336456e-02
 ```
 
@@ -188,7 +188,7 @@ Current MLP-side QDQ split shows the same pattern. On layer 1, `attn_qdq_loss re
 
 The deeper MLP trace shows the SiLU kernel itself is accurate against torch using the same fixed-point gate/up inputs: `silu_mul rel_mse=4.55698144e-04` on layer 0 and `2.64857546e-04` on layer 1. Gate/up projection from post-RMS QDQ is also small (`gate_from_post_qdq rel_mse=2.11212205e-06`, `up_from_post_qdq rel_mse=2.06542627e-05` on layer 1). The large gated-vs-float error is therefore inherited from earlier hidden-state/residual/RMSNorm drift, not the SiLU or gate/up kernels.
 
-Residual/RMSNorm trace now splits kernel-local error from input drift. `attn_resid_add` and `layer_out_add` are exact on layers 0 and 1. RMSNorm kernel-local error is smaller than the total post-RMS error: layer 0 has `post_rms_kern rel_mse=8.72641162e-04` while `post_rms_int rel_mse=1.41499536e-02`; layer 1 has `post_rms_kern rel_mse=7.91632757e-03` while `post_rms_int rel_mse=2.53415368e-02`. Layer 1 input RMSNorm has the same split: `input_rms_kern rel_mse=6.16508350e-03` and `input_rms_int rel_mse=1.79218818e-02`. So the residual add kernels are not a quality source; Q15 dynamic RMSNorm approximation is measurable, but the larger error is already present in the int hidden state entering RMSNorm.
+Residual/RMSNorm trace now splits kernel-local error from input drift. `attn_resid_add` and `layer_out_add` are exact on layers 0 and 1. Dynamic quantization now uses no-clip ceil amax scales; this removes the previous RMSNorm-local max clipping error. Layer 0 has `post_rms_kern rel_mse=5.62097284e-07` while `post_rms_int rel_mse=1.22313248e-02`; layer 1 has `post_rms_kern rel_mse=6.15960857e-07` while `post_rms_int rel_mse=2.08080132e-02`. Layer 1 input RMSNorm has the same split: `input_rms_kern rel_mse=6.40880103e-07` and `input_rms_int rel_mse=1.60594936e-02`. So residual add and RMSNorm kernels are no longer quality sources; the remaining larger error is already present in the int hidden state entering RMSNorm.
 
 Current same-machine single-layer 2048-token-class profile baseline (`--warmup 1 --repeat 5`):
 

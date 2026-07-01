@@ -55,7 +55,7 @@ def eval_windows(tokenizer, args, device):
 
 def quant_i8_q15_16(x):
     xq = torch.clamp(torch.round(x * Q15_16), -(1 << 31), (1 << 31) - 1).to(torch.int32)
-    scale = torch.div(xq.abs().amax(dim=-1), 127, rounding_mode="floor").clamp(min=1).to(torch.uint32)
+    scale = torch.div(xq.abs().amax(dim=-1) + 126, 127, rounding_mode="floor").clamp(min=1).to(torch.uint32)
     y = torch.div(xq, scale.int()[..., None], rounding_mode="floor").clamp(-128, 127).to(torch.int8)
     return y, scale
 

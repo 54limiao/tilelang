@@ -44,6 +44,10 @@ def q15(x):
     return torch.clamp(torch.round(x * Q15_16), -(1 << 31), (1 << 31) - 1).to(torch.int32)
 
 
+def ceil_scale(x, qmax, dim):
+    return torch.div(x.abs().amax(dim=dim) + qmax - 1, qmax, rounding_mode="floor").clamp(min=1).to(torch.uint32)
+
+
 def fix_quant_i32(x, scale):
     mul = (scale & MASK).to(torch.int64)
     shift = (scale >> Q_MULTIPLIER_WIDTH).to(torch.int64)
@@ -73,7 +77,7 @@ def test_dynamic_quant_i12():
     xq = torch.round(x * Q15_16).to(torch.int32)
     kernel = compile_kernel(dynamic_quant_q15_16(rows, cols, "int16", 2047), [1, 2])
     y, s = kernel(xq)
-    ref_s = torch.div(xq.abs().amax(dim=1), 2047, rounding_mode="floor").clamp(min=1).to(torch.uint32)
+    ref_s = ceil_scale(xq, 2047, 1)
     ref_y = torch.div(xq, ref_s.int()[:, None], rounding_mode="floor").clamp(-2048, 2047).to(torch.int16)
     torch.testing.assert_close(s, ref_s, rtol=0, atol=0)
     torch.testing.assert_close(y, ref_y, rtol=0, atol=0)
@@ -85,7 +89,7 @@ def test_dynamic_quant_i16():
     xq = torch.randint(-180000, 180001, (rows, cols), device="cuda", dtype=torch.int32)
     kernel = compile_kernel(dynamic_quant_q15_16(rows, cols, "int16"), [1, 2])
     y, s = kernel(xq)
-    ref_s = torch.div(xq.abs().amax(dim=1), 32767, rounding_mode="floor").clamp(min=1).to(torch.uint32)
+    ref_s = ceil_scale(xq, 32767, 1)
     ref_y = torch.div(xq, ref_s.int()[:, None], rounding_mode="floor").clamp(-32768, 32767).to(torch.int16)
     torch.testing.assert_close(s, ref_s, rtol=0, atol=0)
     torch.testing.assert_close(y, ref_y, rtol=0, atol=0)
@@ -96,7 +100,7 @@ def test_static_quant_per_head_i16():
     torch.manual_seed(0)
     tokens, heads, head_dim = 7, 5, 64
     x = torch.randint(-900000, 900001, (tokens, heads, head_dim), device="cuda", dtype=torch.int32)
-    scale = torch.div(x.abs().amax(dim=(0, 2)), 32767, rounding_mode="floor").clamp(min=1).to(torch.uint32)
+    scale = ceil_scale(x, 32767, (0, 2))
     y = compile_kernel(static_quant_q15_16_per_head(tokens, heads, head_dim, "int16"), [2])(x, scale)
     ref = torch.div(x, scale.int()[None, :, None], rounding_mode="floor").clamp(-32768, 32767).to(torch.int16)
     torch.testing.assert_close(y, ref, rtol=0, atol=0)
@@ -107,7 +111,7 @@ def test_static_quant_per_head_i8():
     torch.manual_seed(0)
     tokens, heads, head_dim = 7, 5, 64
     x = torch.randint(-900000, 900001, (tokens, heads, head_dim), device="cuda", dtype=torch.int32)
-    scale = torch.div(x.abs().amax(dim=(0, 2)), 127, rounding_mode="floor").clamp(min=1).to(torch.uint32)
+    scale = ceil_scale(x, 127, (0, 2))
     y = compile_kernel(static_quant_q15_16_per_head(tokens, heads, head_dim, "int8"), [2])(x, scale)
     ref = torch.div(x, scale.int()[None, :, None], rounding_mode="floor").clamp(-128, 127).to(torch.int8)
     torch.testing.assert_close(y, ref, rtol=0, atol=0)
@@ -219,8 +223,8 @@ def test_rmsnorm_q15_matches_float_reference():
     w = (torch.randn(cols, device="cuda") * 0.03 + 1.0).clamp(0.8, 1.2)
     xq = q15(x)
     y = compile_kernel(rmsnorm_q15_16_weighted(rows, cols), [3])(xq, q15(w), torch.from_numpy(rsqrt_lut()).cuda())
-    scale = torch.div(xq.abs().amax(dim=-1), 32767, rounding_mode="floor").clamp_min(1)
-    q = torch.div(xq, scale[:, None], rounding_mode="floor").clamp(-32768, 32767)
+    scale = ceil_scale(xq, 32767, -1)
+    q = torch.div(xq, scale.int()[:, None], rounding_mode="floor").clamp(-32768, 32767)
     ref = q15(q.float() / torch.sqrt(torch.mean(q.float() * q.float(), dim=-1, keepdim=True).clamp_min(1.0)) * w)
     rel = torch.sqrt(torch.mean((y.float() - ref.float()) ** 2)) / torch.sqrt(torch.mean(ref.float() ** 2))
     assert float(rel) < 0.012

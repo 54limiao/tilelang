@@ -27,7 +27,7 @@ def update_head_amax(acc, x):
 
 
 def scale_from_amax(amax, qmax):
-    return torch.div(amax, qmax, rounding_mode="floor").clamp(min=1).to(torch.uint32)
+    return torch.div(amax + qmax - 1, qmax, rounding_mode="floor").clamp(min=1).to(torch.uint32)
 
 
 def load_calib_ids(model_dir, calib_text, calib_parquet, calib_column, tokens, device):
