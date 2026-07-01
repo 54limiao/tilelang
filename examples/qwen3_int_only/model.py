@@ -31,6 +31,7 @@ from examples.qwen3_int_only.kernels import (
     rope_q15_16,
     rsqrt_lut,
     sigmoid_lut,
+    static_quant_q15_16_per_head,
     silu_mul_dynamic_quant_q15_16,
 )
 from examples.qwen3_int_only.quarot import ROTATE_SEED, random_hadamard_rotation
@@ -292,6 +293,8 @@ class Qwen3IntOnlyBlock:
         self.dq8_hidden = compile_kernel(dynamic_quant_q15_16(seq_len, h, "int8"), [1, 2])
         self.dq8_q_head = compile_kernel(dynamic_quant_q15_16(seq_len * qh, hd, "int8"), [1, 2])
         self.dq8_kv_head = compile_kernel(dynamic_quant_q15_16(seq_len * kvh, hd, "int8"), [1, 2])
+        self.sq8_q_head = compile_kernel(static_quant_q15_16_per_head(seq_len, qh, hd, "int8"), [2])
+        self.sq8_kv_head = compile_kernel(static_quant_q15_16_per_head(seq_len, kvh, hd, "int8"), [2])
         self.dq8_q = compile_kernel(dynamic_quant_q15_16(seq_len, q_dim, "int8"), [1, 2])
         self.qkv_proj_i8 = compile_kernel(linear_dynamic_int8_qkv_q15_16(seq_len, h, q_dim, kv_dim, 32, 64, 128), [8, 9, 10])
         self.o_proj = compile_kernel(linear_dynamic_int8_q15_16(seq_len, q_dim, h, 32, 32, 128), [4])
@@ -338,9 +341,17 @@ class Qwen3IntOnlyBlock:
         else:
             qr = self.rope_q(q_heads, cos_q, sin_q)
             kr = self.rope_k(k_heads, cos_k, sin_k)
-        q8, qs8 = self.dq8_q_head(qr)
-        k8, ks8 = self.dq8_kv_head(kr)
-        v8, vs8 = self.dq8_kv_head(v_heads)
+        if weights.q_post_rope_i8_scale is not None and weights.k_post_rope_i8_scale is not None and weights.v_i8_scale is not None:
+            q8 = self.sq8_q_head(qr.reshape(self.seq_len, self.config.num_attention_heads, self.config.head_dim), weights.q_post_rope_i8_scale)
+            k8 = self.sq8_kv_head(kr.reshape(self.seq_len, self.config.num_key_value_heads, self.config.head_dim), weights.k_post_rope_i8_scale)
+            v8 = self.sq8_kv_head(v_heads.reshape(self.seq_len, self.config.num_key_value_heads, self.config.head_dim), weights.v_i8_scale)
+            qs8 = weights.q_post_rope_i8_scale[None, :].expand(self.seq_len, self.config.num_attention_heads).contiguous()
+            ks8 = weights.k_post_rope_i8_scale[None, :].expand(self.seq_len, self.config.num_key_value_heads).contiguous()
+            vs8 = weights.v_i8_scale[None, :].expand(self.seq_len, self.config.num_key_value_heads).contiguous()
+        else:
+            q8, qs8 = self.dq8_q_head(qr)
+            k8, ks8 = self.dq8_kv_head(kr)
+            v8, vs8 = self.dq8_kv_head(v_heads)
         q_attn = q8.reshape(self.seq_len, self.config.num_attention_heads, self.config.head_dim).permute(1, 0, 2).contiguous()
         k_attn = k8.reshape(self.seq_len, self.config.num_key_value_heads, self.config.head_dim).permute(1, 0, 2).contiguous()
         v_attn = v8.reshape(self.seq_len, self.config.num_key_value_heads, self.config.head_dim).permute(1, 0, 2).contiguous()

@@ -34,7 +34,9 @@ Static attention activation scales are packed with the weights. The current pack
   --use-r3 \
   --calib-parquet /publicdata/huggingface.co/datasets/HuggingFaceFW/fineweb/sample/10BT/000_00000.parquet \
   --calib-column text \
-  --calib-tokens 4096
+  --calib-seq-len 2048 \
+  --calib-batches 32 \
+  --calib-prefix-tokens 512
 ```
 
 Run perplexity on the bundled Declaration of Independence text:

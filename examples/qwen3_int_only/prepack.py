@@ -21,8 +21,13 @@ from examples.qwen3_int_only.quarot import (
 TEXT_PATH = Path(__file__).resolve().parent / "data" / "declaration_of_independence.txt"
 
 
-def static_head_scale(x, qmax):
-    return torch.div(x.abs().amax(dim=(0, 2)), qmax, rounding_mode="floor").clamp(min=1).to(torch.uint32)
+def update_head_amax(acc, x):
+    cur = x.abs().amax(dim=(0, 2)).to(torch.int64)
+    return cur if acc is None else torch.maximum(acc, cur)
+
+
+def scale_from_amax(amax, qmax):
+    return torch.div(amax, qmax, rounding_mode="floor").clamp(min=1).to(torch.uint32)
 
 
 def load_calib_ids(model_dir, calib_text, calib_parquet, calib_column, tokens, device):
@@ -45,46 +50,64 @@ def load_calib_ids(model_dir, calib_text, calib_parquet, calib_column, tokens, d
 
 
 @torch.no_grad()
-def calibrate_attention_scales(embed, layer_weights, norm_weights, ids, config, r3=None):
-    cos_q15, sin_q15, _ = rope_tables_q15_16(ids.numel(), config.head_dim, config.rope_theta, ids.device)
+def run_calib_segment(x, w, norms, cos, sin, config, r3, prefix_tokens):
+    input_norm, post_norm, q_norm, k_norm = norms
+    h = rmsnorm_torch(x, input_norm)
+    q = h @ w["q_proj"].T
+    k = h @ w["k_proj"].T
+    v = h @ w["v_proj"].T
+    q = rmsnorm_torch(q.reshape(-1, config.num_attention_heads, config.head_dim), q_norm)
+    k = rmsnorm_torch(k.reshape(-1, config.num_key_value_heads, config.head_dim), k_norm)
+    q_rope = rope_torch(q.reshape(-1, config.q_size), cos, sin, config.num_attention_heads, config.head_dim).reshape(-1, config.num_attention_heads, config.head_dim)
+    k_rope = rope_torch(k.reshape(-1, config.kv_size), cos, sin, config.num_key_value_heads, config.head_dim).reshape(-1, config.num_key_value_heads, config.head_dim)
+    if r3 is not None:
+        q_rope = (q_rope.to(torch.float64) @ r3.to(torch.float64)).to(torch.float32)
+        k_rope = (k_rope.to(torch.float64) @ r3.to(torch.float64)).to(torch.float32)
+    v = v.reshape(-1, config.num_key_value_heads, config.head_dim)
+    stats = {
+        "q_pre_rope_i16": q15_16(q[prefix_tokens:]),
+        "k_pre_rope_i16": q15_16(k[prefix_tokens:]),
+        "q_post_rope_i8": q15_16(q_rope[prefix_tokens:]),
+        "k_post_rope_i8": q15_16(k_rope[prefix_tokens:]),
+        "v_i8": q15_16(v[prefix_tokens:]),
+    }
+    group = config.num_attention_heads // config.num_key_value_heads
+    q_attn = q_rope.permute(1, 0, 2)
+    k_attn = k_rope.repeat_interleave(group, dim=1).permute(1, 0, 2)
+    v_attn = v.repeat_interleave(group, dim=1).permute(1, 0, 2)
+    score = q_attn @ k_attn.transpose(-1, -2) / (config.head_dim**0.5)
+    mask = torch.ones(score.shape[-2:], device=score.device, dtype=torch.bool).tril()
+    attn = torch.softmax(score.masked_fill(~mask, torch.finfo(score.dtype).min), dim=-1) @ v_attn
+    attn = attn.permute(1, 0, 2).reshape(x.shape[0], config.q_size)
+    x = x + attn @ w["o_proj"].T
+    m = rmsnorm_torch(x, post_norm)
+    return x + (torch.nn.functional.silu(m @ w["gate_proj"].T) * (m @ w["up_proj"].T)) @ w["down_proj"].T, stats
+
+
+@torch.no_grad()
+def calibrate_attention_scales(embed, layer_weights, norm_weights, ids, config, r3=None, prefix_tokens=0, seq_len=2048):
+    cos_q15, sin_q15, _ = rope_tables_q15_16(seq_len, config.head_dim, config.rope_theta, ids.device)
     cos, sin = cos_q15.float() / 65536.0, sin_q15.float() / 65536.0
-    x = embed[ids]
-    scales = []
-    for w, norms in zip(layer_weights, norm_weights):
-        input_norm, post_norm, q_norm, k_norm = norms
-        h = rmsnorm_torch(x, input_norm)
-        q = h @ w["q_proj"].T
-        k = h @ w["k_proj"].T
-        v = h @ w["v_proj"].T
-        q = rmsnorm_torch(q.reshape(-1, config.num_attention_heads, config.head_dim), q_norm)
-        k = rmsnorm_torch(k.reshape(-1, config.num_key_value_heads, config.head_dim), k_norm)
-        q_rope = rope_torch(q.reshape(-1, config.q_size), cos, sin, config.num_attention_heads, config.head_dim).reshape(-1, config.num_attention_heads, config.head_dim)
-        k_rope = rope_torch(k.reshape(-1, config.kv_size), cos, sin, config.num_key_value_heads, config.head_dim).reshape(-1, config.num_key_value_heads, config.head_dim)
-        if r3 is not None:
-            q_rope = (q_rope.to(torch.float64) @ r3.to(torch.float64)).to(torch.float32)
-            k_rope = (k_rope.to(torch.float64) @ r3.to(torch.float64)).to(torch.float32)
-        v = v.reshape(-1, config.num_key_value_heads, config.head_dim)
-        scales.append(
-            {
-                "q_pre_rope_i16": static_head_scale(q15_16(q), 32767),
-                "k_pre_rope_i16": static_head_scale(q15_16(k), 32767),
-                "q_post_rope_i8": static_head_scale(q15_16(q_rope), 127),
-                "k_post_rope_i8": static_head_scale(q15_16(k_rope), 127),
-                "v_i8": static_head_scale(q15_16(v), 127),
-            }
-        )
-        group = config.num_attention_heads // config.num_key_value_heads
-        q_attn = q_rope.permute(1, 0, 2)
-        k_attn = k_rope.repeat_interleave(group, dim=1).permute(1, 0, 2)
-        v_attn = v.repeat_interleave(group, dim=1).permute(1, 0, 2)
-        score = q_attn @ k_attn.transpose(-1, -2) / (config.head_dim**0.5)
-        mask = torch.ones(score.shape[-2:], device=score.device, dtype=torch.bool).tril()
-        attn = torch.softmax(score.masked_fill(~mask, torch.finfo(score.dtype).min), dim=-1) @ v_attn
-        attn = attn.permute(1, 0, 2).reshape(x.shape[0], config.q_size)
-        x = x + attn @ w["o_proj"].T
-        m = rmsnorm_torch(x, post_norm)
-        x = x + (torch.nn.functional.silu(m @ w["gate_proj"].T) * (m @ w["up_proj"].T)) @ w["down_proj"].T
-    return scales
+    segments = ids.reshape(-1, seq_len)
+    scales = [None for _ in layer_weights]
+    for segment in segments:
+        x = embed[segment]
+        for layer_idx, (w, norms) in enumerate(zip(layer_weights, norm_weights)):
+            x, stats = run_calib_segment(x, w, norms, cos, sin, config, r3, prefix_tokens)
+            if scales[layer_idx] is None:
+                scales[layer_idx] = {name: None for name in stats}
+            for name, value in stats.items():
+                scales[layer_idx][name] = update_head_amax(scales[layer_idx][name], value)
+    return [
+        {
+            "q_pre_rope_i16": scale_from_amax(layer["q_pre_rope_i16"], 32767),
+            "k_pre_rope_i16": scale_from_amax(layer["k_pre_rope_i16"], 32767),
+            "q_post_rope_i8": scale_from_amax(layer["q_post_rope_i8"], 127),
+            "k_post_rope_i8": scale_from_amax(layer["k_post_rope_i8"], 127),
+            "v_i8": scale_from_amax(layer["v_i8"], 127),
+        }
+        for layer in scales
+    ]
 
 
 def main():
@@ -100,6 +123,9 @@ def main():
     parser.add_argument("--calib-parquet")
     parser.add_argument("--calib-column", default="text")
     parser.add_argument("--calib-tokens", type=int, default=0)
+    parser.add_argument("--calib-seq-len", type=int, default=0)
+    parser.add_argument("--calib-batches", type=int, default=0)
+    parser.add_argument("--calib-prefix-tokens", type=int, default=0)
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -159,9 +185,16 @@ def main():
             calib_weights.append(layer_float)
             calib_norms.append((input_norm, post_norm, q_norm, k_norm))
 
-    if args.calib_tokens:
-        ids = load_calib_ids(args.model_dir, args.calib_text, args.calib_parquet, args.calib_column, args.calib_tokens, args.device)
-        for layer_idx, scales in enumerate(calibrate_attention_scales(embed, calib_weights, calib_norms, ids, QWEN3_0_6B, r3)):
+    calib_tokens = args.calib_tokens
+    calib_seq_len = args.calib_seq_len
+    if args.calib_seq_len and args.calib_batches:
+        calib_tokens = args.calib_seq_len * args.calib_batches
+        calib_seq_len = args.calib_seq_len
+    elif args.calib_tokens:
+        calib_seq_len = args.calib_tokens
+    if calib_tokens:
+        ids = load_calib_ids(args.model_dir, args.calib_text, args.calib_parquet, args.calib_column, calib_tokens, args.device)
+        for layer_idx, scales in enumerate(calibrate_attention_scales(embed, calib_weights, calib_norms, ids, QWEN3_0_6B, r3, args.calib_prefix_tokens, calib_seq_len)):
             dst = f"layers.{layer_idx}"
             for name, scale in scales.items():
                 tensors[f"{dst}.{name}.scale"] = scale.cpu().contiguous()
@@ -170,7 +203,15 @@ def main():
     save_file(
         tensors,
         str(path),
-        metadata={"use_r1": str(int(args.use_r1)), "use_r2": str(int(args.use_r2)), "use_r3": str(int(args.use_r3)), "calib_tokens": str(args.calib_tokens)},
+        metadata={
+            "use_r1": str(int(args.use_r1)),
+            "use_r2": str(int(args.use_r2)),
+            "use_r3": str(int(args.use_r3)),
+            "calib_tokens": str(calib_tokens),
+            "calib_seq_len": str(calib_seq_len),
+            "calib_batches": str(args.calib_batches),
+            "calib_prefix_tokens": str(args.calib_prefix_tokens),
+        },
     )
     print(path)
 

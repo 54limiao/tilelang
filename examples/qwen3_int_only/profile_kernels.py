@@ -9,6 +9,7 @@ from examples.qwen3_int_only.model import (
     Qwen3IntOnlyBlock,
     load_all_qwen3_block_weights,
     load_embed_tokens,
+    load_packed_qwen3,
     q15_16,
     rope_tables_q15_16,
 )
@@ -72,9 +73,17 @@ def run_block(block, x_q15_16, weights, cos_q15_16, sin_q15_16, r3_q15, prof, sp
     else:
         qr = prof.time("rope_q", lambda: block.rope_q(q_heads, cos_q, sin_q))
         kr = prof.time("rope_k", lambda: block.rope_k(k_heads, cos_k, sin_k))
-    q8, qs8 = prof.time("dq8_q_head", lambda: block.dq8_q_head(qr))
-    k8, ks8 = prof.time("dq8_kv_head", lambda: block.dq8_kv_head(kr))
-    v8, vs8 = prof.time("dq8_v_head", lambda: block.dq8_kv_head(v_heads))
+    if weights.q_post_rope_i8_scale is not None and weights.k_post_rope_i8_scale is not None and weights.v_i8_scale is not None:
+        q8 = prof.time("sq8_q_head", lambda: block.sq8_q_head(qr.reshape(seq_len, cfg.num_attention_heads, cfg.head_dim), weights.q_post_rope_i8_scale))
+        k8 = prof.time("sq8_kv_head", lambda: block.sq8_kv_head(kr.reshape(seq_len, cfg.num_key_value_heads, cfg.head_dim), weights.k_post_rope_i8_scale))
+        v8 = prof.time("sq8_v_head", lambda: block.sq8_kv_head(v_heads.reshape(seq_len, cfg.num_key_value_heads, cfg.head_dim), weights.v_i8_scale))
+        qs8 = weights.q_post_rope_i8_scale[None, :].expand(seq_len, cfg.num_attention_heads).contiguous()
+        ks8 = weights.k_post_rope_i8_scale[None, :].expand(seq_len, cfg.num_key_value_heads).contiguous()
+        vs8 = weights.v_i8_scale[None, :].expand(seq_len, cfg.num_key_value_heads).contiguous()
+    else:
+        q8, qs8 = prof.time("dq8_q_head", lambda: block.dq8_q_head(qr))
+        k8, ks8 = prof.time("dq8_kv_head", lambda: block.dq8_kv_head(kr))
+        v8, vs8 = prof.time("dq8_v_head", lambda: block.dq8_kv_head(v_heads))
     q_attn = q8.reshape(seq_len, cfg.num_attention_heads, cfg.head_dim).permute(1, 0, 2).contiguous()
     k_attn = k8.reshape(seq_len, cfg.num_key_value_heads, cfg.head_dim).permute(1, 0, 2).contiguous()
     v_attn = v8.reshape(seq_len, cfg.num_key_value_heads, cfg.head_dim).permute(1, 0, 2).contiguous()
@@ -107,6 +116,7 @@ def run_block(block, x_q15_16, weights, cos_q15_16, sin_q15_16, r3_q15, prof, sp
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-dir", default="/code/Qwen3-0.6B")
+    parser.add_argument("--packed-dir")
     parser.add_argument("--max-tokens", type=int, default=129)
     parser.add_argument("--layers", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=2)
@@ -123,8 +133,11 @@ def main():
     cfg = QWEN3_0_6B
     block = Qwen3IntOnlyBlock(seq_len, cfg, use_r3=args.use_r3)
     r3_q15 = q15_16(random_hadamard_rotation(cfg.head_dim, ROTATE_SEED + 2)) if args.use_r3 else None
-    weights = load_all_qwen3_block_weights(args.model_dir, cfg)
-    embed = load_embed_tokens(args.model_dir)
+    if args.packed_dir:
+        embed, _, _, weights = load_packed_qwen3(args.packed_dir, cfg)
+    else:
+        weights = load_all_qwen3_block_weights(args.model_dir, cfg)
+        embed = load_embed_tokens(args.model_dir)
     cos, sin, _ = rope_tables_q15_16(seq_len, cfg.head_dim, cfg.rope_theta)
     def run_layers(prof):
         x = q15_16(embed[ids])
