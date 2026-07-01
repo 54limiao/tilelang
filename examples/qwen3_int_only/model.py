@@ -24,6 +24,7 @@ from examples.qwen3_int_only.kernels import (
     rope_q15_16,
     rsqrt_lut,
     sigmoid_lut,
+    silu_mul_dynamic_quant_q15_16,
     silu_q15_16,
 )
 from examples.qwen3_int_only.quarot import ROTATE_SEED, random_hadamard_rotation
@@ -280,6 +281,7 @@ class Qwen3IntOnlyBlock:
         self.rope_k = compile_kernel(rope_rotate_q15_16(seq_len * kvh, hd), [4]) if use_r3 else compile_kernel(rope_q15_16(seq_len * kvh, hd), [3])
         self.silu_mid = compile_kernel(silu_q15_16(seq_len, im), [2])
         self.mul_mid = compile_kernel(mul_q15_16(seq_len, im), [2])
+        self.silu_mul_dq8_mid = compile_kernel(silu_mul_dynamic_quant_q15_16(seq_len, im), [3, 4, 5])
         self.add_hidden = compile_kernel(add_q15_16(seq_len, h), [2])
         self.add_dq16_hidden = compile_kernel(add_dynamic_quant_q15_16(seq_len, h), [2, 3, 4])
         self.attn_i8_fixed = compile_kernel(flash_attention_i8_q15_16_gqa(qh, kvh, seq_len, hd), [7])
@@ -336,8 +338,7 @@ class Qwen3IntOnlyBlock:
         post = self.rms_hidden_dyn(h_norm16, weights.post_attention_layernorm, self.lut_rsqrt)
         h8, hs8 = self.dq8_hidden(post)
         gate, up = self.gate_up_proj_i8(h8, hs8, weights.gate_proj.weight, weights.gate_proj.scale, weights.up_proj.weight, weights.up_proj.scale)
-        gated = self.mul_mid(self.silu_mid(gate, self.lut_sigmoid), up)
-        gated8, gs8 = self.dq8_mid(gated)
+        gated, gated8, gs8 = self.silu_mul_dq8_mid(gate, up, self.lut_sigmoid)
         mlp = self.down_proj_i8(gated8, gs8, weights.down_proj.weight, weights.down_proj.scale)
         return self.add_hidden(h, mlp)
 

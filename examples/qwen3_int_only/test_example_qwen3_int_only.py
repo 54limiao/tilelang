@@ -25,7 +25,9 @@ from examples.qwen3_int_only.kernels import (
     rmsnorm_i16_q15_16_weighted,
     rsqrt_lut,
     sigmoid_lut,
+    silu_mul_dynamic_quant_q15_16,
     silu_q15_16,
+    mul_q15_16,
 )
 
 
@@ -314,3 +316,19 @@ def test_silu_q15_16_sigmoid_lut():
     sig = fix_lut_10bit(xq, lut, 1.0 / 1024.0)
     ref = (xq >> 10) * sig
     torch.testing.assert_close(y, ref, rtol=0, atol=0)
+
+
+@tilelang.testing.requires_cuda
+def test_silu_mul_dynamic_quant_matches_unfused():
+    torch.manual_seed(0)
+    rows, cols = 3, 64
+    gate = torch.randint(-300000, 300001, (rows, cols), device="cuda", dtype=torch.int32)
+    up = torch.randint(-300000, 300001, (rows, cols), device="cuda", dtype=torch.int32)
+    lut = torch.from_numpy(sigmoid_lut()).cuda()
+    y, q, s = compile_kernel(silu_mul_dynamic_quant_q15_16(rows, cols), [3, 4, 5])(gate, up, lut)
+    silu = compile_kernel(silu_q15_16(rows, cols), [2])(gate, lut)
+    ref_y = compile_kernel(mul_q15_16(rows, cols), [2])(silu, up)
+    ref_q, ref_s = compile_kernel(dynamic_quant_q15_16(rows, cols, "int8"), [1, 2])(ref_y)
+    torch.testing.assert_close(y, ref_y, rtol=0, atol=0)
+    torch.testing.assert_close(q, ref_q, rtol=0, atol=0)
+    torch.testing.assert_close(s, ref_s, rtol=0, atol=0)

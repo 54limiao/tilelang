@@ -197,6 +197,37 @@ def silu_q15_16(rows, cols):
     return main
 
 
+def silu_mul_dynamic_quant_q15_16(rows, cols):
+    @T.prim_func
+    def main(
+        Gate: T.Tensor((rows, cols), "int32"),
+        Up: T.Tensor((rows, cols), "int32"),
+        LUT: T.Tensor((1024,), "int32"),
+        Y: T.Tensor((rows, cols), "int32"),
+        Q: T.Tensor((rows, cols), "int8"),
+        S: T.Tensor((rows,), "uint32"),
+    ):
+        with T.Kernel(rows, threads=128) as r:
+            vals = T.alloc_fragment((1, cols), "int32")
+            abs_x = T.alloc_fragment((1, cols), "int32")
+            amax = T.alloc_fragment((1,), "int32")
+            scale = T.alloc_fragment((1,), "int32")
+            for c in T.Parallel(cols):
+                vals[0, c] = (((Gate[r, c] >> T.int32(10)) * T.fix.lut_10bit(Gate[r, c], LUT, scale=1.0 / 1024.0, out_dtype="int32")) >> T.int32(8)) * (Up[r, c] >> T.int32(8))
+                abs_x[0, c] = vals[0, c]
+                if abs_x[0, c] < T.int32(0):
+                    abs_x[0, c] = T.int32(0) - abs_x[0, c]
+            T.reduce_max(abs_x, amax, dim=1, clear=True)
+            scale[0] = T.max(amax[0] // T.int32(127), T.int32(1))
+            S[r] = T.cast(scale[0], "uint32")
+            for c in T.Parallel(cols):
+                Y[r, c] = vals[0, c]
+                vals[0, c] = T.min(T.max(vals[0, c] // scale[0], T.int32(-128)), T.int32(127))
+                Q[r, c] = T.cast(vals[0, c], "int8")
+
+    return main
+
+
 def add_q15_16(rows, cols):
     @T.prim_func
     def main(A: T.Tensor((rows, cols), "int32"), B: T.Tensor((rows, cols), "int32"), Y: T.Tensor((rows, cols), "int32")):

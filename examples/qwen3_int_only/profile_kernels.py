@@ -93,9 +93,7 @@ def run_block(block, x_q15_16, weights, cos_q15_16, sin_q15_16, r3_q15, prof):
         "gate_up_proj_i8",
         lambda: block.gate_up_proj_i8(h8, hs8, weights.gate_proj.weight, weights.gate_proj.scale, weights.up_proj.weight, weights.up_proj.scale),
     )
-    silu = prof.time("silu", lambda: block.silu_mid(gate, block.lut_sigmoid))
-    gated = prof.time("mul_gate_up", lambda: block.mul_mid(silu, up))
-    gated8, gs8 = prof.time("dq8_mid", lambda: block.dq8_mid(gated))
+    gated, gated8, gs8 = prof.time("silu_mul_dq8_mid", lambda: block.silu_mul_dq8_mid(gate, up, block.lut_sigmoid))
     mlp = prof.time("down_proj_i8", lambda: block.down_proj_i8(gated8, gs8, weights.down_proj.weight, weights.down_proj.scale))
     return prof.time("residual_mlp", lambda: block.add_hidden(h, mlp))
 
