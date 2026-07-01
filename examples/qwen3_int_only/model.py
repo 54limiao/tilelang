@@ -393,6 +393,7 @@ class Qwen3IntOnlyBlock:
                 prob_i16 = self.attn_softmax_i16(q_attn, k_attn, qs_attn, ks_attn, self.lut_exp)
                 attn = self.attn_i16v8(prob_i16, v_attn, vs_attn)
             else:
+                prob_i16 = None
                 attn_num, attn_den = self.attn_i8_fixed(q_attn, k_attn, v_attn, qs_attn, ks_attn, vs_attn, self.lut_exp)
                 attn = self.attn_norm(attn_num, attn_den)
         else:
@@ -400,6 +401,7 @@ class Qwen3IntOnlyBlock:
                 prob_i16 = self.attn_cache_softmax_i16(q_attn, cache_k[0], k_attn, qs_attn, cache_k[1], ks_attn, self.lut_exp)
                 attn = self.attn_cache_i16v8(prob_i16, cache_v[0], v_attn, cache_v[1], vs_attn)
             else:
+                prob_i16 = None
                 attn = self.attn_i8_fixed_cache(q_attn, cache_k[0], cache_v[0], k_attn, v_attn, qs_attn, cache_k[1], cache_v[1], ks_attn, vs_attn, self.lut_exp)
         if not self.split_attn:
             attn = attn.permute(1, 0, 2).reshape(self.seq_len, self.config.q_size)
@@ -426,6 +428,13 @@ class Qwen3IntOnlyBlock:
             "k": k_trace.float() / Q15_16,
             "v": v_trace.float() / Q15_16,
             "attn": attn.float() / Q15_16,
+            "prob_i16": prob_i16,
+            "q8": q_attn,
+            "k8": k_attn,
+            "v8": v_attn,
+            "qs8": qs_attn,
+            "ks8": ks_attn,
+            "vs8": vs_attn,
             "attn_out": attn_out.float() / Q15_16,
             "attn_residual": h.float() / Q15_16,
             "post_rms": post.float() / Q15_16,

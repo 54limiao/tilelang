@@ -19,6 +19,21 @@ def metrics(a, b):
     return float(dot / torch.sqrt((x2 * y2).clamp_min(1e-30))), float(se / x.numel()), float(se / y2.clamp_min(1e-30))
 
 
+def attention_refs(trace):
+    q = trace["q8"].float()
+    group = q.shape[0] // trace["k8"].shape[0]
+    k = trace["k8"].repeat_interleave(group, dim=0).float()
+    v = trace["v8"].repeat_interleave(group, dim=0).float()
+    qs = trace["qs8"].float()[:, :, None]
+    ks = trace["ks8"].repeat_interleave(group, dim=0).float()[:, None, :]
+    vs = trace["vs8"].repeat_interleave(group, dim=0).float()[:, :, None]
+    score = torch.matmul(q, k.transpose(-1, -2)) * (qs * ks) / (Q15_16 * Q15_16 * (q.shape[-1] ** 0.5))
+    mask = torch.ones(score.shape[-2:], device=score.device, dtype=torch.bool).tril()
+    prob = torch.softmax(score.masked_fill(~mask, torch.finfo(score.dtype).min), dim=-1)
+    pv = torch.matmul(prob, v * vs / Q15_16).permute(1, 0, 2).reshape(trace["attn"].shape)
+    return prob, pv
+
+
 def attach_dequant_fp(weights: Qwen3BlockWeights):
     for name in ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"):
         packed = getattr(weights, name)
@@ -62,6 +77,12 @@ def main():
     for name in ("input_rms", "q", "k", "v", "attn", "attn_out", "attn_residual", "post_rms", "gate", "up", "gated", "mlp", "layer_out"):
         cos, mse, rel = metrics(itrace[name], ftrace[name])
         print(f"{name:14s} cos={cos:.8f} mse={mse:.8e} rel_mse={rel:.8e}")
+    if itrace["prob_i16"] is not None:
+        prob_ref, pv_ref = attention_refs(itrace)
+        cos, mse, rel = metrics(itrace["prob_i16"].float() / 16383.0, prob_ref)
+        print(f"{'softmax_i16':14s} cos={cos:.8f} mse={mse:.8e} rel_mse={rel:.8e}")
+        cos, mse, rel = metrics(itrace["attn"], pv_ref)
+        print(f"{'pv_i16v8':14s} cos={cos:.8f} mse={mse:.8e} rel_mse={rel:.8e}")
 
 
 if __name__ == "__main__":

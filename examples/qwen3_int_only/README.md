@@ -175,10 +175,12 @@ layers=8 backend=int-only tokens=256 loss=11.688217 ppl=119159.375157 compare=lo
 Current 64-token block trace highlights:
 
 ```text
-layer=0 input_rms rel_mse=1.06552034e-06 q rel_mse=7.91176164e-04 attn rel_mse=2.00207401e-02 mlp rel_mse=4.60865684e-02 layer_out rel_mse=1.74910743e-02
-layer=1 input_rms rel_mse=2.37806290e-02 q rel_mse=2.27384176e-02 attn rel_mse=9.51652229e-02 mlp rel_mse=9.14253369e-02 layer_out rel_mse=3.40638570e-02
+layer=0 input_rms rel_mse=1.06552034e-06 q rel_mse=7.91176164e-04 attn rel_mse=2.00207401e-02 softmax_i16 rel_mse=8.68347660e-03 pv_i16v8 rel_mse=2.60004634e-03 mlp rel_mse=4.60865684e-02 layer_out rel_mse=1.74910743e-02
+layer=1 input_rms rel_mse=2.37806290e-02 q rel_mse=2.27384176e-02 attn rel_mse=9.51652229e-02 softmax_i16 rel_mse=1.78841676e-03 pv_i16v8 rel_mse=1.32548052e-03 mlp rel_mse=9.14253369e-02 layer_out rel_mse=3.40638570e-02
 layer=2 input_rms rel_mse=3.90793644e-02 q rel_mse=4.33117785e-02 attn rel_mse=9.49960873e-02 mlp rel_mse=1.28384978e-02 layer_out rel_mse=1.28336456e-02
 ```
+
+The split attention sub-trace compares `softmax_i16` and `pv_i16v8` against torch references using the already-quantized q/k/v inputs. On these samples their own rel_mse is small, so the larger attention rel_mse is dominated by quantized inputs and layer-to-layer accumulation rather than the PV GEMM math.
 
 Current same-machine single-layer 2048-token-class profile baseline (`--warmup 1 --repeat 5`):
 
