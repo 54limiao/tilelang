@@ -289,12 +289,15 @@ def flash_attention_i8_q15_16(batch, seqlen, dim, block_n=64, score_shift=26, lu
                 acc_o[d] = T.int32(0)
             for nb in T.Pipelined(i // block_n + 1):
                 for j, d in T.Parallel(block_n, dim):
-                    qk[j, d] = T.cast(Q[b, i, d], "int32") * T.cast(K[b, nb * block_n + j, d], "int32")
+                    qk[j, d] = T.cast(Q[b, i, d], "int32") * T.cast(T.if_then_else(nb * block_n + j < seqlen, K[b, nb * block_n + j, d], T.int8(0)), "int32")
                 T.reduce_sum(qk, qk_sum, dim=1, clear=True)
                 for j in T.Parallel(block_n):
-                    scale[j] = (((T.cast(QS[b, i], "int32") >> T.int32(4)) * (T.cast(KS[b, nb * block_n + j], "int32") >> T.int32(4))) >> T.int32(8)) * T.int32(5793)
+                    scale[j] = (
+                        ((T.cast(QS[b, i], "int32") >> T.int32(4)) * (T.cast(T.if_then_else(nb * block_n + j < seqlen, KS[b, nb * block_n + j], T.uint32(1)), "int32") >> T.int32(4)))
+                        >> T.int32(8)
+                    ) * T.int32(5793)
                     score[0, j] = ((qk_sum[j] >> T.int32(8)) * scale[j]) >> T.int32(score_shift - 8)
-                    score[0, j] = T.if_then_else(nb * block_n + j > i, T.int32(-32768), score[0, j])
+                    score[0, j] = T.if_then_else((nb * block_n + j > i) or (nb * block_n + j >= seqlen), T.int32(-32768), score[0, j])
                 T.reduce_max(score, block_max, dim=1, clear=True)
                 new_max[0] = T.max(block_max[0], score_max[0])
                 old_scale[0] = T.fix.lut_10bit(score_max[0] - new_max[0], LUT, scale=lut_scale, out_dtype="int32")
@@ -303,7 +306,13 @@ def flash_attention_i8_q15_16(batch, seqlen, dim, block_n=64, score_shift=26, lu
                 T.reduce_sum(score_exp, block_sum, dim=1, clear=True)
                 denom[0] = ((denom[0] * old_scale[0]) >> T.int32(10)) + block_sum[0]
                 for d, j in T.Parallel(dim, block_n):
-                    weighted_value[d, j] = score_exp[0, j] * ((T.cast(V[b, nb * block_n + j, d], "int32") * T.cast(VS[b, nb * block_n + j], "int32")) >> T.int32(ATTN_VALUE_SHIFT))
+                    weighted_value[d, j] = score_exp[0, j] * (
+                        (
+                            T.cast(T.if_then_else(nb * block_n + j < seqlen, V[b, nb * block_n + j, d], T.int8(0)), "int32")
+                            * T.cast(T.if_then_else(nb * block_n + j < seqlen, VS[b, nb * block_n + j], T.uint32(0)), "int32")
+                        )
+                        >> T.int32(ATTN_VALUE_SHIFT)
+                    )
                 T.reduce_sum(weighted_value, value_part, dim=1, clear=True)
                 for d in T.Parallel(dim):
                     acc_o[d] = (((acc_o[d] >> T.int32(7)) * old_scale[0]) >> T.int32(3)) + value_part[d]
@@ -352,12 +361,15 @@ def flash_attention_i8_q15_16_gqa(q_heads, kv_heads, seqlen, dim, block_n=64, sc
                 acc_o[d] = T.int32(0)
             for nb in T.Pipelined(i // block_n + 1):
                 for j, d in T.Parallel(block_n, dim):
-                    qk[j, d] = T.cast(Q[h, i, d], "int32") * T.cast(K[kh, nb * block_n + j, d], "int32")
+                    qk[j, d] = T.cast(Q[h, i, d], "int32") * T.cast(T.if_then_else(nb * block_n + j < seqlen, K[kh, nb * block_n + j, d], T.int8(0)), "int32")
                 T.reduce_sum(qk, qk_sum, dim=1, clear=True)
                 for j in T.Parallel(block_n):
-                    scale[j] = (((T.cast(QS[h, i], "int32") >> T.int32(4)) * (T.cast(KS[kh, nb * block_n + j], "int32") >> T.int32(4))) >> T.int32(8)) * T.int32(5793)
+                    scale[j] = (
+                        ((T.cast(QS[h, i], "int32") >> T.int32(4)) * (T.cast(T.if_then_else(nb * block_n + j < seqlen, KS[kh, nb * block_n + j], T.uint32(1)), "int32") >> T.int32(4)))
+                        >> T.int32(8)
+                    ) * T.int32(5793)
                     score[0, j] = ((qk_sum[j] >> T.int32(8)) * scale[j]) >> T.int32(score_shift - 8)
-                    score[0, j] = T.if_then_else(nb * block_n + j > i, T.int32(-32768), score[0, j])
+                    score[0, j] = T.if_then_else((nb * block_n + j > i) or (nb * block_n + j >= seqlen), T.int32(-32768), score[0, j])
                 T.reduce_max(score, block_max, dim=1, clear=True)
                 new_max[0] = T.max(block_max[0], score_max[0])
                 old_scale[0] = T.fix.lut_10bit(score_max[0] - new_max[0], LUT, scale=lut_scale, out_dtype="int32")
@@ -366,7 +378,13 @@ def flash_attention_i8_q15_16_gqa(q_heads, kv_heads, seqlen, dim, block_n=64, sc
                 T.reduce_sum(score_exp, block_sum, dim=1, clear=True)
                 denom[0] = ((denom[0] * old_scale[0]) >> T.int32(10)) + block_sum[0]
                 for d, j in T.Parallel(dim, block_n):
-                    weighted_value[d, j] = score_exp[0, j] * ((T.cast(V[kh, nb * block_n + j, d], "int32") * T.cast(VS[kh, nb * block_n + j], "int32")) >> T.int32(ATTN_VALUE_SHIFT))
+                    weighted_value[d, j] = score_exp[0, j] * (
+                        (
+                            T.cast(T.if_then_else(nb * block_n + j < seqlen, V[kh, nb * block_n + j, d], T.int8(0)), "int32")
+                            * T.cast(T.if_then_else(nb * block_n + j < seqlen, VS[kh, nb * block_n + j], T.uint32(0)), "int32")
+                        )
+                        >> T.int32(ATTN_VALUE_SHIFT)
+                    )
                 T.reduce_sum(weighted_value, value_part, dim=1, clear=True)
                 for d in T.Parallel(dim):
                     acc_o[d] = (((acc_o[d] >> T.int32(7)) * old_scale[0]) >> T.int32(3)) + value_part[d]

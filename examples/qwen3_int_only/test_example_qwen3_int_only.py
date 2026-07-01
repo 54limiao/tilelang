@@ -148,7 +148,7 @@ def test_rope_rotate_q15_16():
 @tilelang.testing.requires_cuda
 def test_attention_i8_q15_16_fixed_point():
     torch.manual_seed(0)
-    batch, seqlen, dim, block_n = 2, 128, 128, 64
+    batch, seqlen, dim, block_n = 2, 127, 128, 64
     q = torch.randint(-127, 128, (batch, seqlen, dim), device="cuda", dtype=torch.int8)
     k = torch.randint(-127, 128, (batch, seqlen, dim), device="cuda", dtype=torch.int8)
     v = torch.randint(-127, 128, (batch, seqlen, dim), device="cuda", dtype=torch.int8)
@@ -233,7 +233,7 @@ def test_attention_i8_q15_16_cache_fixed_point():
 @tilelang.testing.requires_cuda
 def test_attention_i8_q15_16_gqa_matches_repeated_kv():
     torch.manual_seed(0)
-    q_heads, kv_heads, seqlen, dim = 16, 8, 128, 128
+    q_heads, kv_heads, seqlen, dim = 16, 8, 127, 128
     group = q_heads // kv_heads
     q = torch.randint(-127, 128, (q_heads, seqlen, dim), device="cuda", dtype=torch.int8)
     k = torch.randint(-127, 128, (kv_heads, seqlen, dim), device="cuda", dtype=torch.int8)
