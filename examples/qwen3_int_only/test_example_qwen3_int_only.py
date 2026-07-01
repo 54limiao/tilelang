@@ -3,6 +3,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 import tilelang.testing
+from tilelang.language.fix import pack_scale
 
 from examples.qwen3_int_only.kernels import (
     Q15_16,
@@ -13,12 +14,13 @@ from examples.qwen3_int_only.kernels import (
     dynamic_quant_q15_16,
     exp_lut_neg,
     flash_attention_i12_q15_16_per_scale,
+    linear_dynamic_int8_q15_16,
     linear_dynamic_int16_q15_16,
     packed_scale_matrix,
-    recip_lut_i12,
-    recip_lut_i16_norm,
     rmsnorm_i16_q15_16_weighted,
     rsqrt_lut,
+    sigmoid_lut,
+    silu_q15_16,
 )
 
 
@@ -35,13 +37,19 @@ def fix_quant_i32(x, scale):
     return out.to(torch.int32)
 
 
+def fix_lut_10bit(x, lut, scale):
+    scale_qt = torch.as_tensor(pack_scale(scale) if isinstance(scale, float) else scale, device=x.device, dtype=torch.int64)
+    idx = fix_quant_i32(x.to(torch.int32), scale_qt).clamp(-512, 511) + 512
+    return lut[idx.long()]
+
+
 @tilelang.testing.requires_cuda
 def test_dynamic_quant_i12():
     rows, cols = 5, 64
     x = torch.linspace(-2.5, 2.7, rows * cols, device="cuda").reshape(rows, cols)
     xq = torch.round(x * Q15_16).to(torch.int32)
-    kernel = compile_kernel(dynamic_quant_q15_16(rows, cols, "int16", 2047), [2, 3])
-    y, s = kernel(xq, torch.from_numpy(recip_lut_i12()).cuda())
+    kernel = compile_kernel(dynamic_quant_q15_16(rows, cols, "int16", 2047), [1, 2])
+    y, s = kernel(xq)
     ref_s = torch.div(xq.abs().amax(dim=1), 2047, rounding_mode="floor").clamp(min=1).to(torch.uint32)
     ref_y = torch.div(xq, ref_s.int()[:, None], rounding_mode="floor").clamp(-2048, 2047).to(torch.int16)
     torch.testing.assert_close(s, ref_s, rtol=0, atol=0)
@@ -52,12 +60,27 @@ def test_dynamic_quant_i12():
 def test_dynamic_quant_i16():
     rows, cols = 5, 64
     xq = torch.randint(-180000, 180001, (rows, cols), device="cuda", dtype=torch.int32)
-    kernel = compile_kernel(dynamic_quant_q15_16(rows, cols, "int16"), [2, 3])
-    y, s = kernel(xq, torch.empty((4096,), device="cuda", dtype=torch.uint32))
+    kernel = compile_kernel(dynamic_quant_q15_16(rows, cols, "int16"), [1, 2])
+    y, s = kernel(xq)
     ref_s = torch.div(xq.abs().amax(dim=1), 32767, rounding_mode="floor").clamp(min=1).to(torch.uint32)
     ref_y = torch.div(xq, ref_s.int()[:, None], rounding_mode="floor").clamp(-32768, 32767).to(torch.int16)
     torch.testing.assert_close(s, ref_s, rtol=0, atol=0)
     torch.testing.assert_close(y, ref_y, rtol=0, atol=0)
+
+
+@tilelang.testing.requires_cuda
+def test_linear_i8_tiled():
+    torch.manual_seed(0)
+    rows, in_features, out_features = 16, 64, 32
+    x = torch.randint(-128, 127, (rows, in_features), device="cuda", dtype=torch.int8)
+    w = torch.randint(-128, 127, (out_features, in_features), device="cuda", dtype=torch.int8)
+    xs = torch.randint(1, 256, (rows,), device="cuda", dtype=torch.uint32)
+    ws = torch.randint(1, 512, (out_features,), device="cuda", dtype=torch.uint32)
+    kernel = compile_kernel(linear_dynamic_int8_q15_16(rows, in_features, out_features), [4])
+    y = kernel(x, xs, w, ws)
+    acc = (x.float() @ w.float().T).int()
+    ref = (acc * ((xs[:, None].int() * ws[None, :].int()) >> 8)) >> 8
+    torch.testing.assert_close(y.to(torch.int64), ref.to(torch.int64), rtol=0, atol=0)
 
 
 @tilelang.testing.requires_cuda
@@ -82,7 +105,7 @@ def test_rmsnorm_i16():
     x = (torch.randn(rows, cols, device="cuda") * 0.08).clamp(-0.4, 0.4)
     w = (torch.randn(cols, device="cuda") * 0.03 + 1.0).clamp(0.8, 1.2)
     xq = q15(x)
-    x16, _ = compile_kernel(dynamic_quant_q15_16(rows, cols, "int16", 4095), [2, 3])(xq, torch.from_numpy(recip_lut_i16_norm()).cuda())
+    x16, _ = compile_kernel(dynamic_quant_q15_16(rows, cols, "int16", 4095), [1, 2])(xq)
     y = compile_kernel(rmsnorm_i16_q15_16_weighted(rows, cols), [3])(x16, q15(w), torch.from_numpy(rsqrt_lut()).cuda())
     scale = torch.div(xq.abs().amax(dim=-1), 4095, rounding_mode="floor").clamp_min(1)
     q = torch.div(xq, scale[:, None], rounding_mode="floor").clamp(-4096, 4095)
@@ -114,9 +137,33 @@ def test_attention_i12_q15_16_per_scale():
     sc += fix_quant_i32(lo, score_i64)
     mask = torch.ones((seqlen, seqlen), device="cuda", dtype=torch.bool).tril()
     sc = sc.masked_fill(~mask, -32768)
-    lut = torch.round(torch.exp((torch.arange(4097, device="cuda").float() - 4096.0) / 64.0) * 1023.0).clamp(0, 1023).int()
-    ex = lut[(sc - sc.max(dim=-1, keepdim=True).values).clamp(-4096, 0) + 4096].to(torch.int64)
-    val = ((v.to(torch.int64) * vs.to(torch.int64)[:, :, None]) >> ATTN_VALUE_SHIFT)
-    acc = (ex[:, :, :, None] * val[:, None, :, :]).sum(dim=2)
-    ref = torch.div(acc, ex.sum(dim=-1, keepdim=True), rounding_mode="trunc").to(torch.int32) << ATTN_VALUE_SHIFT
+    lut = torch.from_numpy(exp_lut_neg()).cuda().int()
+    ref = torch.empty_like(y)
+    for b in range(batch):
+        for i in range(seqlen):
+            score_max = torch.tensor(-(1 << 31), device="cuda", dtype=torch.int32)
+            denom = torch.tensor(0, device="cuda", dtype=torch.int64)
+            acc_o = torch.zeros((dim,), device="cuda", dtype=torch.int64)
+            for nb in range(seqlen // 32):
+                block = sc[b, i, nb * 32 : (nb + 1) * 32]
+                new_max = torch.maximum(block.max(), score_max)
+                old = torch.tensor(0, device="cuda", dtype=torch.int64) if nb == 0 else fix_lut_10bit(score_max - new_max, lut, 1.0 / 8.0).to(torch.int64)
+                ex = fix_lut_10bit(block - new_max, lut, 1.0 / 8.0).to(torch.int64)
+                denom = ((denom * old) >> 10) + ex.sum()
+                val = ((v[b, nb * 32 : (nb + 1) * 32].to(torch.int64) * vs[b, nb * 32 : (nb + 1) * 32].to(torch.int64)[:, None]) >> ATTN_VALUE_SHIFT)
+                acc_o = (((acc_o >> 7) * old) >> 3) + (ex[:, None] * val).sum(dim=0)
+                score_max = new_max
+            ref[b, i] = (acc_o // denom).to(torch.int32) << ATTN_VALUE_SHIFT
     torch.testing.assert_close(y, ref, rtol=0, atol=128)
+
+
+@tilelang.testing.requires_cuda
+def test_silu_q15_16_sigmoid_lut():
+    rows, cols = 2, 64
+    x = torch.linspace(-9.0, 9.0, rows * cols, device="cuda").reshape(rows, cols)
+    xq = q15(x)
+    lut = torch.from_numpy(sigmoid_lut()).cuda()
+    y = compile_kernel(silu_q15_16(rows, cols), [2])(xq, lut)
+    sig = fix_lut_10bit(xq, lut, 1.0 / 1024.0)
+    ref = (xq >> 8) * (sig >> 8)
+    torch.testing.assert_close(y, ref, rtol=0, atol=0)

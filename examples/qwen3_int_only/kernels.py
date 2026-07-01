@@ -4,114 +4,58 @@ import numpy as np
 import tilelang
 import tilelang.language as T
 
-from tilelang.language.fix import Q_MULTIPLIER_WIDTH, pack_scale
+from tilelang.language.fix import Q_MULTIPLIER_WIDTH
 
 MASK = (1 << Q_MULTIPLIER_WIDTH) - 1
 Q15_16 = 1 << 16
-EXP_TO_Q7 = 1.0 / 8.0
 ATTN_VALUE_SHIFT = 7
+I32_MIN = -2147483648
 
 
 def exp_lut_neg():
-    return np.array([np.clip(round(math.exp((i - 4096) / 64.0) * 1023.0), 0, 1023) for i in range(4097)], dtype=np.int16)
+    return np.array([np.clip(round(math.exp(min(i - 512, 0) / 8.0) * 1023.0), 0, 1023) for i in range(1024)], dtype=np.int16)
 
 
 def rsqrt_lut():
     return np.array([0 if i < 640 else np.clip(round(1024.0 / math.sqrt(i / 128.0 - 4.0)), 0, 1023) for i in range(1024)], dtype=np.int16)
 
 
-def silu_lut():
-    return np.array([round((x / 256.0) / (1.0 + math.exp(-(x / 256.0))) * Q15_16) for x in range(-2048, 2048)], dtype=np.int32)
+def sigmoid_lut():
+    def sigmoid(x):
+        if x <= -7.0:
+            return 0.0
+        if x >= 7.0:
+            return 1.0
+        return 1.0 / (1.0 + math.exp(-x))
 
-
-def recip_lut_i8():
-    return np.array([0 if i == 0 else min((127 << 9) // i, MASK) for i in range(4096)], dtype=np.uint32)
-
-
-def recip_lut_i16():
-    return np.array([0 if i == 0 else min((32767 << 4) // i, MASK) for i in range(4096)], dtype=np.uint32)
-
-
-def recip_lut_i12():
-    return np.array([0 if i == 0 else min((2047 << 5) // i, MASK) for i in range(4096)], dtype=np.uint32)
-
-
-def recip_lut_i16_norm():
-    return np.array([0 if i == 0 else min((4095 << 4) // i, MASK) for i in range(4096)], dtype=np.uint32)
+    return np.array([round(sigmoid((i - 512) / 64.0) * Q15_16) for i in range(1024)], dtype=np.int32)
 
 
 def dynamic_quant_q15_16(rows, cols, out_dtype="int8", qmax_override=None):
     qmax = 127 if out_dtype == "int8" else 32767
     if qmax_override is not None:
         qmax = qmax_override
-    frac_shift = 9 if out_dtype == "int8" else 4
-    if out_dtype == "int16" and qmax == 2047:
-        frac_shift = 5
 
     @T.prim_func
     def main(
         X: T.Tensor((rows, cols), "int32"),
-        LUT: T.Tensor((4096,), "uint32"),
         Y: T.Tensor((rows, cols), out_dtype),
         S: T.Tensor((rows,), "uint32"),
     ):
         with T.Kernel(rows, threads=128) as r:
-            xa = T.alloc_fragment((1, cols), "int32")
+            abs_x = T.alloc_fragment((1, cols), "int32")
             amax = T.alloc_fragment((1,), "int32")
-            idx = T.alloc_fragment((1,), "int32")
-            idx_shift = T.alloc_fragment((1,), "int32")
-            qt = T.alloc_fragment((1,), "int32")
+            scale = T.alloc_fragment((1,), "int32")
             for c in T.Parallel(cols):
-                xa[0, c] = X[r, c]
-                if xa[0, c] < T.int32(0):
-                    xa[0, c] = T.int32(0) - xa[0, c]
-            T.reduce_max(xa, amax, dim=1, clear=True)
-            idx_shift[0] = T.int32(10)
-            if amax[0] > T.int32(4193280):
-                idx_shift[0] = T.int32(11)
-            if amax[0] > T.int32(8386560):
-                idx_shift[0] = T.int32(12)
-            if amax[0] > T.int32(16773120):
-                idx_shift[0] = T.int32(13)
-            if amax[0] > T.int32(33546240):
-                idx_shift[0] = T.int32(14)
-            if amax[0] > T.int32(67092480):
-                idx_shift[0] = T.int32(15)
-            if amax[0] > T.int32(134184960):
-                idx_shift[0] = T.int32(16)
-            if amax[0] > T.int32(268369920):
-                idx_shift[0] = T.int32(17)
-            if amax[0] > T.int32(536739840):
-                idx_shift[0] = T.int32(18)
-            if amax[0] > T.int32(1073479680):
-                idx_shift[0] = T.int32(19)
-            idx[0] = amax[0] >> idx_shift[0]
-            if idx[0] > T.int32(4095):
-                idx[0] = T.int32(4095)
-            if idx[0] < T.int32(1):
-                idx[0] = T.int32(1)
-            qt[0] = ((T.int32(frac_shift) + idx_shift[0]) << T.int32(Q_MULTIPLIER_WIDTH)) | (T.cast(LUT[idx[0]], "int32") & T.int32(MASK))
-            idx[0] = amax[0] // T.int32(qmax)
-            if idx[0] < T.int32(1):
-                idx[0] = T.int32(1)
-            S[r] = T.cast(idx[0], "uint32")
+                abs_x[0, c] = X[r, c]
+                if abs_x[0, c] < T.int32(0):
+                    abs_x[0, c] = T.int32(0) - abs_x[0, c]
+            T.reduce_max(abs_x, amax, dim=1, clear=True)
+            scale[0] = T.max(amax[0] // T.int32(qmax), T.int32(1))
+            S[r] = T.cast(scale[0], "uint32")
             for c in T.Parallel(cols):
-                if out_dtype == "int16":
-                    xa[0, c] = X[r, c] // idx[0]
-                    if xa[0, c] > T.int32(qmax):
-                        xa[0, c] = T.int32(qmax)
-                    if xa[0, c] < T.int32(0 - qmax - 1):
-                        xa[0, c] = T.int32(0 - qmax - 1)
-                    Y[r, c] = T.cast(xa[0, c], out_dtype)
-                elif qmax_override is None or qmax_override >= 32767:
-                    Y[r, c] = T.fix.quant(X[r, c], scale=qt[0], out_dtype=out_dtype)
-                else:
-                    xa[0, c] = T.fix.quant(X[r, c], scale=qt[0], out_dtype="int32")
-                    if xa[0, c] > T.int32(qmax):
-                        xa[0, c] = T.int32(qmax)
-                    if xa[0, c] < T.int32(0 - qmax - 1):
-                        xa[0, c] = T.int32(0 - qmax - 1)
-                    Y[r, c] = T.cast(xa[0, c], out_dtype)
+                abs_x[0, c] = T.min(T.max(X[r, c] // scale[0], T.int32(0 - qmax - 1)), T.int32(qmax))
+                Y[r, c] = T.cast(abs_x[0, c], out_dtype)
 
     return main
 
@@ -174,7 +118,7 @@ def rmsnorm_i16_q15_16_weighted(rows, cols):
                 wk[0] = wk[0] >> T.int32(4)
             if (wk[0] & T.int32(0xC)) != T.int32(0):
                 ns[0] += T.int32(2)
-            inv[0] = T.fix.quant_lut(ss[0], RLUT, scale=(ns[0] << T.int32(Q_MULTIPLIER_WIDTH)) | T.int32(128), index_dtype="int10", out_dtype="int32")
+            inv[0] = T.fix.lut_10bit(ss[0], RLUT, scale=(ns[0] << T.int32(Q_MULTIPLIER_WIDTH)) | T.int32(128), out_dtype="int32")
             fold[0] = T.fix.quant(inv[0], scale=1024.0, out_dtype="int32")
             qt[0] = ((T.int32(6) + (ns[0] >> T.int32(1))) << T.int32(Q_MULTIPLIER_WIDTH)) | ((fold[0] >> T.int32(4)) & T.int32(MASK))
             for c in T.Parallel(cols):
@@ -186,17 +130,12 @@ def rmsnorm_i16_q15_16_weighted(rows, cols):
 
 def silu_q15_16(rows, cols):
     @T.prim_func
-    def main(X: T.Tensor((rows, cols), "int32"), LUT: T.Tensor((4096,), "int32"), Y: T.Tensor((rows, cols), "int32")):
+    def main(X: T.Tensor((rows, cols), "int32"), LUT: T.Tensor((1024,), "int32"), Y: T.Tensor((rows, cols), "int32")):
         with T.Kernel(rows, threads=128) as r:
-            idx = T.alloc_fragment((1, cols), "int32")
+            sig = T.alloc_fragment((1, cols), "int32")
             for c in T.Parallel(cols):
-                idx[0, c] = (X[r, c] >> T.int32(8)) + T.int32(2048)
-                if idx[0, c] < T.int32(0):
-                    Y[r, c] = T.int32(0)
-                elif idx[0, c] > T.int32(4095):
-                    Y[r, c] = X[r, c]
-                else:
-                    Y[r, c] = LUT[idx[0, c]]
+                sig[0, c] = T.fix.lut_10bit(X[r, c], LUT, scale=1.0 / 1024.0, out_dtype="int32")
+                Y[r, c] = (X[r, c] >> T.int32(8)) * (sig[0, c] >> T.int32(8))
 
     return main
 
@@ -221,65 +160,76 @@ def mul_q15_16(rows, cols):
     return main
 
 
-def linear_dynamic_q15_16(rows, in_features, out_features, x_dtype="int8"):
-    if x_dtype == "int16":
-        chunk_size = 64
-        while in_features % chunk_size != 0:
-            chunk_size //= 2
-        chunks = in_features // chunk_size
-
-        @T.prim_func
-        def main(
-            X: T.Tensor((rows, in_features), x_dtype),
-            XS: T.Tensor((rows,), "uint32"),
-            W: T.Tensor((out_features, in_features), "int8"),
-            WS: T.Tensor((out_features,), "uint32"),
-            Y: T.Tensor((rows, out_features), "int32"),
-        ):
-            with T.Kernel(rows, out_features, threads=128) as (r, o):
-                prod = T.alloc_fragment((chunks, chunk_size), "int32")
-                acc = T.alloc_fragment((chunks,), "int32")
-                total = T.alloc_fragment((1,), "int32")
-                scale = T.alloc_fragment((1,), "int32")
-                for g, k in T.Parallel(chunks, chunk_size):
-                    prod[g, k] = T.cast(X[r, g * chunk_size + k], "int32") * T.cast(W[o, g * chunk_size + k], "int32")
-                T.reduce_sum(prod, acc, dim=1, clear=True)
-                T.reduce_sum(acc, total, dim=0, clear=True)
-                scale[0] = T.cast((XS[r] * WS[o]) >> T.int32(2), "int32")
-                Y[r, o] = ((total[0] >> T.int32(12)) * scale[0]) >> T.int32(2)
-
-        return main
-
-    scale_shift = 8
-    out_shift = 8
+def linear_dynamic_int8_q15_16(rows, in_features, out_features, block_m=16, block_n=16, block_k=64):
+    local_m = 2
+    local_n = 2
+    threads = (block_m // local_m) * (block_n // local_n)
 
     @T.prim_func
     def main(
-        X: T.Tensor((rows, in_features), x_dtype),
+        X: T.Tensor((rows, in_features), "int8"),
+        XS: T.Tensor((rows,), "uint32"),
+        W: T.Tensor((out_features, in_features), "int8"),
+        WS: T.Tensor((out_features,), "uint32"),
+        Y: T.Tensor((rows, out_features), "int32"),
+    ):
+        with T.Kernel(T.ceildiv(out_features, block_n), T.ceildiv(rows, block_m), threads=threads) as (bo, br):
+            x_shared = T.alloc_shared((block_m, block_k), "int8")
+            w_shared = T.alloc_shared((block_n, block_k), "int8")
+            x_local = T.alloc_local((local_m, 4), "int8")
+            w_local = T.alloc_local((local_n, 4), "int8")
+            acc = T.alloc_local((local_m, local_n), "int32")
+            tid = T.get_thread_binding()
+            tm = tid % (block_m // local_m)
+            tn = tid // (block_m // local_m)
+
+            T.clear(acc)
+            for ko in T.Pipelined(in_features // block_k, num_stages=2):
+                T.copy(X[br * block_m, ko * block_k], x_shared)
+                T.copy(W[bo * block_n, ko * block_k], w_shared)
+                for ki in T.serial(block_k // 4):
+                    for mi in T.serial(local_m):
+                        for kk in T.vectorized(4):
+                            x_local[mi, kk] = x_shared[tm * local_m + mi, ki * 4 + kk]
+                    for ni in T.serial(local_n):
+                        for kk in T.vectorized(4):
+                            w_local[ni, kk] = w_shared[tn * local_n + ni, ki * 4 + kk]
+                    for mi, ni in T.grid(local_m, local_n):
+                        T.dp4a(x_local[mi, 0], w_local[ni, 0], acc[mi, ni])
+
+            for mi, ni in T.grid(local_m, local_n):
+                Y[br * block_m + tm * local_m + mi, bo * block_n + tn * local_n + ni] = (
+                    acc[mi, ni] * T.cast((XS[br * block_m + tm * local_m + mi] * WS[bo * block_n + tn * local_n + ni]) >> T.int32(8), "int32")
+                ) >> T.int32(8)
+
+    return main
+
+
+def linear_dynamic_int16_q15_16(rows, in_features, out_features):
+    chunk_size = 64
+    while in_features % chunk_size != 0:
+        chunk_size //= 2
+    chunks = in_features // chunk_size
+
+    @T.prim_func
+    def main(
+        X: T.Tensor((rows, in_features), "int16"),
         XS: T.Tensor((rows,), "uint32"),
         W: T.Tensor((out_features, in_features), "int8"),
         WS: T.Tensor((out_features,), "uint32"),
         Y: T.Tensor((rows, out_features), "int32"),
     ):
         with T.Kernel(rows, out_features, threads=128) as (r, o):
-            prod = T.alloc_fragment((1, in_features), "int32")
+            prod = T.alloc_fragment((chunks, chunk_size), "int32")
+            partial = T.alloc_fragment((chunks,), "int32")
             acc = T.alloc_fragment((1,), "int32")
-            scale = T.alloc_fragment((1,), "int32")
-            for k in T.Parallel(in_features):
-                prod[0, k] = T.cast(X[r, k], "int32") * T.cast(W[o, k], "int32")
-            T.reduce_sum(prod, acc, dim=1, clear=True)
-            scale[0] = T.cast((XS[r] * WS[o]) >> T.int32(scale_shift), "int32")
-            Y[r, o] = (acc[0] * scale[0]) >> T.int32(out_shift)
+            for g, k in T.Parallel(chunks, chunk_size):
+                prod[g, k] = T.cast(X[r, g * chunk_size + k], "int32") * T.cast(W[o, g * chunk_size + k], "int32")
+            T.reduce_sum(prod, partial, dim=1, clear=True)
+            T.reduce_sum(partial, acc, dim=0, clear=True)
+            Y[r, o] = ((acc[0] >> T.int32(12)) * T.cast((XS[r] * WS[o]) >> T.int32(2), "int32")) >> T.int32(2)
 
     return main
-
-
-def linear_dynamic_int8_q15_16(rows, in_features, out_features):
-    return linear_dynamic_q15_16(rows, in_features, out_features, "int8")
-
-
-def linear_dynamic_int16_q15_16(rows, in_features, out_features):
-    return linear_dynamic_q15_16(rows, in_features, out_features, "int16")
 
 
 def flash_attention_i12_q15_16_per_scale(batch, seqlen, dim, block_n=32):
@@ -288,7 +238,7 @@ def flash_attention_i12_q15_16_per_scale(batch, seqlen, dim, block_n=32):
         Q: T.Tensor((batch, seqlen, dim), "int16"),
         K: T.Tensor((batch, seqlen, dim), "int16"),
         V: T.Tensor((batch, seqlen, dim), "int16"),
-        LUT: T.Tensor((4097,), "int16"),
+        LUT: T.Tensor((1024,), "int16"),
         QS: T.Tensor((batch * seqlen * seqlen,), "uint32"),
         VS: T.Tensor((batch, seqlen), "uint32"),
         O: T.Tensor((batch, seqlen, dim), "int32"),
@@ -296,70 +246,56 @@ def flash_attention_i12_q15_16_per_scale(batch, seqlen, dim, block_n=32):
         with T.Kernel(batch * seqlen, threads=128) as blk:
             b = blk // seqlen
             i = blk - b * seqlen
-            dot = T.alloc_fragment((block_n, dim), "int32")
-            red = T.alloc_fragment((block_n,), "int32")
-            out = T.alloc_fragment((dim,), "int32")
-            sc = T.alloc_fragment((1, block_n), "int32")
-            ex = T.alloc_fragment((1, block_n), "int32")
-            pv = T.alloc_fragment((dim, block_n), "int32")
-            acc = T.alloc_fragment((dim,), "int32")
-            hi = T.alloc_fragment((block_n,), "int32")
-            lo = T.alloc_fragment((block_n,), "int32")
-            mx = T.alloc_fragment((1,), "int32")
-            bm = T.alloc_fragment((1,), "int32")
-            nm = T.alloc_fragment((1,), "int32")
-            os = T.alloc_fragment((1,), "int32")
-            bs = T.alloc_fragment((1,), "int32")
-            sm = T.alloc_fragment((1,), "int32")
-            ei = T.alloc_fragment((1, block_n), "int32")
-            idx = T.alloc_fragment((1,), "int32")
-            mx[0] = T.int32(-2147483648)
-            sm[0] = T.int32(0)
+            qk = T.alloc_fragment((block_n, dim), "int32")
+            qk_sum = T.alloc_fragment((block_n,), "int32")
+            value_part = T.alloc_fragment((dim,), "int32")
+            score = T.alloc_fragment((1, block_n), "int32")
+            score_exp = T.alloc_fragment((1, block_n), "int32")
+            weighted_value = T.alloc_fragment((dim, block_n), "int32")
+            acc_o = T.alloc_fragment((dim,), "int32")
+            score_hi = T.alloc_fragment((block_n,), "int32")
+            score_lo = T.alloc_fragment((block_n,), "int32")
+            score_max = T.alloc_fragment((1,), "int32")
+            block_max = T.alloc_fragment((1,), "int32")
+            new_max = T.alloc_fragment((1,), "int32")
+            old_scale = T.alloc_fragment((1,), "int32")
+            block_sum = T.alloc_fragment((1,), "int32")
+            denom = T.alloc_fragment((1,), "int32")
+            score_max[0] = T.int32(I32_MIN)
+            denom[0] = T.int32(0)
             for d in T.Parallel(dim):
-                acc[d] = T.int32(0)
+                acc_o[d] = T.int32(0)
             for nb in T.Pipelined(seqlen // block_n):
                 for j, d in T.Parallel(block_n, dim):
-                    dot[j, d] = T.cast(Q[b, i, d], "int32") * T.cast(K[b, nb * block_n + j, d], "int32")
-                T.reduce_sum(dot, red, dim=1, clear=True)
+                    qk[j, d] = T.cast(Q[b, i, d], "int32") * T.cast(K[b, nb * block_n + j, d], "int32")
+                T.reduce_sum(qk, qk_sum, dim=1, clear=True)
                 for j in T.Parallel(block_n):
-                    hi[j] = red[j] >> T.int32(14)
-                    lo[j] = red[j] - (hi[j] << T.int32(14))
-                    sc[0, j] = T.fix.quant(
-                        hi[j],
+                    score_hi[j] = qk_sum[j] >> T.int32(14)
+                    score_lo[j] = qk_sum[j] - (score_hi[j] << T.int32(14))
+                    score[0, j] = T.fix.quant(
+                        score_hi[j],
                         scale=(((T.cast(QS[(b * seqlen + i) * seqlen + nb * block_n + j], "int32") >> T.int32(Q_MULTIPLIER_WIDTH)) - T.int32(14)) << T.int32(Q_MULTIPLIER_WIDTH))
                         | (T.cast(QS[(b * seqlen + i) * seqlen + nb * block_n + j], "int32") & T.int32(MASK)),
                         out_dtype="int32",
                     )
-                    sc[0, j] += T.fix.quant(lo[j], scale=T.cast(QS[(b * seqlen + i) * seqlen + nb * block_n + j], "int32"), out_dtype="int32")
-                    if nb * block_n + j > i:
-                        sc[0, j] = T.int32(-32768)
-                T.reduce_max(sc, bm, dim=1, clear=True)
-                nm[0] = bm[0]
-                if mx[0] > nm[0]:
-                    nm[0] = mx[0]
-                os[0] = mx[0] - nm[0]
-                if os[0] < T.int32(-4096):
-                    os[0] = T.int32(-4096)
-                if os[0] > T.int32(0):
-                    os[0] = T.int32(0)
-                os[0] = T.cast(LUT[os[0] + T.int32(4096)], "int32")
+                    score[0, j] += T.fix.quant(score_lo[j], scale=T.cast(QS[(b * seqlen + i) * seqlen + nb * block_n + j], "int32"), out_dtype="int32")
+                    score[0, j] = T.if_then_else(nb * block_n + j > i, T.int32(-32768), score[0, j])
+
+                T.reduce_max(score, block_max, dim=1, clear=True)
+                new_max[0] = T.max(block_max[0], score_max[0])
+                old_scale[0] = T.fix.lut_10bit(score_max[0] - new_max[0], LUT, scale=1.0 / 8.0, out_dtype="int32")
                 for j in T.Parallel(block_n):
-                    ei[0, j] = sc[0, j] - nm[0]
-                    if ei[0, j] < T.int32(-4096):
-                        ei[0, j] = T.int32(-4096)
-                    if ei[0, j] > T.int32(0):
-                        ei[0, j] = T.int32(0)
-                    ex[0, j] = T.cast(LUT[ei[0, j] + T.int32(4096)], "int32")
-                T.reduce_sum(ex, bs, dim=1, clear=True)
-                sm[0] = ((sm[0] * os[0]) >> T.int32(10)) + bs[0]
+                    score_exp[0, j] = T.fix.lut_10bit(score[0, j] - new_max[0], LUT, scale=1.0 / 8.0, out_dtype="int32")
+                T.reduce_sum(score_exp, block_sum, dim=1, clear=True)
+                denom[0] = ((denom[0] * old_scale[0]) >> T.int32(10)) + block_sum[0]
                 for d, j in T.Parallel(dim, block_n):
-                    pv[d, j] = ex[0, j] * ((T.cast(V[b, nb * block_n + j, d], "int32") * T.cast(VS[b, nb * block_n + j], "int32")) >> T.int32(ATTN_VALUE_SHIFT))
-                T.reduce_sum(pv, out, dim=1, clear=True)
+                    weighted_value[d, j] = score_exp[0, j] * ((T.cast(V[b, nb * block_n + j, d], "int32") * T.cast(VS[b, nb * block_n + j], "int32")) >> T.int32(ATTN_VALUE_SHIFT))
+                T.reduce_sum(weighted_value, value_part, dim=1, clear=True)
                 for d in T.Parallel(dim):
-                    acc[d] = (((acc[d] >> T.int32(7)) * os[0]) >> T.int32(3)) + out[d]
-                mx[0] = nm[0]
+                    acc_o[d] = (((acc_o[d] >> T.int32(7)) * old_scale[0]) >> T.int32(3)) + value_part[d]
+                score_max[0] = new_max[0]
             for d in T.Parallel(dim):
-                O[b, i, d] = (acc[d] // sm[0]) << T.int32(ATTN_VALUE_SHIFT)
+                O[b, i, d] = (acc_o[d] // denom[0]) << T.int32(ATTN_VALUE_SHIFT)
 
     return main
 

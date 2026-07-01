@@ -122,6 +122,15 @@ def quant_lut(
     index_dtype: str,
     out_dtype: str,
 ) -> PrimExpr:
-    lo, _ = _SIGNED_INT_RANGES[str(index_dtype)]
-    q = signed_saturate(quant(x, scale=scale, out_dtype="int32"), str(index_dtype))
-    return lut(q, table, index_offset=-lo, out_dtype=str(out_dtype))
+    return lut_10bit(x, table, scale=scale, out_dtype=out_dtype)
+
+
+def lut_10bit(
+    x: PrimExpr,
+    table,
+    *,
+    scale,
+    out_dtype: str,
+) -> PrimExpr:
+    q = signed_saturate(quant(x, scale=scale, out_dtype="int32"), "int10")
+    return lut(q, table, index_offset=512, out_dtype=str(out_dtype))
