@@ -2,7 +2,7 @@
 
 This example runs a Qwen3-0.6B inference path using Q15.16 activations, per-token dynamic quantization, int8 per-channel weights, int8 attention, and integer TileLang kernels for the default path.
 
-The committed TileLang path is W8A8: dynamic quant, int8 GEMM, RMSNorm, RoPE/R3, SiLU, fixed-point attention with GQA, cached fixed-point attention, and gate/up paired projection.
+The committed TileLang path is W8A8: dynamic quant, int8 GEMM, fused Q15 RMSNorm, RoPE/R3, SiLU+mul+dynamic-quant, fixed-point attention with GQA/cache, fused attention residual+RMSNorm, and paired gate/up projection.
 
 The expected local model path is:
 
@@ -50,18 +50,25 @@ Run the single-layer kernel profile baseline. Use this no-cache single-layer pro
   --repeat 5
 ```
 
-Recent 2048-token-class Declaration run:
+Recent 2048-token-class Declaration PPL record:
 
 ```text
 backend=hf tokens=1902 loss=3.106583 ppl=22.344565
 backend=int-only tokens=1902 loss=3.317960 ppl=27.603982
 ```
 
-Single-layer 2048-token-class profile baseline:
+Current single-layer 2048-token-class profile baseline after the RMSNorm/residual fusions:
 
 ```text
-attention_i8_fixed avg=63.505 ms total=317.527 ms 97.27%
-gate_up_proj_i8    avg=0.306 ms  total=1.528 ms   0.47%
-down_proj_i8       avg=0.161 ms  total=0.806 ms   0.25%
-total              326.445 ms
+attention_i8_fixed     avg=102.163 ms total=510.814 ms 98.46%
+gate_up_proj_i8        avg=0.306 ms   total=1.528 ms   0.29%
+down_proj_i8           avg=0.168 ms   total=0.838 ms   0.16%
+o_proj_i8              avg=0.124 ms   total=0.618 ms   0.12%
+q_proj_i8              avg=0.120 ms   total=0.599 ms   0.12%
+rms_q_q15              avg=0.088 ms   total=0.441 ms   0.08%
+silu_mul_dq8_mid       avg=0.080 ms   total=0.402 ms   0.08%
+k_proj_i8              avg=0.074 ms   total=0.372 ms   0.07%
+dq8_attn               avg=0.070 ms   total=0.349 ms   0.07%
+v_proj_i8              avg=0.069 ms   total=0.344 ms   0.07%
+total                  518.792 ms
 ```
