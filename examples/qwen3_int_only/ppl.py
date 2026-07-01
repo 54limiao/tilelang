@@ -42,11 +42,17 @@ def ppl_from_logits(logits, labels):
 
 
 @torch.no_grad()
-def hf_ppl(model_dir, max_tokens):
+def hf_ppl(model_dir, max_tokens, cache_prompt):
     tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(model_dir, local_files_only=True, trust_remote_code=True, dtype=torch.bfloat16).to("cuda")
     ids = input_tokens(tokenizer, max_tokens, model.device).unsqueeze(0)
-    return ppl_from_logits(model(ids[:, :-1]).logits.float().reshape(-1, model.config.vocab_size), ids[:, 1:].reshape(-1))
+    if cache_prompt:
+        prefix = torch.tensor(tokenizer(cache_prompt, add_special_tokens=False).input_ids, device=model.device, dtype=torch.long).unsqueeze(0)
+        full = torch.cat((prefix, ids), dim=1)
+        logits = model(full[:, :-1]).logits.float()[:, prefix.size(1) :]
+    else:
+        logits = model(ids[:, :-1]).logits.float()
+    return ppl_from_logits(logits.reshape(-1, model.config.vocab_size), ids[:, 1:].reshape(-1))
 
 
 @torch.no_grad()
@@ -73,13 +79,12 @@ def int_only_ppl(model_dir, packed_dir, max_tokens, layers, verbose, cache_promp
         elif hasattr(past, "to_legacy_cache"):
             past = past.to_legacy_cache()
         n_layers = QWEN3_0_6B.num_hidden_layers if layers is None else layers
-        group = QWEN3_0_6B.num_attention_heads // QWEN3_0_6B.num_key_value_heads
         r2 = random_hadamard_rotation(QWEN3_0_6B.head_dim, ROTATE_SEED + 1, "cuda") if use_r2 else None
         r3 = random_hadamard_rotation(QWEN3_0_6B.head_dim, ROTATE_SEED + 2, "cuda") if use_r3 else None
         cache_kv = []
         for k, v in past[:n_layers]:
-            k = k[0].float().repeat_interleave(group, dim=0).contiguous()
-            v = v[0].float().repeat_interleave(group, dim=0).contiguous()
+            k = k[0].float().contiguous()
+            v = v[0].float().contiguous()
             if r3 is not None:
                 k = (k.to(torch.float64) @ r3.to(torch.float64)).to(torch.float32)
             if r2 is not None:
@@ -105,7 +110,7 @@ def main():
     args = parser.parse_args()
 
     if args.backend == "hf":
-        ppl, loss, ntokens = hf_ppl(args.model_dir, args.max_tokens)
+        ppl, loss, ntokens = hf_ppl(args.model_dir, args.max_tokens, args.cache_prompt)
     elif args.backend == "local-float":
         ppl, loss, ntokens = local_float_ppl(args.model_dir, args.max_tokens, args.layers, args.verbose)
     else:

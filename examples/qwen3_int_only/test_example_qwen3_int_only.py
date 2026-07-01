@@ -13,14 +13,12 @@ from examples.qwen3_int_only.kernels import (
     compile_kernel,
     dynamic_quant_q15_16,
     exp_lut_neg,
-    flash_attention_i8_float_q15_16,
-    flash_attention_i8_float_q15_16_cache,
-    flash_attention_i12_q15_16_per_scale,
-    flash_attention_q15_float_q15_16,
-    flash_attention_q15_float_q15_16_cache,
+    flash_attention_i8_q15_16,
+    flash_attention_i8_q15_16_cache,
+    flash_attention_i8_q15_16_gqa,
+    flash_attention_i8_q15_16_gqa_cache,
+    linear_dynamic_int8_pair_q15_16,
     linear_dynamic_int8_q15_16,
-    linear_dynamic_int16_q15_16,
-    packed_scale_matrix,
     rope_rotate_q15_16,
     rmsnorm_i16_q15_16_weighted,
     rsqrt_lut,
@@ -96,18 +94,22 @@ def test_linear_i8_tiled():
 
 
 @tilelang.testing.requires_cuda
-def test_linear_i16_chunk():
+def test_linear_i8_pair_tiled():
     torch.manual_seed(0)
-    rows, in_features, out_features, chunk = 3, 256, 5, 64
-    x = torch.randint(-2048, 2048, (rows, in_features), device="cuda", dtype=torch.int16)
-    w = torch.randint(-128, 127, (out_features, in_features), device="cuda", dtype=torch.int8)
-    xs = torch.randint(1, 128, (rows,), device="cuda", dtype=torch.uint32)
-    ws = torch.randint(1, 512, (out_features,), device="cuda", dtype=torch.uint32)
-    kernel = compile_kernel(linear_dynamic_int16_q15_16(rows, in_features, out_features), [4])
-    y = kernel(x, xs, w, ws)
-    acc = (x[:, None, :].int() * w[None, :, :].int()).reshape(rows, out_features, -1, chunk).sum(dim=-1).sum(dim=-1)
-    ref = ((acc >> 12) * ((xs[:, None].int() * ws[None, :].int()) >> 2)) >> 2
-    torch.testing.assert_close(y.to(torch.int64), ref.to(torch.int64), rtol=0, atol=0)
+    rows, in_features, out_features = 16, 64, 32
+    x = torch.randint(-128, 127, (rows, in_features), device="cuda", dtype=torch.int8)
+    w0 = torch.randint(-128, 127, (out_features, in_features), device="cuda", dtype=torch.int8)
+    w1 = torch.randint(-128, 127, (out_features, in_features), device="cuda", dtype=torch.int8)
+    xs = torch.randint(1, 256, (rows,), device="cuda", dtype=torch.uint32)
+    ws0 = torch.randint(1, 512, (out_features,), device="cuda", dtype=torch.uint32)
+    ws1 = torch.randint(1, 512, (out_features,), device="cuda", dtype=torch.uint32)
+    y0, y1 = compile_kernel(linear_dynamic_int8_pair_q15_16(rows, in_features, out_features), [6, 7])(x, xs, w0, ws0, w1, ws1)
+    acc0 = (x.float() @ w0.float().T).int()
+    acc1 = (x.float() @ w1.float().T).int()
+    ref0 = (acc0 >> 8) * ((xs[:, None].int() * ws0[None, :].int()) >> 8)
+    ref1 = (acc1 >> 8) * ((xs[:, None].int() * ws1[None, :].int()) >> 8)
+    torch.testing.assert_close(y0.to(torch.int64), ref0.to(torch.int64), rtol=0, atol=0)
+    torch.testing.assert_close(y1.to(torch.int64), ref1.to(torch.int64), rtol=0, atol=0)
 
 
 @tilelang.testing.requires_cuda
@@ -144,72 +146,44 @@ def test_rope_rotate_q15_16():
 
 
 @tilelang.testing.requires_cuda
-def test_attention_i12_q15_16_per_scale():
+def test_attention_i8_q15_16_fixed_point():
     torch.manual_seed(0)
-    batch, seqlen, dim = 2, 32, 16
-    q = torch.randint(-1500, 1501, (batch, seqlen, dim), device="cuda", dtype=torch.int16)
-    k = torch.randint(-1500, 1501, (batch, seqlen, dim), device="cuda", dtype=torch.int16)
-    v = torch.randint(-1800, 1801, (batch, seqlen, dim), device="cuda", dtype=torch.int16)
-    vs = torch.randint(8, 256, (batch, seqlen), device="cuda", dtype=torch.uint32)
-    qs = torch.linspace(0.00025, 0.00070, batch * seqlen, device="cuda").reshape(batch, seqlen)
-    ks = torch.linspace(0.00030, 0.00080, batch * seqlen, device="cuda").reshape(batch, seqlen)
-    score = qs[:, :, None] * ks[:, None, :] / (dim**0.5) * 64.0
-    score_q = torch.from_numpy(packed_scale_matrix(score)).cuda()
-    kernel = compile_kernel(flash_attention_i12_q15_16_per_scale(batch, seqlen, dim), [6])
-    y = kernel(q, k, v, torch.from_numpy(exp_lut_neg()).cuda(), score_q.reshape(-1).contiguous(), vs)
-    red = (q.float() @ k.float().transpose(-1, -2)).to(torch.int32)
-    hi = red >> 14
-    lo = red - (hi << 14)
-    score_i64 = score_q.to(torch.int64)
-    hi_scale = (((score_i64 >> Q_MULTIPLIER_WIDTH) - 14) << Q_MULTIPLIER_WIDTH) | (score_i64 & MASK)
-    sc = fix_quant_i32(hi, hi_scale)
-    sc += fix_quant_i32(lo, score_i64)
-    mask = torch.ones((seqlen, seqlen), device="cuda", dtype=torch.bool).tril()
-    sc = sc.masked_fill(~mask, -32768)
-    lut = torch.from_numpy(exp_lut_neg()).cuda().int()
-    ref = torch.empty_like(y)
-    for b in range(batch):
-        for i in range(seqlen):
-            score_max = torch.tensor(-(1 << 31), device="cuda", dtype=torch.int32)
-            denom = torch.tensor(0, device="cuda", dtype=torch.int64)
-            acc_o = torch.zeros((dim,), device="cuda", dtype=torch.int64)
-            for nb in range(seqlen // 32):
-                block = sc[b, i, nb * 32 : (nb + 1) * 32]
-                new_max = torch.maximum(block.max(), score_max)
-                old = torch.tensor(0, device="cuda", dtype=torch.int64) if nb == 0 else fix_lut_10bit(score_max - new_max, lut, 1.0 / 8.0).to(torch.int64)
-                ex = fix_lut_10bit(block - new_max, lut, 1.0 / 8.0).to(torch.int64)
-                denom = ((denom * old) >> 10) + ex.sum()
-                val = ((v[b, nb * 32 : (nb + 1) * 32].to(torch.int64) * vs[b, nb * 32 : (nb + 1) * 32].to(torch.int64)[:, None]) >> ATTN_VALUE_SHIFT)
-                acc_o = (((acc_o >> 7) * old) >> 3) + (ex[:, None] * val).sum(dim=0)
-                score_max = new_max
-            ref[b, i] = (acc_o // denom).to(torch.int32) << ATTN_VALUE_SHIFT
-    torch.testing.assert_close(y, ref, rtol=0, atol=128)
-
-
-@tilelang.testing.requires_cuda
-def test_attention_i8_float_q15_16_causal_tail():
-    torch.manual_seed(0)
-    batch, seqlen, dim = 2, 127, 128
+    batch, seqlen, dim, block_n = 2, 128, 128, 64
     q = torch.randint(-127, 128, (batch, seqlen, dim), device="cuda", dtype=torch.int8)
     k = torch.randint(-127, 128, (batch, seqlen, dim), device="cuda", dtype=torch.int8)
     v = torch.randint(-127, 128, (batch, seqlen, dim), device="cuda", dtype=torch.int8)
     qs = torch.round((torch.rand((batch, seqlen), device="cuda") * 0.02 + 0.005) * Q15_16).to(torch.uint32)
     ks = torch.round((torch.rand((batch, seqlen), device="cuda") * 0.02 + 0.005) * Q15_16).to(torch.uint32)
     vs = torch.round((torch.rand((batch, seqlen), device="cuda") * 0.03 + 0.004) * Q15_16).to(torch.uint32)
-    y = compile_kernel(flash_attention_i8_float_q15_16(batch, seqlen, dim), [6])(q, k, v, qs, ks, vs)
-    qf = q.float() * qs.float()[:, :, None] / Q15_16
-    kf = k.float() * ks.float()[:, :, None] / Q15_16
-    vf = v.float() * vs.float()[:, :, None] / Q15_16
-    score = qf @ kf.transpose(-1, -2) / (dim**0.5)
-    mask = torch.ones((seqlen, seqlen), device="cuda", dtype=torch.bool).tril()
-    ref = torch.trunc((torch.softmax(score.masked_fill(~mask, torch.finfo(score.dtype).min), dim=-1) @ vf) * Q15_16).to(torch.int32)
-    torch.testing.assert_close(y, ref, rtol=0, atol=256)
+    lut = torch.from_numpy(exp_lut_neg()).cuda()
+    y = compile_kernel(flash_attention_i8_q15_16(batch, seqlen, dim, block_n), [7])(q, k, v, qs, ks, vs, lut)
+    red = (q.float() @ k.float().transpose(-1, -2)).to(torch.int32)
+    scale = (((qs[:, :, None].int() >> 4) * (ks[:, None, :].int() >> 4)) >> 8) * 5793
+    score = ((red >> 8) * scale) >> 18
+    score = score.masked_fill(~torch.ones((seqlen, seqlen), device="cuda", dtype=torch.bool).tril(), -32768)
+    ref = torch.empty_like(y)
+    for b in range(batch):
+        for i in range(seqlen):
+            score_max = torch.tensor(-(1 << 31), device="cuda", dtype=torch.int32)
+            denom = torch.tensor(0, device="cuda", dtype=torch.int64)
+            acc_o = torch.zeros((dim,), device="cuda", dtype=torch.int64)
+            for nb in range((i // block_n) + 1):
+                block = score[b, i, nb * block_n : (nb + 1) * block_n]
+                new_max = torch.maximum(block.max(), score_max)
+                old = fix_lut_10bit(score_max - new_max, lut, 0.125).to(torch.int64)
+                ex = fix_lut_10bit(block - new_max, lut, 0.125).to(torch.int64)
+                denom = ((denom * old) >> 10) + ex.sum()
+                vv = (v[b, nb * block_n : (nb + 1) * block_n].to(torch.int64) * vs[b, nb * block_n : (nb + 1) * block_n].to(torch.int64)[:, None]) >> ATTN_VALUE_SHIFT
+                acc_o = (((acc_o >> 7) * old) >> 3) + (ex[:, None] * vv).sum(dim=0)
+                score_max = new_max
+            ref[b, i] = (acc_o // denom).to(torch.int32) << ATTN_VALUE_SHIFT
+    torch.testing.assert_close(y, ref, rtol=0, atol=0)
 
 
 @tilelang.testing.requires_cuda
-def test_attention_i8_float_q15_16_cache():
+def test_attention_i8_q15_16_cache_fixed_point():
     torch.manual_seed(0)
-    batch, cache_len, seqlen, dim = 2, 17, 73, 128
+    batch, cache_len, seqlen, dim, block_n = 2, 17, 73, 128, 64
     q = torch.randint(-127, 128, (batch, seqlen, dim), device="cuda", dtype=torch.int8)
     k = torch.randint(-127, 128, (batch, seqlen, dim), device="cuda", dtype=torch.int8)
     v = torch.randint(-127, 128, (batch, seqlen, dim), device="cuda", dtype=torch.int8)
@@ -220,52 +194,98 @@ def test_attention_i8_float_q15_16_cache():
     vs = torch.round((torch.rand((batch, seqlen), device="cuda") * 0.03 + 0.004) * Q15_16).to(torch.uint32)
     cks = torch.round((torch.rand((batch, cache_len), device="cuda") * 0.02 + 0.005) * Q15_16).to(torch.uint32)
     cvs = torch.round((torch.rand((batch, cache_len), device="cuda") * 0.03 + 0.004) * Q15_16).to(torch.uint32)
-    y = compile_kernel(flash_attention_i8_float_q15_16_cache(batch, seqlen, cache_len, dim), [10])(q, ck, cv, k, v, qs, cks, cvs, ks, vs)
-    qf = q.float() * qs.float()[:, :, None] / Q15_16
-    k_all = torch.cat((ck.float() * cks.float()[:, :, None] / Q15_16, k.float() * ks.float()[:, :, None] / Q15_16), dim=1)
-    v_all = torch.cat((cv.float() * cvs.float()[:, :, None] / Q15_16, v.float() * vs.float()[:, :, None] / Q15_16), dim=1)
-    score = qf @ k_all.transpose(-1, -2) / (dim**0.5)
+    lut = torch.from_numpy(exp_lut_neg()).cuda()
+    y = compile_kernel(flash_attention_i8_q15_16_cache(batch, seqlen, cache_len, dim, block_n), [11])(q, ck, cv, k, v, qs, cks, cvs, ks, vs, lut)
+    k_all = torch.cat((ck, k), dim=1)
+    v_all = torch.cat((cv, v), dim=1)
+    ks_all = torch.cat((cks, ks), dim=1)
+    vs_all = torch.cat((cvs, vs), dim=1)
+    red = (q.float() @ k_all.float().transpose(-1, -2)).to(torch.int32)
+    scale = (((qs[:, :, None].int() >> 4) * (ks_all[:, None, :].int() >> 4)) >> 8) * 5793
+    score = ((red >> 8) * scale) >> 18
     q_pos = cache_len + torch.arange(seqlen, device="cuda")
     k_pos = torch.arange(cache_len + seqlen, device="cuda")
-    mask = k_pos[None, :] <= q_pos[:, None]
-    ref = torch.trunc((torch.softmax(score.masked_fill(~mask, torch.finfo(score.dtype).min), dim=-1) @ v_all) * Q15_16).to(torch.int32)
-    torch.testing.assert_close(y, ref, rtol=0, atol=256)
+    score = score.masked_fill(k_pos[None, :] > q_pos[:, None], -32768)
+    ref = torch.empty_like(y)
+    for b in range(batch):
+        for i in range(seqlen):
+            score_max = torch.tensor(-(1 << 31), device="cuda", dtype=torch.int32)
+            denom = torch.tensor(0, device="cuda", dtype=torch.int64)
+            acc_o = torch.zeros((dim,), device="cuda", dtype=torch.int64)
+            for nb in range(((cache_len + i) // block_n) + 1):
+                block = score[b, i, nb * block_n : (nb + 1) * block_n]
+                if block.numel() < block_n:
+                    block = torch.cat((block, torch.full((block_n - block.numel(),), -32768, device="cuda", dtype=torch.int32)))
+                new_max = torch.maximum(block.max(), score_max)
+                old = fix_lut_10bit(score_max - new_max, lut, 0.125).to(torch.int64)
+                ex = fix_lut_10bit(block - new_max, lut, 0.125).to(torch.int64)
+                denom = ((denom * old) >> 10) + ex.sum()
+                vv = torch.zeros((block_n, dim), device="cuda", dtype=torch.int64)
+                end = min((nb + 1) * block_n, cache_len + seqlen)
+                valid = end - nb * block_n
+                vv[:valid] = (v_all[b, nb * block_n : end].to(torch.int64) * vs_all[b, nb * block_n : end].to(torch.int64)[:, None]) >> ATTN_VALUE_SHIFT
+                acc_o = (((acc_o >> 7) * old) >> 3) + (ex[:, None] * vv).sum(dim=0)
+                score_max = new_max
+            ref[b, i] = (acc_o // denom).to(torch.int32) << ATTN_VALUE_SHIFT
+    torch.testing.assert_close(y, ref, rtol=0, atol=0)
 
 
 @tilelang.testing.requires_cuda
-def test_attention_q15_float_q15_16_causal_tail():
+def test_attention_i8_q15_16_gqa_matches_repeated_kv():
     torch.manual_seed(0)
-    batch, seqlen, dim = 2, 127, 128
-    qf = torch.randn((batch, seqlen, dim), device="cuda") * 0.15
-    kf = torch.randn((batch, seqlen, dim), device="cuda") * 0.15
-    vf = torch.randn((batch, seqlen, dim), device="cuda") * 0.08
-    q, k, v = q15(qf), q15(kf), q15(vf)
-    y = compile_kernel(flash_attention_q15_float_q15_16(batch, seqlen, dim), [3])(q, k, v)
-    score = qf @ kf.transpose(-1, -2) / (dim**0.5)
-    mask = torch.ones((seqlen, seqlen), device="cuda", dtype=torch.bool).tril()
-    ref = torch.trunc((torch.softmax(score.masked_fill(~mask, torch.finfo(score.dtype).min), dim=-1) @ vf) * Q15_16).to(torch.int32)
-    torch.testing.assert_close(y, ref, rtol=0, atol=256)
+    q_heads, kv_heads, seqlen, dim = 16, 8, 128, 128
+    group = q_heads // kv_heads
+    q = torch.randint(-127, 128, (q_heads, seqlen, dim), device="cuda", dtype=torch.int8)
+    k = torch.randint(-127, 128, (kv_heads, seqlen, dim), device="cuda", dtype=torch.int8)
+    v = torch.randint(-127, 128, (kv_heads, seqlen, dim), device="cuda", dtype=torch.int8)
+    qs = torch.round((torch.rand((q_heads, seqlen), device="cuda") * 0.02 + 0.005) * Q15_16).to(torch.uint32)
+    ks = torch.round((torch.rand((kv_heads, seqlen), device="cuda") * 0.02 + 0.005) * Q15_16).to(torch.uint32)
+    vs = torch.round((torch.rand((kv_heads, seqlen), device="cuda") * 0.03 + 0.004) * Q15_16).to(torch.uint32)
+    lut = torch.from_numpy(exp_lut_neg()).cuda()
+    y = compile_kernel(flash_attention_i8_q15_16_gqa(q_heads, kv_heads, seqlen, dim), [7])(q, k, v, qs, ks, vs, lut)
+    ref = compile_kernel(flash_attention_i8_q15_16(q_heads, seqlen, dim), [7])(
+        q,
+        k.repeat_interleave(group, dim=0).contiguous(),
+        v.repeat_interleave(group, dim=0).contiguous(),
+        qs,
+        ks.repeat_interleave(group, dim=0).contiguous(),
+        vs.repeat_interleave(group, dim=0).contiguous(),
+        lut,
+    )
+    torch.testing.assert_close(y, ref, rtol=0, atol=0)
 
 
 @tilelang.testing.requires_cuda
-def test_attention_q15_float_q15_16_cache():
+def test_attention_i8_q15_16_gqa_cache_matches_repeated_kv():
     torch.manual_seed(0)
-    batch, cache_len, seqlen, dim = 2, 17, 73, 128
-    qf = torch.randn((batch, seqlen, dim), device="cuda") * 0.15
-    kf = torch.randn((batch, seqlen, dim), device="cuda") * 0.15
-    vf = torch.randn((batch, seqlen, dim), device="cuda") * 0.08
-    ckf = torch.randn((batch, cache_len, dim), device="cuda") * 0.15
-    cvf = torch.randn((batch, cache_len, dim), device="cuda") * 0.08
-    q, k, v = q15(qf), q15(kf), q15(vf)
-    ck, cv = q15(ckf), q15(cvf)
-    y = compile_kernel(flash_attention_q15_float_q15_16_cache(batch, seqlen, cache_len, dim), [5])(q, ck, cv, k, v)
-    k_all, v_all = torch.cat((ckf, kf), dim=1), torch.cat((cvf, vf), dim=1)
-    score = qf @ k_all.transpose(-1, -2) / (dim**0.5)
-    q_pos = cache_len + torch.arange(seqlen, device="cuda")
-    k_pos = torch.arange(cache_len + seqlen, device="cuda")
-    mask = k_pos[None, :] <= q_pos[:, None]
-    ref = torch.trunc((torch.softmax(score.masked_fill(~mask, torch.finfo(score.dtype).min), dim=-1) @ v_all) * Q15_16).to(torch.int32)
-    torch.testing.assert_close(y, ref, rtol=0, atol=256)
+    q_heads, kv_heads, cache_len, seqlen, dim = 16, 8, 17, 73, 128
+    group = q_heads // kv_heads
+    q = torch.randint(-127, 128, (q_heads, seqlen, dim), device="cuda", dtype=torch.int8)
+    k = torch.randint(-127, 128, (kv_heads, seqlen, dim), device="cuda", dtype=torch.int8)
+    v = torch.randint(-127, 128, (kv_heads, seqlen, dim), device="cuda", dtype=torch.int8)
+    ck = torch.randint(-127, 128, (kv_heads, cache_len, dim), device="cuda", dtype=torch.int8)
+    cv = torch.randint(-127, 128, (kv_heads, cache_len, dim), device="cuda", dtype=torch.int8)
+    qs = torch.round((torch.rand((q_heads, seqlen), device="cuda") * 0.02 + 0.005) * Q15_16).to(torch.uint32)
+    ks = torch.round((torch.rand((kv_heads, seqlen), device="cuda") * 0.02 + 0.005) * Q15_16).to(torch.uint32)
+    vs = torch.round((torch.rand((kv_heads, seqlen), device="cuda") * 0.03 + 0.004) * Q15_16).to(torch.uint32)
+    cks = torch.round((torch.rand((kv_heads, cache_len), device="cuda") * 0.02 + 0.005) * Q15_16).to(torch.uint32)
+    cvs = torch.round((torch.rand((kv_heads, cache_len), device="cuda") * 0.03 + 0.004) * Q15_16).to(torch.uint32)
+    lut = torch.from_numpy(exp_lut_neg()).cuda()
+    y = compile_kernel(flash_attention_i8_q15_16_gqa_cache(q_heads, kv_heads, seqlen, cache_len, dim), [11])(q, ck, cv, k, v, qs, cks, cvs, ks, vs, lut)
+    ref = compile_kernel(flash_attention_i8_q15_16_cache(q_heads, seqlen, cache_len, dim), [11])(
+        q,
+        ck.repeat_interleave(group, dim=0).contiguous(),
+        cv.repeat_interleave(group, dim=0).contiguous(),
+        k.repeat_interleave(group, dim=0).contiguous(),
+        v.repeat_interleave(group, dim=0).contiguous(),
+        qs,
+        cks.repeat_interleave(group, dim=0).contiguous(),
+        cvs.repeat_interleave(group, dim=0).contiguous(),
+        ks.repeat_interleave(group, dim=0).contiguous(),
+        vs.repeat_interleave(group, dim=0).contiguous(),
+        lut,
+    )
+    torch.testing.assert_close(y, ref, rtol=0, atol=0)
 
 
 @tilelang.testing.requires_cuda
