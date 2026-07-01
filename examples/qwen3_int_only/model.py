@@ -18,7 +18,7 @@ from examples.qwen3_int_only.kernels import (
     flash_attention_i8_q15_16_gqa_cache,
     linear_dynamic_int8_pair_q15_16,
     linear_dynamic_int8_q15_16,
-    rmsnorm_i16_q15_16_weighted,
+    rmsnorm_q15_16_grouped_weighted,
     rmsnorm_q15_16_weighted,
     rope_rotate_q15_16,
     rope_q15_16,
@@ -261,13 +261,11 @@ class Qwen3IntOnlyBlock:
         q_dim, kv_dim = config.q_size, config.kv_size
         self.rms_hidden_q15 = compile_kernel(rmsnorm_q15_16_weighted(seq_len, h), [3])
         self.add_rms_hidden_q15 = compile_kernel(add_rmsnorm_q15_16_weighted(seq_len, h), [4, 5])
-        self.rms_q_dyn = compile_kernel(rmsnorm_i16_q15_16_weighted(seq_len * qh, hd), [3])
-        self.rms_k_dyn = compile_kernel(rmsnorm_i16_q15_16_weighted(seq_len * kvh, hd), [3])
+        self.rms_q_q15 = compile_kernel(rmsnorm_q15_16_grouped_weighted(seq_len, qh, hd), [3])
+        self.rms_k_q15 = compile_kernel(rmsnorm_q15_16_grouped_weighted(seq_len, kvh, hd), [3])
         self.dq8_hidden = compile_kernel(dynamic_quant_q15_16(seq_len, h, "int8"), [1, 2])
         self.dq8_q_head = compile_kernel(dynamic_quant_q15_16(seq_len * qh, hd, "int8"), [1, 2])
         self.dq8_kv_head = compile_kernel(dynamic_quant_q15_16(seq_len * kvh, hd, "int8"), [1, 2])
-        self.dq16_q_norm = compile_kernel(dynamic_quant_q15_16(seq_len, q_dim, "int16", 4095), [1, 2])
-        self.dq16_kv_norm = compile_kernel(dynamic_quant_q15_16(seq_len, kv_dim, "int16", 4095), [1, 2])
         self.dq8_q = compile_kernel(dynamic_quant_q15_16(seq_len, q_dim, "int8"), [1, 2])
         self.q_proj = compile_kernel(linear_dynamic_int8_q15_16(seq_len, h, q_dim), [4])
         self.k_proj = compile_kernel(linear_dynamic_int8_q15_16(seq_len, h, kv_dim), [4])
@@ -293,13 +291,9 @@ class Qwen3IntOnlyBlock:
         q = self.q_proj(x8, xs8, weights.q_proj.weight, weights.q_proj.scale)
         k = self.k_proj(x8, xs8, weights.k_proj.weight, weights.k_proj.scale)
         v = self.v_proj(x8, xs8, weights.v_proj.weight, weights.v_proj.scale)
-        q_heads = q.reshape(self.seq_len * self.config.num_attention_heads, self.config.head_dim)
-        k_heads = k.reshape(self.seq_len * self.config.num_key_value_heads, self.config.head_dim)
         v_heads = v.reshape(self.seq_len * self.config.num_key_value_heads, self.config.head_dim)
-        qh16, _ = self.dq16_q_norm(q_heads.reshape(self.seq_len, self.config.q_size))
-        kh16, _ = self.dq16_kv_norm(k_heads.reshape(self.seq_len, self.config.kv_size))
-        q_heads = self.rms_q_dyn(qh16.reshape(self.seq_len * self.config.num_attention_heads, self.config.head_dim), weights.q_norm, self.lut_rsqrt)
-        k_heads = self.rms_k_dyn(kh16.reshape(self.seq_len * self.config.num_key_value_heads, self.config.head_dim), weights.k_norm, self.lut_rsqrt)
+        q_heads = self.rms_q_q15(q, weights.q_norm, self.lut_rsqrt)
+        k_heads = self.rms_k_q15(k, weights.k_norm, self.lut_rsqrt)
         pos_cos = cos_q15_16[self.cache_len : self.cache_len + self.seq_len]
         pos_sin = sin_q15_16[self.cache_len : self.cache_len + self.seq_len]
         cos_q = pos_cos[:, None, :].expand(self.seq_len, self.config.num_attention_heads, self.config.head_dim // 2).reshape(self.seq_len * self.config.num_attention_heads, self.config.head_dim // 2).contiguous()
