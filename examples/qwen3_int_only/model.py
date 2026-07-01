@@ -12,16 +12,18 @@ from examples.qwen3_int_only.kernels import (
     add_q15_16,
     compile_kernel,
     dynamic_quant_q15_16,
-    flash_attention_q15_float_q15_16_cache,
-    flash_attention_q15_float_q15_16,
+    flash_attention_i8_float_q15_16,
+    flash_attention_i8_float_q15_16_cache,
     linear_dynamic_int8_q15_16,
     mul_q15_16,
     rmsnorm_i16_q15_16_weighted,
+    rope_rotate_q15_16,
     rope_q15_16,
     rsqrt_lut,
     sigmoid_lut,
     silu_q15_16,
 )
+from examples.qwen3_int_only.quarot import ROTATE_SEED, random_hadamard_rotation
 
 
 @dataclass(frozen=True)
@@ -246,10 +248,11 @@ def block_torch(x, weights: Qwen3BlockWeights, cos_q15_16, sin_q15_16, config=QW
 
 
 class Qwen3IntOnlyBlock:
-    def __init__(self, seq_len, config=QWEN3_0_6B, cache_len=0):
+    def __init__(self, seq_len, config=QWEN3_0_6B, cache_len=0, use_r3=False):
         self.seq_len = seq_len
         self.cache_len = cache_len
         self.config = config
+        self.use_r3 = use_r3
         h, hd, im = config.hidden_size, config.head_dim, config.intermediate_size
         qh, kvh = config.num_attention_heads, config.num_key_value_heads
         q_dim, kv_dim = config.q_size, config.kv_size
@@ -257,6 +260,8 @@ class Qwen3IntOnlyBlock:
         self.rms_q_dyn = compile_kernel(rmsnorm_i16_q15_16_weighted(seq_len * qh, hd), [3])
         self.rms_k_dyn = compile_kernel(rmsnorm_i16_q15_16_weighted(seq_len * kvh, hd), [3])
         self.dq8_hidden = compile_kernel(dynamic_quant_q15_16(seq_len, h, "int8"), [1, 2])
+        self.dq8_q_head = compile_kernel(dynamic_quant_q15_16(seq_len * qh, hd, "int8"), [1, 2])
+        self.dq8_kv_head = compile_kernel(dynamic_quant_q15_16(seq_len * kvh, hd, "int8"), [1, 2])
         self.dq16_hidden_norm = compile_kernel(dynamic_quant_q15_16(seq_len, h, "int16", 4095), [1, 2])
         self.dq16_q_norm = compile_kernel(dynamic_quant_q15_16(seq_len, q_dim, "int16", 4095), [1, 2])
         self.dq16_kv_norm = compile_kernel(dynamic_quant_q15_16(seq_len, kv_dim, "int16", 4095), [1, 2])
@@ -269,19 +274,19 @@ class Qwen3IntOnlyBlock:
         self.gate_proj_i8 = compile_kernel(linear_dynamic_int8_q15_16(seq_len, h, im), [4])
         self.up_proj_i8 = compile_kernel(linear_dynamic_int8_q15_16(seq_len, h, im), [4])
         self.down_proj_i8 = compile_kernel(linear_dynamic_int8_q15_16(seq_len, im, h), [4])
-        self.rope_q = compile_kernel(rope_q15_16(seq_len * qh, hd), [3])
-        self.rope_k = compile_kernel(rope_q15_16(seq_len * kvh, hd), [3])
+        self.rope_q = compile_kernel(rope_rotate_q15_16(seq_len * qh, hd), [4]) if use_r3 else compile_kernel(rope_q15_16(seq_len * qh, hd), [3])
+        self.rope_k = compile_kernel(rope_rotate_q15_16(seq_len * kvh, hd), [4]) if use_r3 else compile_kernel(rope_q15_16(seq_len * kvh, hd), [3])
         self.silu_mid = compile_kernel(silu_q15_16(seq_len, im), [2])
         self.mul_mid = compile_kernel(mul_q15_16(seq_len, im), [2])
         self.add_hidden = compile_kernel(add_q15_16(seq_len, h), [2])
-        self.attn_q15_float = compile_kernel(flash_attention_q15_float_q15_16(qh, seq_len, hd), [3])
-        self.attn_q15_float_cache = None
+        self.attn_i8_float = compile_kernel(flash_attention_i8_float_q15_16(qh, seq_len, hd), [6])
+        self.attn_i8_float_cache = None
         if cache_len:
-            self.attn_q15_float_cache = compile_kernel(flash_attention_q15_float_q15_16_cache(qh, seq_len, cache_len, hd), [5])
+            self.attn_i8_float_cache = compile_kernel(flash_attention_i8_float_q15_16_cache(qh, seq_len, cache_len, hd), [10])
         self.lut_rsqrt = torch.from_numpy(rsqrt_lut()).cuda()
         self.lut_sigmoid = torch.from_numpy(sigmoid_lut()).cuda()
 
-    def __call__(self, x_q15_16, weights: Qwen3BlockWeights, cos_q15_16, sin_q15_16, cache_k=None, cache_v=None):
+    def __call__(self, x_q15_16, weights: Qwen3BlockWeights, cos_q15_16, sin_q15_16, cache_k=None, cache_v=None, r3_q15=None):
         x16, _ = self.dq16_hidden_norm(x_q15_16)
         norm = self.rms_hidden_dyn(x16, weights.input_layernorm, self.lut_rsqrt)
         x8, xs8 = self.dq8_hidden(norm)
@@ -301,16 +306,26 @@ class Qwen3IntOnlyBlock:
         sin_q = pos_sin[:, None, :].expand(self.seq_len, self.config.num_attention_heads, self.config.head_dim // 2).reshape(self.seq_len * self.config.num_attention_heads, self.config.head_dim // 2).contiguous()
         cos_k = pos_cos[:, None, :].expand(self.seq_len, self.config.num_key_value_heads, self.config.head_dim // 2).reshape(self.seq_len * self.config.num_key_value_heads, self.config.head_dim // 2).contiguous()
         sin_k = pos_sin[:, None, :].expand(self.seq_len, self.config.num_key_value_heads, self.config.head_dim // 2).reshape(self.seq_len * self.config.num_key_value_heads, self.config.head_dim // 2).contiguous()
-        qr = self.rope_q(q_heads, cos_q, sin_q)
-        kr = self.rope_k(k_heads, cos_k, sin_k)
-        group = self.config.num_attention_heads // self.config.num_key_value_heads
-        q_attn = qr.reshape(self.seq_len, self.config.num_attention_heads, self.config.head_dim).permute(1, 0, 2).contiguous()
-        k_attn = kr.reshape(self.seq_len, self.config.num_key_value_heads, self.config.head_dim).repeat_interleave(group, dim=1).permute(1, 0, 2).contiguous()
-        v_attn = v_heads.reshape(self.seq_len, self.config.num_key_value_heads, self.config.head_dim).repeat_interleave(group, dim=1).permute(1, 0, 2).contiguous()
-        if cache_k is None:
-            attn = self.attn_q15_float(q_attn, k_attn, v_attn)
+        if self.use_r3:
+            qr = self.rope_q(q_heads, cos_q, sin_q, r3_q15)
+            kr = self.rope_k(k_heads, cos_k, sin_k, r3_q15)
         else:
-            attn = self.attn_q15_float_cache(q_attn, cache_k, cache_v, k_attn, v_attn)
+            qr = self.rope_q(q_heads, cos_q, sin_q)
+            kr = self.rope_k(k_heads, cos_k, sin_k)
+        group = self.config.num_attention_heads // self.config.num_key_value_heads
+        q8, qs8 = self.dq8_q_head(qr)
+        k8, ks8 = self.dq8_kv_head(kr)
+        v8, vs8 = self.dq8_kv_head(v_heads)
+        q_attn = q8.reshape(self.seq_len, self.config.num_attention_heads, self.config.head_dim).permute(1, 0, 2).contiguous()
+        k_attn = k8.reshape(self.seq_len, self.config.num_key_value_heads, self.config.head_dim).repeat_interleave(group, dim=1).permute(1, 0, 2).contiguous()
+        v_attn = v8.reshape(self.seq_len, self.config.num_key_value_heads, self.config.head_dim).repeat_interleave(group, dim=1).permute(1, 0, 2).contiguous()
+        qs_attn = qs8.reshape(self.seq_len, self.config.num_attention_heads).permute(1, 0).contiguous()
+        ks_attn = ks8.reshape(self.seq_len, self.config.num_key_value_heads).repeat_interleave(group, dim=1).permute(1, 0).contiguous()
+        vs_attn = vs8.reshape(self.seq_len, self.config.num_key_value_heads).repeat_interleave(group, dim=1).permute(1, 0).contiguous()
+        if cache_k is None:
+            attn = self.attn_i8_float(q_attn, k_attn, v_attn, qs_attn, ks_attn, vs_attn)
+        else:
+            attn = self.attn_i8_float_cache(q_attn, cache_k[0], cache_v[0], k_attn, v_attn, qs_attn, cache_k[1], cache_v[1], ks_attn, vs_attn)
         attn = attn.permute(1, 0, 2).reshape(self.seq_len, self.config.q_size)
         attn8, attn_s8 = self.dq8_q(attn)
         attn_out = self.o_proj(attn8, attn_s8, weights.o_proj.weight, weights.o_proj.scale)
@@ -327,11 +342,12 @@ class Qwen3IntOnlyBlock:
 
 
 class Qwen3IntOnlyModel:
-    def __init__(self, seq_len, model_dir="/code/Qwen3-0.6B", packed_dir=None, config=QWEN3_0_6B, cache_len=0):
+    def __init__(self, seq_len, model_dir="/code/Qwen3-0.6B", packed_dir=None, config=QWEN3_0_6B, cache_len=0, use_r3=False, rotate_seed=ROTATE_SEED):
         self.seq_len = seq_len
         self.cache_len = cache_len
         self.config = config
-        self.block = Qwen3IntOnlyBlock(seq_len, config, cache_len=cache_len)
+        self.r3_q15 = q15_16(random_hadamard_rotation(config.head_dim, rotate_seed + 2)) if use_r3 else None
+        self.block = Qwen3IntOnlyBlock(seq_len, config, cache_len=cache_len, use_r3=use_r3)
         self.final_norm_kernel = compile_kernel(rmsnorm_i16_q15_16_weighted(seq_len, config.hidden_size), [3])
         self.lut_rsqrt = torch.from_numpy(rsqrt_lut()).cuda()
         self.cos, self.sin, _ = rope_tables_q15_16(seq_len + cache_len, config.head_dim, config.rope_theta)
@@ -353,9 +369,9 @@ class Qwen3IntOnlyModel:
             t0 = time.time()
             layer_cache = None if cache_kv is None else cache_kv[layer_idx]
             if layer_cache is None:
-                x = self.block(x, self.layers[layer_idx], self.cos, self.sin)
+                x = self.block(x, self.layers[layer_idx], self.cos, self.sin, r3_q15=self.r3_q15)
             else:
-                x = self.block(x, self.layers[layer_idx], self.cos, self.sin, layer_cache[0], layer_cache[1])
+                x = self.block(x, self.layers[layer_idx], self.cos, self.sin, layer_cache[0], layer_cache[1], self.r3_q15)
             if verbose:
                 torch.cuda.synchronize()
                 print(f"int-only layer {layer_idx} done in {time.time() - t0:.3f}s", flush=True)

@@ -79,6 +79,36 @@ def rope_q15_16(rows, dim):
     return main
 
 
+def rope_rotate_q15_16(rows, dim):
+    @T.prim_func
+    def main(
+        X: T.Tensor((rows, dim), "int32"),
+        COS: T.Tensor((rows, dim // 2), "int32"),
+        SIN: T.Tensor((rows, dim // 2), "int32"),
+        R: T.Tensor((dim, dim), "int32"),
+        Y: T.Tensor((rows, dim), "int32"),
+    ):
+        with T.Kernel(rows, threads=128) as r:
+            rope_lo = T.alloc_fragment((dim // 2,), "int32")
+            rope_hi = T.alloc_fragment((dim // 2,), "int32")
+            acc = T.alloc_fragment((dim,), "int32")
+            for d in T.Parallel(dim // 2):
+                rope_lo[d] = ((X[r, d] >> T.int32(8)) * (COS[r, d] >> T.int32(8))) - (
+                    (X[r, d + dim // 2] >> T.int32(8)) * (SIN[r, d] >> T.int32(8))
+                )
+                rope_hi[d] = ((X[r, d] >> T.int32(8)) * (SIN[r, d] >> T.int32(8))) + (
+                    (X[r, d + dim // 2] >> T.int32(8)) * (COS[r, d] >> T.int32(8))
+                )
+            for o in T.Parallel(dim):
+                acc[o] = T.int32(0)
+                for k in T.serial(dim // 2):
+                    acc[o] += (rope_lo[k] >> T.int32(8)) * (R[k, o] >> T.int32(8))
+                    acc[o] += (rope_hi[k] >> T.int32(8)) * (R[k + dim // 2, o] >> T.int32(8))
+                Y[r, o] = acc[o]
+
+    return main
+
+
 def rmsnorm_i16_q15_16_weighted(rows, cols):
     mean_shift = int(math.log2(cols))
 
@@ -397,6 +427,122 @@ def flash_attention_i8_float_q15_16(batch, seqlen, dim, block_m=64, block_n=64, 
                         bm * block_m + m < seqlen,
                         T.if_then_else(
                             (nb * block_n + n < seqlen) and (bm * block_m + m >= nb * block_n + n),
+                            0,
+                            -T.infinity("float32"),
+                        ),
+                        0,
+                    )
+                T.gemm(q_shared, k_shared, prob, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+                T.copy(score_max, score_prev)
+                T.fill(score_max, -T.infinity("float32"))
+                T.reduce_max(prob, score_max, dim=1, clear=False)
+                for m in T.Parallel(block_m):
+                    score_max[m] = T.max(score_max[m], score_prev[m])
+                    score_scale[m] = T.exp2((score_prev[m] - score_max[m]) * log2e_scale)
+                for m, n in T.Parallel(block_m, block_n):
+                    prob[m, n] = T.exp2((prob[m, n] - score_max[m]) * log2e_scale)
+                T.reduce_sum(prob, score_sum, dim=1)
+                for m in T.Parallel(block_m):
+                    denom[m] = denom[m] * score_scale[m] + score_sum[m]
+                T.copy(prob, prob_cast)
+                for m, d in T.Parallel(block_m, dim):
+                    acc_o[m, d] *= score_scale[m]
+                T.gemm(prob_cast, v_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
+            for m, d in T.Parallel(block_m, dim):
+                if bm * block_m + m < seqlen:
+                    O[b, bm * block_m + m, d] = T.cast((acc_o[m, d] / denom[m]) * Q15_16, "int32")
+
+    return main
+
+
+def flash_attention_i8_float_q15_16_cache(batch, seqlen, cache_len, dim, block_m=64, block_n=64, threads=128):
+    kv_len = cache_len + seqlen
+    log2e_scale = (1.0 / math.sqrt(dim)) * 1.4426950408889634
+
+    @T.prim_func
+    def main(
+        Q: T.Tensor((batch, seqlen, dim), "int8"),
+        CACHE_K: T.Tensor((batch, cache_len, dim), "int8"),
+        CACHE_V: T.Tensor((batch, cache_len, dim), "int8"),
+        K: T.Tensor((batch, seqlen, dim), "int8"),
+        V: T.Tensor((batch, seqlen, dim), "int8"),
+        QS: T.Tensor((batch, seqlen), "uint32"),
+        CACHE_KS: T.Tensor((batch, cache_len), "uint32"),
+        CACHE_VS: T.Tensor((batch, cache_len), "uint32"),
+        KS: T.Tensor((batch, seqlen), "uint32"),
+        VS: T.Tensor((batch, seqlen), "uint32"),
+        O: T.Tensor((batch, seqlen, dim), "int32"),
+    ):
+        with T.Kernel(T.ceildiv(seqlen, block_m), batch, threads=threads) as (bm, b):
+            q_shared = T.alloc_shared((block_m, dim), "float16")
+            k_shared = T.alloc_shared((block_n, dim), "float16")
+            v_shared = T.alloc_shared((block_n, dim), "float16")
+            prob = T.alloc_fragment((block_m, block_n), "float32")
+            prob_cast = T.alloc_fragment((block_m, block_n), "float16")
+            acc_o = T.alloc_fragment((block_m, dim), "float32")
+            score_max = T.alloc_fragment((block_m,), "float32")
+            score_prev = T.alloc_fragment((block_m,), "float32")
+            score_scale = T.alloc_fragment((block_m,), "float32")
+            score_sum = T.alloc_fragment((block_m,), "float32")
+            denom = T.alloc_fragment((block_m,), "float32")
+
+            for m, d in T.Parallel(block_m, dim):
+                q_shared[m, d] = T.if_then_else(
+                    bm * block_m + m < seqlen,
+                    T.cast(
+                        T.cast(Q[b, bm * block_m + m, d], "float32") * T.cast(QS[b, bm * block_m + m], "float32") * (1.0 / Q15_16),
+                        "float16",
+                    ),
+                    T.float16(0.0),
+                )
+            T.fill(acc_o, 0.0)
+            T.fill(denom, 0.0)
+            T.fill(score_max, -T.infinity("float32"))
+            for nb in T.Pipelined(T.ceildiv(kv_len, block_n), num_stages=1):
+                for n, d in T.Parallel(block_n, dim):
+                    k_shared[n, d] = T.if_then_else(
+                        nb * block_n + n < cache_len,
+                        T.cast(
+                            T.cast(CACHE_K[b, nb * block_n + n, d], "float32")
+                            * T.cast(CACHE_KS[b, nb * block_n + n], "float32")
+                            * (1.0 / Q15_16),
+                            "float16",
+                        ),
+                        T.if_then_else(
+                            nb * block_n + n < kv_len,
+                            T.cast(
+                                T.cast(K[b, nb * block_n + n - cache_len, d], "float32")
+                                * T.cast(KS[b, nb * block_n + n - cache_len], "float32")
+                                * (1.0 / Q15_16),
+                                "float16",
+                            ),
+                            T.float16(0.0),
+                        ),
+                    )
+                    v_shared[n, d] = T.if_then_else(
+                        nb * block_n + n < cache_len,
+                        T.cast(
+                            T.cast(CACHE_V[b, nb * block_n + n, d], "float32")
+                            * T.cast(CACHE_VS[b, nb * block_n + n], "float32")
+                            * (1.0 / Q15_16),
+                            "float16",
+                        ),
+                        T.if_then_else(
+                            nb * block_n + n < kv_len,
+                            T.cast(
+                                T.cast(V[b, nb * block_n + n - cache_len, d], "float32")
+                                * T.cast(VS[b, nb * block_n + n - cache_len], "float32")
+                                * (1.0 / Q15_16),
+                                "float16",
+                            ),
+                            T.float16(0.0),
+                        ),
+                    )
+                for m, n in T.Parallel(block_m, block_n):
+                    prob[m, n] = T.if_then_else(
+                        bm * block_m + m < seqlen,
+                        T.if_then_else(
+                            (nb * block_n + n < kv_len) and (cache_len + bm * block_m + m >= nb * block_n + n),
                             0,
                             -T.infinity("float32"),
                         ),

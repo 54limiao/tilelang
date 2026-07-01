@@ -14,12 +14,14 @@ from examples.qwen3_int_only.kernels import (
     dynamic_quant_q15_16,
     exp_lut_neg,
     flash_attention_i8_float_q15_16,
+    flash_attention_i8_float_q15_16_cache,
     flash_attention_i12_q15_16_per_scale,
     flash_attention_q15_float_q15_16,
     flash_attention_q15_float_q15_16_cache,
     linear_dynamic_int8_q15_16,
     linear_dynamic_int16_q15_16,
     packed_scale_matrix,
+    rope_rotate_q15_16,
     rmsnorm_i16_q15_16_weighted,
     rsqrt_lut,
     sigmoid_lut,
@@ -44,6 +46,13 @@ def fix_lut_10bit(x, lut, scale):
     scale_qt = torch.as_tensor(pack_scale(scale) if isinstance(scale, float) else scale, device=x.device, dtype=torch.int64)
     idx = fix_quant_i32(x.to(torch.int32), scale_qt).clamp(-512, 511) + 512
     return lut[idx.long()]
+
+
+def hadamard(dim, device):
+    h = torch.ones(1, 1, device=device)
+    while h.shape[0] < dim:
+        h = torch.cat((torch.cat((h, h), dim=1), torch.cat((h, -h), dim=1)), dim=0)
+    return h / (dim**0.5)
 
 
 @tilelang.testing.requires_cuda
@@ -118,6 +127,23 @@ def test_rmsnorm_i16():
 
 
 @tilelang.testing.requires_cuda
+def test_rope_rotate_q15_16():
+    torch.manual_seed(0)
+    rows, dim = 7, 32
+    x = torch.randn((rows, dim), device="cuda") * 0.2
+    cos = torch.cos(torch.randn((rows, dim // 2), device="cuda") * 0.1)
+    sin = torch.sin(torch.randn((rows, dim // 2), device="cuda") * 0.1)
+    h = hadamard(dim, "cuda")
+    xq, cq, sq, hq = q15(x), q15(cos), q15(sin), q15(h)
+    y = compile_kernel(rope_rotate_q15_16(rows, dim), [4])(xq, cq, sq, hq)
+    lo = ((xq[:, : dim // 2] >> 8) * (cq >> 8)) - ((xq[:, dim // 2 :] >> 8) * (sq >> 8))
+    hi = ((xq[:, : dim // 2] >> 8) * (sq >> 8)) + ((xq[:, dim // 2 :] >> 8) * (cq >> 8))
+    rope = torch.cat((lo, hi), dim=-1)
+    ref = ((rope[:, :, None] >> 8) * (hq[None, :, :] >> 8)).sum(dim=1).to(torch.int32)
+    torch.testing.assert_close(y, ref, rtol=0, atol=0)
+
+
+@tilelang.testing.requires_cuda
 def test_attention_i12_q15_16_per_scale():
     torch.manual_seed(0)
     batch, seqlen, dim = 2, 32, 16
@@ -177,6 +203,32 @@ def test_attention_i8_float_q15_16_causal_tail():
     score = qf @ kf.transpose(-1, -2) / (dim**0.5)
     mask = torch.ones((seqlen, seqlen), device="cuda", dtype=torch.bool).tril()
     ref = torch.trunc((torch.softmax(score.masked_fill(~mask, torch.finfo(score.dtype).min), dim=-1) @ vf) * Q15_16).to(torch.int32)
+    torch.testing.assert_close(y, ref, rtol=0, atol=256)
+
+
+@tilelang.testing.requires_cuda
+def test_attention_i8_float_q15_16_cache():
+    torch.manual_seed(0)
+    batch, cache_len, seqlen, dim = 2, 17, 73, 128
+    q = torch.randint(-127, 128, (batch, seqlen, dim), device="cuda", dtype=torch.int8)
+    k = torch.randint(-127, 128, (batch, seqlen, dim), device="cuda", dtype=torch.int8)
+    v = torch.randint(-127, 128, (batch, seqlen, dim), device="cuda", dtype=torch.int8)
+    ck = torch.randint(-127, 128, (batch, cache_len, dim), device="cuda", dtype=torch.int8)
+    cv = torch.randint(-127, 128, (batch, cache_len, dim), device="cuda", dtype=torch.int8)
+    qs = torch.round((torch.rand((batch, seqlen), device="cuda") * 0.02 + 0.005) * Q15_16).to(torch.uint32)
+    ks = torch.round((torch.rand((batch, seqlen), device="cuda") * 0.02 + 0.005) * Q15_16).to(torch.uint32)
+    vs = torch.round((torch.rand((batch, seqlen), device="cuda") * 0.03 + 0.004) * Q15_16).to(torch.uint32)
+    cks = torch.round((torch.rand((batch, cache_len), device="cuda") * 0.02 + 0.005) * Q15_16).to(torch.uint32)
+    cvs = torch.round((torch.rand((batch, cache_len), device="cuda") * 0.03 + 0.004) * Q15_16).to(torch.uint32)
+    y = compile_kernel(flash_attention_i8_float_q15_16_cache(batch, seqlen, cache_len, dim), [10])(q, ck, cv, k, v, qs, cks, cvs, ks, vs)
+    qf = q.float() * qs.float()[:, :, None] / Q15_16
+    k_all = torch.cat((ck.float() * cks.float()[:, :, None] / Q15_16, k.float() * ks.float()[:, :, None] / Q15_16), dim=1)
+    v_all = torch.cat((cv.float() * cvs.float()[:, :, None] / Q15_16, v.float() * vs.float()[:, :, None] / Q15_16), dim=1)
+    score = qf @ k_all.transpose(-1, -2) / (dim**0.5)
+    q_pos = cache_len + torch.arange(seqlen, device="cuda")
+    k_pos = torch.arange(cache_len + seqlen, device="cuda")
+    mask = k_pos[None, :] <= q_pos[:, None]
+    ref = torch.trunc((torch.softmax(score.masked_fill(~mask, torch.finfo(score.dtype).min), dim=-1) @ v_all) * Q15_16).to(torch.int32)
     torch.testing.assert_close(y, ref, rtol=0, atol=256)
 
 
