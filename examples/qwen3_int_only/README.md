@@ -24,7 +24,7 @@ For reproducible static-quantization experiments, use the shared model and datas
 ```
 
 Static attention activation scales are packed with the weights. The current packed scale slots are per-head `q_pre_rope_i16`, `k_pre_rope_i16`, `q_post_rope_i8`, `k_post_rope_i8`, and `v_i8`; runtime kernels should read these scales instead of calibrating.
-Quantization scales use no-clip ceil amax: `(amax + qmax - 1) // qmax`, clamped to at least 1. Re-run `prepack.py` after changing this scale rule because static attention scales are serialized into the pack.
+Quantization scales use no-clip ceil amax: `(amax + qmax - 1) // qmax`, clamped to at least 1. Runtime quantization uses integer round-to-nearest on magnitude and restores sign. Re-run `prepack.py` after changing the scale rule because static attention scales are serialized into the pack.
 
 ```bash
 /root/venv/bin/python examples/qwen3_int_only/prepack.py \
@@ -167,7 +167,7 @@ Recent 2048-token-class Declaration PPL record:
 ```text
 backend=hf tokens=1902 loss=3.106583 ppl=22.344565
 backend=int-only --use-r1 --use-r2 --use-r3 tokens=1902 loss=3.372760 ppl=29.158889
-backend=int-only --use-r1 --use-r2 --use-r3 --split-attn tokens=1902 loss=3.365579 ppl=28.950245
+backend=int-only --use-r1 --use-r2 --use-r3 --split-attn tokens=1902 loss=3.299825 ppl=27.107887 compare=hf cos=0.97377499 mse=1.27046896e+00 rel_mse=5.34204678e-02
 ```
 
 Current FineWeb 2x2048-token baseline with the Chinese cache prompt and static 32x2048 calibration pack:
@@ -180,25 +180,25 @@ backend=int-only --use-r1 --use-r2 --use-r3 --split-attn tokens=4096 loss=3.6280
 Current FineWeb 256-token cumulative layer sweep against local float:
 
 ```text
-layers=1 backend=int-only tokens=256 loss=14.217113 ppl=1494216.491091 compare=local-float cos=0.99699614 mse=2.13716682e-01 rel_mse=6.15065098e-03
-layers=2 backend=int-only tokens=256 loss=12.797936 ppl=361470.762677 compare=local-float cos=0.99711432 mse=2.89199071e-01 rel_mse=5.92839873e-03
-layers=4 backend=int-only tokens=256 loss=12.280800 ppl=215518.033190 compare=local-float cos=0.99232234 mse=8.13625268e-01 rel_mse=1.56216798e-02
-layers=8 backend=int-only tokens=256 loss=11.599915 ppl=109088.477353 compare=local-float cos=0.98492364 mse=2.16168671e+00 rel_mse=3.20327968e-02
+layers=1 backend=int-only tokens=256 loss=14.298169 ppl=1620376.578481 compare=local-float cos=0.99740373 mse=1.80444243e-01 rel_mse=5.19308812e-03
+layers=2 backend=int-only tokens=256 loss=12.875274 ppl=390535.324770 compare=local-float cos=0.99801277 mse=1.95146106e-01 rel_mse=4.00037221e-03
+layers=4 backend=int-only tokens=256 loss=12.392824 ppl=241065.551394 compare=local-float cos=0.99683737 mse=3.35850729e-01 rel_mse=6.44836483e-03
+layers=8 backend=int-only tokens=256 loss=11.571200 ppl=106000.635758 compare=local-float cos=0.99299909 mse=1.00256420e+00 rel_mse=1.48564244e-02
 ```
 
 Current 64-token block trace highlights:
 
 ```text
-layer=0 input_rms rel_mse=1.06552034e-06 q rel_mse=7.68633152e-04 attn rel_mse=1.80518553e-02 softmax_i16 rel_mse=8.43968149e-03 pv_i16v8 rel_mse=2.41573271e-03 mlp rel_mse=4.08283882e-02 layer_out rel_mse=1.56490020e-02
-layer=1 input_rms rel_mse=1.60626341e-02 q rel_mse=1.56723578e-02 attn rel_mse=7.03484714e-02 softmax_i16 rel_mse=1.81590114e-03 pv_i16v8 rel_mse=1.28780154e-03 mlp rel_mse=6.44694865e-02 layer_out rel_mse=2.50392985e-02
-layer=2 input_rms rel_mse=3.90793644e-02 q rel_mse=4.33117785e-02 attn rel_mse=9.49960873e-02 mlp rel_mse=1.28384978e-02 layer_out rel_mse=1.28336456e-02
+layer=0 input_rms rel_mse=1.06552034e-06 q rel_mse=7.11495290e-04 attn rel_mse=2.02661175e-02 softmax_i16 rel_mse=8.41666572e-03 pv_i16v8 rel_mse=2.45846040e-03 mlp rel_mse=3.71044017e-02 layer_out rel_mse=1.50453513e-02
+layer=1 input_rms rel_mse=1.55158173e-02 q rel_mse=1.29401488e-02 attn rel_mse=4.41492461e-02 softmax_i16 rel_mse=1.66352175e-03 pv_i16v8 rel_mse=1.23040669e-03 mlp rel_mse=4.23145220e-02 layer_out rel_mse=1.83776282e-02
+layer=2 input_rms rel_mse=1.77999847e-02 q rel_mse=1.67836715e-02 attn rel_mse=4.16141599e-02 mlp rel_mse=4.86866618e-03 layer_out rel_mse=4.85706003e-03
 ```
 
 The split attention sub-trace compares `softmax_i16` and `pv_i16v8` against torch references using the already-quantized q/k/v inputs. On these samples their own rel_mse is small, so the larger attention rel_mse is dominated by quantized inputs and layer-to-layer accumulation rather than the PV GEMM math.
 
 Current q/k/v QDQ loss is also small. On layer 1, `q_qdq_loss rel_mse=5.37294778e-04`, `k_qdq_loss rel_mse=1.07717264e-04`, and `v_qdq_loss rel_mse=8.31166573e-04`, while the pre-quant q/k/v tensors are already at `2-4%` rel_mse. That points to accumulated hidden-state error before q/k/v quantization rather than bad static q/k/v scales.
 
-Current MLP-side QDQ split shows the same pattern. On layer 1, `attn_qdq_loss rel_mse=4.93896310e-04` and `post_qdq_loss rel_mse=1.12665730e-04`, while `gated rel_mse=8.93671289e-02` and `gated_qdq_loss rel_mse=1.29515920e-02`. The next quality target is therefore the fixed-point SiLU/gate-up product path, not the surrounding dynamic quantization.
+MLP-side QDQ improved after switching runtime quantization to integer round-to-nearest. On layer 2, `gated_qdq_loss rel_mse` dropped from `3.66984569e-02` to `3.33172247e-05`, and `layer_out rel_mse` dropped from `1.36468485e-02` to `4.85706003e-03`. Projection lowering remains small: `down_from_gated_qdq rel_mse=1.79821334e-04` on layer 2.
 
 The deeper MLP trace shows the SiLU kernel itself is accurate against torch using the same fixed-point gate/up inputs: `silu_mul rel_mse=4.55698144e-04` on layer 0 and `2.64857546e-04` on layer 1. Gate/up projection from post-RMS QDQ is also small (`gate_from_post_qdq rel_mse=2.11212205e-06`, `up_from_post_qdq rel_mse=2.06542627e-05` on layer 1). The large gated-vs-float error is therefore inherited from earlier hidden-state/residual/RMSNorm drift, not the SiLU or gate/up kernels.
 
@@ -208,7 +208,7 @@ Repacking the static attention calibration with the same no-clip ceil scale rule
 
 Deeper block traces should be read with the `*_out` normalized metrics, not only branch-local rel_mse. On layer 4, `attn_out rel_mse=3.04542363e-01` and `mlp rel_mse=2.01169401e-01`, but their contribution relative to final hidden energy is only `attn_out_out rel_to_out=1.13196293e-05` and `mlp_out rel_to_out=2.01086641e-05`; `hidden_in_out rel_to_out=1.36730000e-02` already matches the final `layer_out rel_mse=1.36817088e-02`. Layer 7 is similar: `hidden_in_out rel_to_out=1.37537895e-02`, while `attn_out_out rel_to_out=2.94227393e-05` and `mlp_out rel_to_out=9.25156637e-05`. This means the large branch-local rel_mse is mostly a small-energy branch effect; the final hidden drift is inherited from earlier layers.
 
-Early-layer attribution points to MLP branch input quality, not projection GEMM lowering. On layer 0, `attn_out_out rel_to_out=6.50323275e-03` and `mlp_out rel_to_out=1.22368485e-02`; on layer 1, `hidden_in_out rel_to_out=8.17824714e-03`, `attn_out_out rel_to_out=4.64037200e-03`, and `mlp_out rel_to_out=1.80872902e-02`. The projection checks are small: layer 1 has `o_from_attn_qdq rel_mse=3.52726871e-04` and `down_from_gated_qdq rel_mse=2.93103105e-04`. On layer 2 the MLP branch dominates final output energy (`mlp_out ref_energy=9.99595284e-01`) and `gated_qdq_loss rel_mse=3.66984569e-02`, while `down_from_gated_qdq rel_mse=1.70276122e-04`. So the next quality target is gated activation quantization / MLP branch input drift, not o/down projection GEMM math.
+Early-layer attribution now shows MLP gated quantization was a real quality source and projection GEMM lowering is still small. After round-to-nearest, layer 1 has `hidden_in_out rel_to_out=7.86277559e-03`, `attn_out_out rel_to_out=2.98309419e-03`, and `mlp_out rel_to_out=1.18715856e-02`; layer 2 has `mlp_out rel_to_out=4.86669596e-03` with `gated_qdq_loss rel_mse=3.33172247e-05`. The projection checks stay small: layer 1 has `o_from_attn_qdq rel_mse=3.48534813e-04` and `down_from_gated_qdq rel_mse=3.15667829e-04`, while layer 2 has `down_from_gated_qdq rel_mse=1.79821334e-04`.
 
 Current same-machine single-layer 2048-token-class profile baseline (`--warmup 1 --repeat 5`):
 
