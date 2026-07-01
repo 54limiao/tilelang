@@ -9,6 +9,7 @@ from safetensors.torch import load_file
 
 from examples.qwen3_int_only.kernels import (
     Q15_16,
+    add_dynamic_quant_q15_16,
     add_q15_16,
     compile_kernel,
     dynamic_quant_q15_16,
@@ -280,6 +281,7 @@ class Qwen3IntOnlyBlock:
         self.silu_mid = compile_kernel(silu_q15_16(seq_len, im), [2])
         self.mul_mid = compile_kernel(mul_q15_16(seq_len, im), [2])
         self.add_hidden = compile_kernel(add_q15_16(seq_len, h), [2])
+        self.add_dq16_hidden = compile_kernel(add_dynamic_quant_q15_16(seq_len, h), [2, 3, 4])
         self.attn_i8_fixed = compile_kernel(flash_attention_i8_q15_16_gqa(qh, kvh, seq_len, hd), [7])
         self.attn_i8_fixed_cache = None
         if cache_len:
@@ -330,8 +332,7 @@ class Qwen3IntOnlyBlock:
         attn = attn.permute(1, 0, 2).reshape(self.seq_len, self.config.q_size)
         attn8, attn_s8 = self.dq8_q(attn)
         attn_out = self.o_proj(attn8, attn_s8, weights.o_proj.weight, weights.o_proj.scale)
-        h = self.add_hidden(x_q15_16, attn_out)
-        h_norm16, _ = self.dq16_hidden_norm(h)
+        h, h_norm16, _ = self.add_dq16_hidden(x_q15_16, attn_out)
         post = self.rms_hidden_dyn(h_norm16, weights.post_attention_layernorm, self.lut_rsqrt)
         h8, hs8 = self.dq8_hidden(post)
         gate, up = self.gate_up_proj_i8(h8, hs8, weights.gate_proj.weight, weights.gate_proj.scale, weights.up_proj.weight, weights.up_proj.scale)

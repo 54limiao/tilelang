@@ -57,6 +57,36 @@ def dynamic_quant_q15_16(rows, cols, out_dtype="int8", qmax_override=None):
     return main
 
 
+def add_dynamic_quant_q15_16(rows, cols, qmax=4095):
+    @T.prim_func
+    def main(
+        A: T.Tensor((rows, cols), "int32"),
+        B: T.Tensor((rows, cols), "int32"),
+        Y: T.Tensor((rows, cols), "int32"),
+        Q: T.Tensor((rows, cols), "int16"),
+        S: T.Tensor((rows,), "uint32"),
+    ):
+        with T.Kernel(rows, threads=128) as r:
+            vals = T.alloc_fragment((1, cols), "int32")
+            abs_x = T.alloc_fragment((1, cols), "int32")
+            amax = T.alloc_fragment((1,), "int32")
+            scale = T.alloc_fragment((1,), "int32")
+            for c in T.Parallel(cols):
+                vals[0, c] = A[r, c] + B[r, c]
+                abs_x[0, c] = vals[0, c]
+                if abs_x[0, c] < T.int32(0):
+                    abs_x[0, c] = T.int32(0) - abs_x[0, c]
+            T.reduce_max(abs_x, amax, dim=1, clear=True)
+            scale[0] = T.max(amax[0] // T.int32(qmax), T.int32(1))
+            S[r] = T.cast(scale[0], "uint32")
+            for c in T.Parallel(cols):
+                Y[r, c] = vals[0, c]
+                vals[0, c] = T.min(T.max(vals[0, c] // scale[0], T.int32(0 - qmax - 1)), T.int32(qmax))
+                Q[r, c] = T.cast(vals[0, c], "int16")
+
+    return main
+
+
 def rope_q15_16(rows, dim):
     @T.prim_func
     def main(

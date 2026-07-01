@@ -10,6 +10,8 @@ from examples.qwen3_int_only.kernels import (
     ATTN_VALUE_SHIFT,
     MASK,
     Q_MULTIPLIER_WIDTH,
+    add_dynamic_quant_q15_16,
+    add_q15_16,
     compile_kernel,
     dynamic_quant_q15_16,
     exp_lut_neg,
@@ -76,6 +78,20 @@ def test_dynamic_quant_i16():
     ref_y = torch.div(xq, ref_s.int()[:, None], rounding_mode="floor").clamp(-32768, 32767).to(torch.int16)
     torch.testing.assert_close(s, ref_s, rtol=0, atol=0)
     torch.testing.assert_close(y, ref_y, rtol=0, atol=0)
+
+
+@tilelang.testing.requires_cuda
+def test_add_dynamic_quant_i16_matches_unfused():
+    torch.manual_seed(0)
+    rows, cols = 5, 64
+    a = torch.randint(-180000, 180001, (rows, cols), device="cuda", dtype=torch.int32)
+    b = torch.randint(-180000, 180001, (rows, cols), device="cuda", dtype=torch.int32)
+    y, q, s = compile_kernel(add_dynamic_quant_q15_16(rows, cols), [2, 3, 4])(a, b)
+    ref_y = compile_kernel(add_q15_16(rows, cols), [2])(a, b)
+    ref_q, ref_s = compile_kernel(dynamic_quant_q15_16(rows, cols, "int16", 4095), [1, 2])(ref_y)
+    torch.testing.assert_close(y, ref_y, rtol=0, atol=0)
+    torch.testing.assert_close(q, ref_q, rtol=0, atol=0)
+    torch.testing.assert_close(s, ref_s, rtol=0, atol=0)
 
 
 @tilelang.testing.requires_cuda
