@@ -182,6 +182,8 @@ layer=2 input_rms rel_mse=3.90793644e-02 q rel_mse=4.33117785e-02 attn rel_mse=9
 
 The split attention sub-trace compares `softmax_i16` and `pv_i16v8` against torch references using the already-quantized q/k/v inputs. On these samples their own rel_mse is small, so the larger attention rel_mse is dominated by quantized inputs and layer-to-layer accumulation rather than the PV GEMM math.
 
+Current q/k/v QDQ loss is also small. On layer 1, `q_qdq_loss rel_mse=5.37294778e-04`, `k_qdq_loss rel_mse=1.07717264e-04`, and `v_qdq_loss rel_mse=8.31166573e-04`, while the pre-quant q/k/v tensors are already at `2-4%` rel_mse. That points to accumulated hidden-state error before q/k/v quantization rather than bad static q/k/v scales.
+
 Current same-machine single-layer 2048-token-class profile baseline (`--warmup 1 --repeat 5`):
 
 ```text

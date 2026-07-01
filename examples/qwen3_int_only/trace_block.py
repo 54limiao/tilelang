@@ -34,6 +34,14 @@ def attention_refs(trace):
     return prob, pv
 
 
+def dequant_qkv(trace):
+    group = trace["q8"].shape[0] // trace["k8"].shape[0]
+    q = (trace["q8"].float() * trace["qs8"].float()[:, :, None] / Q15_16).permute(1, 0, 2).reshape(trace["q"].shape)
+    k = (trace["k8"].float() * trace["ks8"].float()[:, :, None] / Q15_16).repeat_interleave(group, dim=0).permute(1, 0, 2).reshape(trace["k"].shape)
+    v = (trace["v8"].float() * trace["vs8"].float()[:, :, None] / Q15_16).repeat_interleave(group, dim=0).permute(1, 0, 2).reshape(trace["v"].shape)
+    return q, k, v
+
+
 def attach_dequant_fp(weights: Qwen3BlockWeights):
     for name in ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"):
         packed = getattr(weights, name)
@@ -77,6 +85,13 @@ def main():
     for name in ("input_rms", "q", "k", "v", "attn", "attn_out", "attn_residual", "post_rms", "gate", "up", "gated", "mlp", "layer_out"):
         cos, mse, rel = metrics(itrace[name], ftrace[name])
         print(f"{name:14s} cos={cos:.8f} mse={mse:.8e} rel_mse={rel:.8e}")
+    qdq = dequant_qkv(itrace)
+    for name, value in zip(("q_qdq", "k_qdq", "v_qdq"), qdq):
+        base = name[:1]
+        cos, mse, rel = metrics(value, ftrace[base])
+        print(f"{name:14s} cos={cos:.8f} mse={mse:.8e} rel_mse={rel:.8e}")
+        cos, mse, rel = metrics(value, itrace[base])
+        print(f"{name + '_loss':14s} cos={cos:.8f} mse={mse:.8e} rel_mse={rel:.8e}")
     if itrace["prob_i16"] is not None:
         prob_ref, pv_ref = attention_refs(itrace)
         cos, mse, rel = metrics(itrace["prob_i16"].float() / 16383.0, prob_ref)
