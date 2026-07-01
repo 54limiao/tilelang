@@ -116,10 +116,19 @@ def print_trace(layer_idx, seq_len, x_int, xf, itrace, ftrace, layer):
         value = dequant_rows(itrace[q_name], itrace[s_name])
         print_metric(name, value, ftrace[base])
         print_metric(name + "_loss", value, itrace[base])
+    attn_qdq = dequant_rows(itrace["attn8"], itrace["attn_s8"])
     post_qdq = dequant_rows(itrace["post8"], itrace["post_s8"])
+    gated_qdq = dequant_rows(itrace["gated8"], itrace["gated_s8"])
+    o_qdq_ref = linear_ref(attn_qdq, layer, "o_proj")
     gate_qdq_ref = linear_ref(post_qdq, layer, "gate_proj")
     up_qdq_ref = linear_ref(post_qdq, layer, "up_proj")
-    for name, value, ref in (("gate_from_post_qdq", itrace["gate"], gate_qdq_ref), ("up_from_post_qdq", itrace["up"], up_qdq_ref)):
+    down_qdq_ref = linear_ref(gated_qdq, layer, "down_proj")
+    for name, value, ref in (
+        ("o_from_attn_qdq", itrace["attn_out"], o_qdq_ref),
+        ("gate_from_post_qdq", itrace["gate"], gate_qdq_ref),
+        ("up_from_post_qdq", itrace["up"], up_qdq_ref),
+        ("down_from_gated_qdq", itrace["mlp"], down_qdq_ref),
+    ):
         print_metric(name, value, ref)
     silu_ref = torch.nn.functional.silu(itrace["gate"]) * itrace["up"]
     print_metric("silu_mul", itrace["gated"], silu_ref)

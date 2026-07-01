@@ -208,6 +208,8 @@ Repacking the static attention calibration with the same no-clip ceil scale rule
 
 Deeper block traces should be read with the `*_out` normalized metrics, not only branch-local rel_mse. On layer 4, `attn_out rel_mse=3.04542363e-01` and `mlp rel_mse=2.01169401e-01`, but their contribution relative to final hidden energy is only `attn_out_out rel_to_out=1.13196293e-05` and `mlp_out rel_to_out=2.01086641e-05`; `hidden_in_out rel_to_out=1.36730000e-02` already matches the final `layer_out rel_mse=1.36817088e-02`. Layer 7 is similar: `hidden_in_out rel_to_out=1.37537895e-02`, while `attn_out_out rel_to_out=2.94227393e-05` and `mlp_out rel_to_out=9.25156637e-05`. This means the large branch-local rel_mse is mostly a small-energy branch effect; the final hidden drift is inherited from earlier layers.
 
+Early-layer attribution points to MLP branch input quality, not projection GEMM lowering. On layer 0, `attn_out_out rel_to_out=6.50323275e-03` and `mlp_out rel_to_out=1.22368485e-02`; on layer 1, `hidden_in_out rel_to_out=8.17824714e-03`, `attn_out_out rel_to_out=4.64037200e-03`, and `mlp_out rel_to_out=1.80872902e-02`. The projection checks are small: layer 1 has `o_from_attn_qdq rel_mse=3.52726871e-04` and `down_from_gated_qdq rel_mse=2.93103105e-04`. On layer 2 the MLP branch dominates final output energy (`mlp_out ref_energy=9.99595284e-01`) and `gated_qdq_loss rel_mse=3.66984569e-02`, while `down_from_gated_qdq rel_mse=1.70276122e-04`. So the next quality target is gated activation quantization / MLP branch input drift, not o/down projection GEMM math.
+
 Current same-machine single-layer 2048-token-class profile baseline (`--warmup 1 --repeat 5`):
 
 ```text
