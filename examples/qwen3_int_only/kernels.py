@@ -262,7 +262,7 @@ def flash_attention_i12_q15_16_per_scale(batch, seqlen, dim, block_n=32):
             denom[0] = T.int32(0)
             for d in T.Parallel(dim):
                 acc_o[d] = T.int32(0)
-            for nb in T.Pipelined(seqlen // block_n):
+            for nb in T.Pipelined(i // block_n + 1):
                 for j, d in T.Parallel(block_n, dim):
                     qk[j, d] = T.cast(Q[b, i, d], "int32") * T.cast(K[b, nb * block_n + j, d], "int32")
                 T.reduce_sum(qk, qk_sum, dim=1, clear=True)
