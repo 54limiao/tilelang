@@ -405,7 +405,7 @@ def linear_i8(rows, in_features, out_features, block_m=64, block_n=128, block_k=
     return main
 
 
-def attention_i8(q_heads, kv_heads, seqlen, cache_len, dim, block_m=16, block_n=64, score_shift=26, lut_scale=SCALE_EXP_LUT):
+def attention_i8(q_heads, kv_heads, seqlen, cache_len, dim, block_m=32, block_n=128, score_shift=26, lut_scale=SCALE_EXP_LUT):
     group = q_heads // kv_heads
     kv_len = cache_len + seqlen
     q_size = q_heads * dim
