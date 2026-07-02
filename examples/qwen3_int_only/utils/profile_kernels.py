@@ -165,6 +165,12 @@ def main():
     for _ in range(args.repeat):
         run_layers(prof)
     summary = prof.summary(print_rows=True)
+    counted_ops_top = sum(row.get("gops", 0.0) for row in summary["kernels"]) / 1000.0
+    print(
+        f"profile seq_len={seq_len} tokens layers={args.layers} repeats={args.repeat} "
+        f"total_ms={summary['total_ms']:.3f} per_pass_ms={summary['total_ms'] / args.repeat:.3f} "
+        f"counted_ops_per_pass={counted_ops_top / args.repeat:.3f} TOP counted_tops={counted_ops_top / (summary['total_ms'] / 1000.0):.2f}"
+    )
     if args.jsonl_out:
         row = {
             "max_tokens": args.max_tokens,
@@ -176,6 +182,9 @@ def main():
             "cache_len": cache_len,
             "fused_static": True,
             "fast_hadamard": True,
+            "counted_ops_top": counted_ops_top,
+            "counted_ops_per_pass_top": counted_ops_top / args.repeat,
+            "counted_tops": counted_ops_top / (summary["total_ms"] / 1000.0),
             **summary,
         }
         with open(args.jsonl_out, "a", encoding="utf-8") as f:
