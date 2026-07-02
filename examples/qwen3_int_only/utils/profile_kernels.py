@@ -51,13 +51,11 @@ def default_int8_peak_tops():
 
 
 class Profiler:
-    def __init__(self, math_ops, peak_tops=0.0, tc_ops=None):
+    def __init__(self, peak_tops=0.0):
         self.rows = []
-        self.math_ops = math_ops
-        self.tc_ops = tc_ops or math_ops
         self.peak_tops = peak_tops
 
-    def time(self, name, fn):
+    def time(self, name, fn, math_ops=0, tc_ops=None):
         torch.cuda.synchronize()
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
@@ -65,25 +63,29 @@ class Profiler:
         out = fn()
         end.record()
         torch.cuda.synchronize()
-        self.rows.append((name, start.elapsed_time(end)))
+        self.rows.append((name, start.elapsed_time(end), math_ops, math_ops if tc_ops is None else tc_ops))
         return out
 
     def summary(self, print_rows=False):
         totals = {}
         counts = {}
-        for name, ms in self.rows:
+        math_ops = {}
+        tc_ops = {}
+        for name, ms, math, tc in self.rows:
             totals[name] = totals.get(name, 0.0) + ms
             counts[name] = counts.get(name, 0) + 1
+            math_ops[name] = math_ops.get(name, 0) + math
+            tc_ops[name] = tc_ops.get(name, 0) + tc
         total = sum(totals.values())
         items = []
         for name, ms in sorted(totals.items(), key=lambda x: x[1], reverse=True):
-            row = {"name": name, "avg_ms": ms / counts[name], "total_ms": ms, "count": counts[name], "pct": ms / total * 100.0}
-            if name in self.math_ops:
-                row["math_gops"] = self.math_ops[name] * counts[name] / 1.0e9
+            row = {"name": name, "total_ms": ms, "pct": ms / total * 100.0}
+            if math_ops[name]:
+                row["math_gops"] = math_ops[name] / 1.0e9
                 row["math_tops"] = row["math_gops"] / ms
                 if self.peak_tops:
                     row["math_util_pct"] = row["math_tops"] / self.peak_tops * 100.0
-                row["tc_gops"] = self.tc_ops.get(name, self.math_ops[name]) * counts[name] / 1.0e9
+                row["tc_gops"] = tc_ops[name] / 1.0e9
                 row["tc_tops"] = row["tc_gops"] / ms
                 if self.peak_tops:
                     row["tc_util_pct"] = row["tc_tops"] / self.peak_tops * 100.0
@@ -94,7 +96,7 @@ class Profiler:
                     math_util = f" util={row['math_util_pct']:5.2f}%" if "math_util_pct" in row else ""
                     tc_util = f" util={row['tc_util_pct']:5.2f}%" if "tc_util_pct" in row else ""
                     perf = f" math={row['math_tops']:7.2f} TOPS{math_util} tc={row['tc_tops']:7.2f} TOPS{tc_util}"
-                print(f"{name:28s} avg={row['avg_ms']:8.3f} ms total={ms:9.3f} ms {row['pct']:6.2f}%{perf}")
+                print(f"{name:28s} total={ms:9.3f} ms {row['pct']:6.2f}%{perf}")
         if print_rows:
             print(f"{'total':28s} {total:9.3f} ms")
         return {"total_ms": total, "kernels": items}
@@ -127,30 +129,32 @@ def build_cache_kv(model_dir, tokenizer, cache_prompt, layer_weights, use_r2=Tru
 @torch.no_grad()
 def run_block(block, x, x8, xs8, weights, cos, sin, r3_q15, prof, cache_k=None, cache_v=None):
     cfg = block.config
+    ops = op_counts(block.seq_len, cfg, block.cache_len)
+    tc_ops = tc_op_counts(block.seq_len, cfg, block.cache_len)
     pos_cos = cos[block.cache_len : block.cache_len + block.seq_len]
     pos_sin = sin[block.cache_len : block.cache_len + block.seq_len]
-    qkv = prof.time("linear_i8_qkv", lambda: block.qkv_proj(x8, weights.input_qkv_i8_scale, weights.qkv_proj.weight, weights.qkv_proj.scale))
+    qkv = prof.time("linear_i8", lambda: block.qkv_proj(x8, weights.input_qkv_i8_scale, weights.qkv_proj.weight, weights.qkv_proj.scale), ops["linear_i8_qkv"], tc_ops["linear_i8_qkv"])
     q = qkv[:, : cfg.q_size].contiguous()
     k = qkv[:, cfg.q_size : cfg.q_size + cfg.kv_size].contiguous()
     v = qkv[:, cfg.q_size + cfg.kv_size :].contiguous()
     v_heads = v.reshape(block.seq_len * cfg.num_key_value_heads, cfg.head_dim)
-    _q, q_heads = prof.time("rms_q15_q", lambda: block.rms_q(q.reshape(block.seq_len * cfg.num_attention_heads, cfg.head_dim).contiguous(), block.zero_q, weights.q_norm, block.lut_rsqrt))
-    _k, k_heads = prof.time("rms_q15_k", lambda: block.rms_k(k.reshape(block.seq_len * cfg.num_key_value_heads, cfg.head_dim).contiguous(), block.zero_k, weights.k_norm, block.lut_rsqrt))
-    q_attn = prof.time("rope_sq8_q", lambda: block.rope_q(q_heads, pos_cos, pos_sin, r3_q15, weights.q_post_rope_i8_scale))
-    k_attn = prof.time("rope_sq8_k", lambda: block.rope_k(k_heads, pos_cos, pos_sin, r3_q15, weights.k_post_rope_i8_scale))
+    _q, q_heads = prof.time("rms_q15", lambda: block.rms_q(q.reshape(block.seq_len * cfg.num_attention_heads, cfg.head_dim).contiguous(), block.zero_q, weights.q_norm, block.lut_rsqrt))
+    _k, k_heads = prof.time("rms_q15", lambda: block.rms_k(k.reshape(block.seq_len * cfg.num_key_value_heads, cfg.head_dim).contiguous(), block.zero_k, weights.k_norm, block.lut_rsqrt))
+    q_attn = prof.time("rope_sq8", lambda: block.rope_q(q_heads, pos_cos, pos_sin, r3_q15, weights.q_post_rope_i8_scale))
+    k_attn = prof.time("rope_sq8", lambda: block.rope_k(k_heads, pos_cos, pos_sin, r3_q15, weights.k_post_rope_i8_scale))
     v_attn = prof.time("quant_v_i8", lambda: block.quant_v(v_heads.reshape(block.seq_len, cfg.num_key_value_heads, cfg.head_dim), weights.v_i8_scale))
     cache_k = block.empty_cache_k if cache_k is None else cache_k
     cache_v = block.empty_cache_v if cache_v is None else cache_v
-    attn8 = prof.time("attention_i8", lambda: block.attn(q_attn, cache_k, cache_v, k_attn, v_attn, weights.q_post_rope_i8_scale, weights.k_post_rope_i8_scale, weights.v_i8_scale, block.lut_exp, weights.attn_i8_scale))
-    attn_out = prof.time("linear_i8_o", lambda: block.o_proj(attn8, weights.attn_i8_scale, weights.o_proj.weight, weights.o_proj.scale))
-    h, h8, _hs8 = prof.time("rms_sq8_post_attn", lambda: block.rms_sq8(x, attn_out, weights.post_attention_layernorm, block.lut_rsqrt, weights.post_mlp_i8_scale))
+    attn8 = prof.time("attention_i8", lambda: block.attn(q_attn, cache_k, cache_v, k_attn, v_attn, weights.q_post_rope_i8_scale, weights.k_post_rope_i8_scale, weights.v_i8_scale, block.lut_exp, weights.attn_i8_scale), ops["attention_i8"], tc_ops["attention_i8"])
+    attn_out = prof.time("linear_i8", lambda: block.o_proj(attn8, weights.attn_i8_scale, weights.o_proj.weight, weights.o_proj.scale), ops["linear_i8_o"], tc_ops["linear_i8_o"])
+    h, h8, _hs8 = prof.time("rms_sq8", lambda: block.rms_sq8(x, attn_out, weights.post_attention_layernorm, block.lut_rsqrt, weights.post_mlp_i8_scale))
     hs8 = weights.post_mlp_i8_scale
-    gate_up = prof.time("linear_i8_gate_up", lambda: block.gate_up_proj(h8, hs8, weights.gate_up_proj.weight, weights.gate_up_proj.scale))
+    gate_up = prof.time("linear_i8", lambda: block.gate_up_proj(h8, hs8, weights.gate_up_proj.weight, weights.gate_up_proj.scale), ops["linear_i8_gate_up"], tc_ops["linear_i8_gate_up"])
     gate = gate_up[:, : cfg.intermediate_size].contiguous()
     up = gate_up[:, cfg.intermediate_size :].contiguous()
     gated, _gs = prof.time("silu_i16", lambda: block.silu_mul(gate, up, block.lut_sigmoid, weights.gated_mlp_i16_scale))
     gs = weights.gated_mlp_i16_scale
-    mlp = prof.time("linear_i16_down", lambda: block.down_proj(gated, gs, weights.down_proj.weight, weights.down_proj.scale))
+    mlp = prof.time("linear_i16", lambda: block.down_proj(gated, gs, weights.down_proj.weight, weights.down_proj.scale), ops["linear_i16_down"], tc_ops["linear_i16_down"])
     return h, mlp
 
 
@@ -187,26 +191,24 @@ def main():
     def run_layers(prof):
         residual = q15_16(embed[ids])
         _res, x8, xs8 = prof.time(
-            "rms_sq8_input",
+            "rms_sq8",
             lambda: block.rms_sq8(residual, block.zero_hidden, weights[0].input_layernorm, block.lut_rsqrt, weights[0].input_qkv_i8_scale),
         )
         mlp = None
         for layer_idx in range(args.layers):
             if layer_idx:
                 residual, x8, xs8 = prof.time(
-                    "rms_sq8_layer",
+                    "rms_sq8",
                     lambda: block.rms_sq8(residual, mlp, weights[layer_idx].input_layernorm, block.lut_rsqrt, weights[layer_idx].input_qkv_i8_scale),
                 )
             cache_k, cache_v = cache_kv[layer_idx]
             residual, mlp = run_block(block, residual, x8, xs8, weights[layer_idx], cos, sin, r3_q15, prof, cache_k, cache_v)
         return residual, mlp
 
-    math_ops = op_counts(seq_len, QWEN3_0_6B, cache_len)
-    tc_ops = tc_op_counts(seq_len, QWEN3_0_6B, cache_len)
     peak_tops = args.peak_tops or default_int8_peak_tops()
     for _ in range(args.warmup):
-        run_layers(Profiler(math_ops, peak_tops, tc_ops))
-    prof = Profiler(math_ops, peak_tops, tc_ops)
+        run_layers(Profiler(peak_tops))
+    prof = Profiler(peak_tops)
     for _ in range(args.repeat):
         run_layers(prof)
     summary = prof.summary(print_rows=True)
