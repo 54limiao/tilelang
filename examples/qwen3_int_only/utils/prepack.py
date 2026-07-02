@@ -6,7 +6,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 from transformers import AutoTokenizer
 
-from examples.qwen3_int_only.ppl import iter_texts
+from examples.qwen3_int_only.utils.ppl import iter_texts
 from examples.qwen3_int_only.utils import (
     ROTATE_SEED,
     QWEN3_0_6B,

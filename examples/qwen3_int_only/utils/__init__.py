@@ -7,7 +7,7 @@ from safetensors import safe_open
 from safetensors.torch import load_file
 
 from examples.qwen3_int_only.kernels import Q15_16
-from examples.qwen3_int_only.quarot import (
+from examples.qwen3_int_only.utils.quarot import (
     ROTATE_SEED,
     random_hadamard_rotation,
     rotate_head_input,

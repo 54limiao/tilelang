@@ -16,7 +16,7 @@ from examples.qwen3_int_only.utils import (
     random_hadamard_rotation,
     rmsnorm_torch,
 )
-from examples.qwen3_int_only.ppl import load_ids
+from examples.qwen3_int_only.utils.ppl import load_ids
 
 
 def metrics(a, b):

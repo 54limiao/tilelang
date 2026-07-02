@@ -6,7 +6,7 @@ from safetensors import safe_open
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from examples.qwen3_int_only.model import Q15_16, QWEN3_0_6B, Qwen3IntOnlyBlock
-from examples.qwen3_int_only.ppl import iter_texts, quant_i8_q15_16
+from examples.qwen3_int_only.utils.ppl import iter_texts, quant_i8_q15_16
 from examples.qwen3_int_only.utils import ROTATE_SEED, load_packed_qwen3, q15_16, random_hadamard_rotation, rope_tables_q15_16
 
 

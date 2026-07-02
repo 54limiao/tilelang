@@ -12,7 +12,7 @@ Expected roots:
 Pack weights and calibration scales:
 
 ```bash
-/root/venv/bin/python examples/qwen3_int_only/prepack.py \
+/root/venv/bin/python examples/qwen3_int_only/utils/prepack.py \
   --model-dir /publicdata/huggingface.co/Qwen/Qwen3-0.6B \
   --out-dir /tmp/Qwen3-0.6B-static-calib-32x2048 \
   --use-r1 \
@@ -28,7 +28,7 @@ Pack weights and calibration scales:
 Run the 2048-token FineWeb quality baseline against HF bf16:
 
 ```bash
-/root/venv/bin/python examples/qwen3_int_only/ppl.py \
+/root/venv/bin/python examples/qwen3_int_only/utils/ppl.py \
   --model-dir /publicdata/huggingface.co/Qwen/Qwen3-0.6B \
   --packed-dir /tmp/Qwen3-0.6B-static-calib-32x2048 \
   --eval-dataset fineweb \
@@ -46,7 +46,7 @@ tokens=256 loss=4.439738 ppl=84.752757 compare=hf cos=0.99380889 mse=1.00682883e
 Profile the same static path:
 
 ```bash
-/root/venv/bin/python examples/qwen3_int_only/profile_kernels.py \
+/root/venv/bin/python examples/qwen3_int_only/utils/profile_kernels.py \
   --model-dir /publicdata/huggingface.co/Qwen/Qwen3-0.6B \
   --packed-dir /tmp/Qwen3-0.6B-static-calib-32x2048 \
   --max-tokens 2049 \
@@ -58,7 +58,7 @@ Profile the same static path:
 Trace a block against the dequantized packed-weight float reference:
 
 ```bash
-/root/venv/bin/python examples/qwen3_int_only/trace_block.py \
+/root/venv/bin/python examples/qwen3_int_only/utils/trace_block.py \
   --model-dir /publicdata/huggingface.co/Qwen/Qwen3-0.6B \
   --packed-dir /tmp/Qwen3-0.6B-static-calib-32x2048 \
   --eval-dataset fineweb \
@@ -67,4 +67,4 @@ Trace a block against the dequantized packed-weight float reference:
   --jsonl-out /tmp/qwen_trace_metrics.jsonl
 ```
 
-The showcase files are `model.py` and `kernels.py`. Packing, QuaRot helpers, and torch reference utilities live in `utils/`; `prepack.py`, `ppl.py`, `profile_kernels.py`, and `trace_block.py` are tools.
+The showcase files are `model.py` and `kernels.py`. Packing, QuaRot helpers, and torch reference utilities live in `utils/`; `utils/prepack.py`, `utils/ppl.py`, `utils/profile_kernels.py`, and `utils/trace_block.py` are tools.
