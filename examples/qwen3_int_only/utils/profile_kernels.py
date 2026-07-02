@@ -98,7 +98,7 @@ def run_block(block, x, weights, cos, sin, r3_q15, prof, cache_k=None, cache_v=N
     cfg = block.config
     pos_cos = cos[block.cache_len : block.cache_len + block.seq_len]
     pos_sin = sin[block.cache_len : block.cache_len + block.seq_len]
-    x8, xs8 = prof.time("rms_input_dq8_fast", lambda: block.rms_dq8_hidden_fast(x, weights.input_layernorm, block.lut_rsqrt))
+    x8, xs8 = prof.time("rms_input_sq8_fast", lambda: block.rms_sq8_hidden_fast(x, weights.input_layernorm, block.lut_rsqrt, weights.input_qkv_i8_scale))
     q, k, v = prof.time("qkv_proj_i8", lambda: block.qkv_proj_i8(x8, xs8, weights.q_proj.weight, weights.q_proj.scale, weights.k_proj.weight, weights.k_proj.scale, weights.v_proj.weight, weights.v_proj.scale))
     v_heads = v.reshape(block.seq_len * cfg.num_key_value_heads, cfg.head_dim)
     q_heads = prof.time("rms_q_q15", lambda: block.rms_q_q15(q, weights.q_norm, block.lut_rsqrt))
@@ -111,8 +111,7 @@ def run_block(block, x, weights, cos, sin, r3_q15, prof, cache_k=None, cache_v=N
     else:
         attn8 = prof.time("attention_cache_i8v8_fused_static", lambda: block.attn_i8v8_fused_cache_static(q_attn, cache_k[0], cache_v[0], k_attn, v_attn, weights.q_post_rope_i8_scale, cache_k[1], cache_v[1], weights.k_post_rope_i8_scale, weights.v_i8_scale, block.lut_exp, weights.attn_i8_scale))
     attn_out = prof.time("o_proj_i8_static", lambda: block.o_proj(attn8, weights.attn_i8_scale, weights.o_proj.weight, weights.o_proj.scale))
-    h, post = prof.time("residual_attn_rms_q15", lambda: block.add_rms_hidden_q15(x, attn_out, weights.post_attention_layernorm, block.lut_rsqrt))
-    h8, _hs8 = prof.time("sq8_hidden_static", lambda: block.sq8_hidden(post, weights.post_mlp_i8_scale))
+    h, h8, _hs8 = prof.time("residual_attn_rms_sq8", lambda: block.add_rms_sq8_hidden(x, attn_out, weights.post_attention_layernorm, block.lut_rsqrt, weights.post_mlp_i8_scale))
     hs8 = weights.post_mlp_i8_scale
     gate, up = prof.time("gate_up_proj_static", lambda: block.gate_up_proj_static(h8, hs8, weights.gate_proj.weight, weights.gate_proj.scale, weights.up_proj.weight, weights.up_proj.scale))
     gated, _gs = prof.time("silu_mul_sq16_mid_fast", lambda: block.silu_mul_sq16_mid_fast(gate, up, block.lut_sigmoid, weights.gated_mlp_i16_scale))

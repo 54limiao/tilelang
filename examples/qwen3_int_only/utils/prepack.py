@@ -94,6 +94,7 @@ def current_pack_metadata(path):
         key in keys
         for key in (
             "layers.0.q_post_rope_i8.scale",
+            "layers.0.input_qkv_i8.scale",
             "layers.0.k_post_rope_i8.scale",
             "layers.0.v_i8.scale",
             "layers.0.attn_i8.scale",
@@ -123,6 +124,7 @@ def run_calib_segment(x, w, norms, cos, sin, config, r3, prefix_tokens):
         k_rope = (k_rope.to(torch.float64) @ r3.to(torch.float64)).to(torch.float32)
     v = v.reshape(batch, seq_len, config.num_key_value_heads, config.head_dim)
     stats = {
+        "input_qkv_i8": q15_16(h[:, prefix_tokens:]),
         "q_pre_rope_i16": q15_16(q[:, prefix_tokens:]).reshape(-1, config.num_attention_heads, config.head_dim),
         "k_pre_rope_i16": q15_16(k[:, prefix_tokens:]).reshape(-1, config.num_key_value_heads, config.head_dim),
         "q_post_rope_i8": q15_16(q_rope[:, prefix_tokens:]).reshape(-1, config.num_attention_heads, config.head_dim),
@@ -156,7 +158,8 @@ def calibrate_attention_scales(embed, layer_weights, norm_weights, ids, config, 
     scales = [None for _ in layer_weights]
     for layer_idx, (w, norms) in enumerate(zip(layer_weights, norm_weights)):
         x, stats = run_calib_segment(x, w, norms, cos, sin, config, r3, prefix_tokens)
-        scales[layer_idx] = {name: update_head_amax(None, value) for name, value in stats.items() if name not in ("post_mlp_i8", "gated_mlp_i16")}
+        scales[layer_idx] = {name: update_head_amax(None, value) for name, value in stats.items() if name not in ("input_qkv_i8", "post_mlp_i8", "gated_mlp_i16")}
+        scales[layer_idx]["input_qkv_i8"] = update_tensor_amax(None, stats["input_qkv_i8"])
         scales[layer_idx]["attn_i8"] = update_tensor_amax(None, stats["attn_i8"])
         scales[layer_idx]["post_mlp_i8"] = update_tensor_amax(None, stats["post_mlp_i8"])
         scales[layer_idx]["gated_mlp_i16"] = update_tensor_amax(None, stats["gated_mlp_i16"])
@@ -164,6 +167,7 @@ def calibrate_attention_scales(embed, layer_weights, norm_weights, ids, config, 
         {
             "q_pre_rope_i16": scale_from_amax(layer["q_pre_rope_i16"], 32767),
             "k_pre_rope_i16": scale_from_amax(layer["k_pre_rope_i16"], 32767),
+            "input_qkv_i8": scale_from_amax(layer["input_qkv_i8"], 127),
             "q_post_rope_i8": scale_from_amax(layer["q_post_rope_i8"], 127),
             "k_post_rope_i8": scale_from_amax(layer["k_post_rope_i8"], 127),
             "v_i8": scale_from_amax(layer["v_i8"], 127),

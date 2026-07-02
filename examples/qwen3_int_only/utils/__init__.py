@@ -84,6 +84,7 @@ class Qwen3BlockWeights:
     k_norm: torch.Tensor
     q_pre_rope_i16_scale: torch.Tensor | None = None
     k_pre_rope_i16_scale: torch.Tensor | None = None
+    input_qkv_i8_scale: torch.Tensor | None = None
     q_post_rope_i8_scale: torch.Tensor | None = None
     k_post_rope_i8_scale: torch.Tensor | None = None
     v_i8_scale: torch.Tensor | None = None
@@ -143,6 +144,7 @@ class Qwen3BlockWeights:
             None,
             None,
             None,
+            None,
             q_proj,
             k_proj,
             v_proj,
@@ -177,6 +179,7 @@ def load_packed_qwen3(packed_dir, config=QWEN3_0_6B, device="cuda"):
                 tensors[f"{p}.k_norm"],
                 optional(f"{p}.q_pre_rope_i16.scale"),
                 optional(f"{p}.k_pre_rope_i16.scale"),
+                optional(f"{p}.input_qkv_i8.scale"),
                 optional(f"{p}.q_post_rope_i8.scale"),
                 optional(f"{p}.k_post_rope_i8.scale"),
                 optional(f"{p}.v_i8.scale"),
