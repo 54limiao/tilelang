@@ -4,18 +4,19 @@ import json
 import torch
 from transformers import AutoTokenizer
 
-from examples.qwen3_int_only.model import (
+from examples.qwen3_int_only.model import Qwen3IntOnlyModel
+from examples.qwen3_int_only.utils import (
+    ROTATE_SEED,
     Q15_16,
     Qwen3BlockWeights,
-    Qwen3IntOnlyModel,
     block_torch,
     block_torch_trace,
     load_packed_qwen3,
     q15_16,
+    random_hadamard_rotation,
     rmsnorm_torch,
 )
 from examples.qwen3_int_only.ppl import load_ids
-from examples.qwen3_int_only.quarot import ROTATE_SEED, random_hadamard_rotation
 
 
 def metrics(a, b):
@@ -163,12 +164,12 @@ def print_trace(layer_idx, seq_len, x_int, xf, itrace, ftrace, layer):
 @torch.no_grad()
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-dir", default="/code/Qwen3-0.6B")
+    parser.add_argument("--model-dir", default="/publicdata/huggingface.co/Qwen/Qwen3-0.6B")
     parser.add_argument("--packed-dir", default="/tmp/Qwen3-0.6B-int-only-static")
     parser.add_argument("--eval-dataset", default="fineweb")
     parser.add_argument("--eval-parquet", default="")
     parser.add_argument("--eval-column", default="text")
-    parser.add_argument("--eval-text", default="examples/qwen3_int_only/data/declaration_of_independence.txt")
+    parser.add_argument("--eval-text", default="")
     parser.add_argument("--max-tokens", type=int, default=257)
     parser.add_argument("--layer", type=int, default=0)
     parser.add_argument("--layers", default="")

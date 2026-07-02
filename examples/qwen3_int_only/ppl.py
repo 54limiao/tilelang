@@ -12,12 +12,11 @@ from examples.qwen3_int_only.model import (
     Q15_16,
     QWEN3_0_6B,
     Qwen3IntOnlyModel,
-    parse_layer_set,
 )
-from examples.qwen3_int_only.quarot import ROTATE_SEED, random_hadamard_rotation
+from examples.qwen3_int_only.utils import ROTATE_SEED, random_hadamard_rotation
 
 
-TEXT_PATH = Path(__file__).resolve().parent / "data" / "declaration_of_independence.txt"
+DEFAULT_MODEL_DIR = "/publicdata/huggingface.co/Qwen/Qwen3-0.6B"
 FINEWEB_PATH = "/publicdata/huggingface.co/datasets/HuggingFaceFW/fineweb/sample/10BT/000_00000.parquet"
 C4_PATH = "/publicdata/huggingface.co/datasets/allenai/c4/en/c4-train.00000-of-01024.json.gz"
 DATASETS = {
@@ -66,9 +65,7 @@ def load_ids(tokenizer, args, total_tokens, device):
         ids.extend(tokenizer(text, add_special_tokens=False).input_ids)
         if len(ids) >= total_tokens:
             return torch.tensor(ids[:total_tokens], device=device, dtype=torch.long)
-    text = Path(args.eval_text).read_text(encoding="utf-8")
-    ids = tokenizer(text, add_special_tokens=False).input_ids[:total_tokens]
-    return torch.tensor(ids, device=device, dtype=torch.long)
+    return torch.tensor(ids[:total_tokens], device=device, dtype=torch.long)
 
 
 def eval_windows(tokenizer, args, device):
@@ -219,9 +216,6 @@ def prepare_eval(args):
             cache_len=cache_len,
             use_r3=True,
             fast_hadamard=True,
-            mlp_i16=args.mlp_i16,
-            mlp_i16_layers=parse_layer_set(args.mlp_i16_layers),
-            static_mlp=args.static_mlp,
         )
     else:
         int_model = None
@@ -261,15 +255,15 @@ def run_eval(args, tokenizer, windows, hf_model, int_model, cache_kv, layers):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-dir", default="/code/Qwen3-0.6B")
+    parser.add_argument("--model-dir", default=DEFAULT_MODEL_DIR)
     parser.add_argument("--packed-dir", default="/tmp/Qwen3-0.6B-static-calib-32x2048")
     parser.add_argument("--backend", choices=["hf", "int-only"], default="int-only")
     parser.add_argument("--compare-backend", choices=["none", "hf"], default="hf")
     parser.add_argument("--max-tokens", type=int, default=2049)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-batches", type=int, default=1)
-    parser.add_argument("--eval-text", default=str(TEXT_PATH))
-    parser.add_argument("--eval-dataset", default="")
+    parser.add_argument("--eval-text", default="")
+    parser.add_argument("--eval-dataset", default="fineweb")
     parser.add_argument("--eval-parquet", default="")
     parser.add_argument("--eval-column", default="text")
     parser.add_argument("--layers", type=int)
@@ -278,9 +272,6 @@ def main():
     parser.add_argument("--cache-prompt", default="你是一个有用而无害的聊天助手。")
     parser.add_argument("--use-r1", action="store_true")
     parser.add_argument("--use-r2", action="store_true")
-    parser.add_argument("--mlp-i16", action="store_true")
-    parser.add_argument("--mlp-i16-layers", default="")
-    parser.add_argument("--static-mlp", action="store_true")
     parser.add_argument("--jsonl-out", default="")
     parser.add_argument("--jsonl-windows", action="store_true")
     args = parser.parse_args()
@@ -307,9 +298,7 @@ def main():
                 "use_r3": True,
                 "fused_static": True,
                 "fast_hadamard": True,
-                "mlp_i16": args.mlp_i16,
-                "mlp_i16_layers": args.mlp_i16_layers,
-                "static_mlp": args.static_mlp,
+                "static_mlp": True,
             }
             row = {
                 "kind": "summary",

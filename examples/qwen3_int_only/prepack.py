@@ -6,11 +6,16 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 from transformers import AutoTokenizer
 
-from examples.qwen3_int_only.model import QWEN3_0_6B, per_channel_i8_weight, q15_16, rmsnorm_torch, rope_tables_q15_16, rope_torch
 from examples.qwen3_int_only.ppl import iter_texts
-from examples.qwen3_int_only.quarot import (
+from examples.qwen3_int_only.utils import (
     ROTATE_SEED,
+    QWEN3_0_6B,
+    per_channel_i8_weight,
+    q15_16,
     random_hadamard_rotation,
+    rmsnorm_torch,
+    rope_tables_q15_16,
+    rope_torch,
     rotate_head_input,
     rotate_head_output,
     rotate_input,
@@ -19,7 +24,7 @@ from examples.qwen3_int_only.quarot import (
 )
 
 
-TEXT_PATH = Path(__file__).resolve().parent / "data" / "declaration_of_independence.txt"
+DEFAULT_MODEL_DIR = "/publicdata/huggingface.co/Qwen/Qwen3-0.6B"
 
 
 def update_head_amax(acc, x):
@@ -117,15 +122,15 @@ def calibrate_attention_scales(embed, layer_weights, norm_weights, ids, config, 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-dir", default="/code/Qwen3-0.6B")
-    parser.add_argument("--out-dir", default="/code/Qwen3-0.6B-int-only")
+    parser.add_argument("--model-dir", default=DEFAULT_MODEL_DIR)
+    parser.add_argument("--out-dir", default="/tmp/Qwen3-0.6B-static-calib")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--use-r1", action="store_true")
     parser.add_argument("--use-r2", action="store_true")
     parser.add_argument("--use-r3", action="store_true")
     parser.add_argument("--rotate-seed", type=int, default=ROTATE_SEED)
-    parser.add_argument("--calib-text", default=str(TEXT_PATH))
-    parser.add_argument("--calib-dataset", default="")
+    parser.add_argument("--calib-text", default="")
+    parser.add_argument("--calib-dataset", default="fineweb")
     parser.add_argument("--calib-parquet")
     parser.add_argument("--calib-column", default="text")
     parser.add_argument("--calib-tokens", type=int, default=0)

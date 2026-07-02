@@ -1,17 +1,16 @@
 import argparse
 import json
-from pathlib import Path
 
 import torch
 from safetensors import safe_open
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from examples.qwen3_int_only.model import Q15_16, QWEN3_0_6B, Qwen3IntOnlyBlock, load_packed_qwen3, parse_layer_set, q15_16, rope_tables_q15_16
-from examples.qwen3_int_only.ppl import quant_i8_q15_16
-from examples.qwen3_int_only.quarot import ROTATE_SEED, random_hadamard_rotation
+from examples.qwen3_int_only.model import Q15_16, QWEN3_0_6B, Qwen3IntOnlyBlock
+from examples.qwen3_int_only.ppl import iter_texts, quant_i8_q15_16
+from examples.qwen3_int_only.utils import ROTATE_SEED, load_packed_qwen3, q15_16, random_hadamard_rotation, rope_tables_q15_16
 
 
-TEXT_PATH = Path(__file__).resolve().parent / "data" / "declaration_of_independence.txt"
+DEFAULT_MODEL_DIR = "/publicdata/huggingface.co/Qwen/Qwen3-0.6B"
 
 
 def packed_flags(packed_dir):
@@ -26,8 +25,8 @@ def op_counts(seq_len, cfg, cache_len=0):
     return {
         "qkv_proj_i8": 2 * seq_len * cfg.hidden_size * (cfg.q_size + 2 * cfg.kv_size),
         "o_proj_i8": 2 * seq_len * cfg.q_size * cfg.hidden_size,
-        "gate_up_proj_i8": 2 * seq_len * cfg.hidden_size * (2 * cfg.intermediate_size),
-        "down_residual_i8": 2 * seq_len * cfg.intermediate_size * cfg.hidden_size,
+        "gate_up_proj_static": 2 * seq_len * cfg.hidden_size * (2 * cfg.intermediate_size),
+        "down_residual_static": 2 * 2 * seq_len * cfg.intermediate_size * cfg.hidden_size,
         "attention_i8v8_fused_static": qk_ops * 2 + pv_ops,
         "attention_cache_i8v8_fused_static": qk_ops * 2 + pv_ops,
         "rope_sq8_q_attn_hadamard": 2 * seq_len * cfg.num_attention_heads * cfg.head_dim * cfg.head_dim,
@@ -97,7 +96,7 @@ def build_cache_kv(model_dir, tokenizer, cache_prompt, layers, use_r2=True, use_
 
 
 @torch.no_grad()
-def run_block(block, x, weights, cos, sin, r3_q15, prof, cache_k=None, cache_v=None, mlp_i16=False):
+def run_block(block, x, weights, cos, sin, r3_q15, prof, cache_k=None, cache_v=None):
     cfg = block.config
     pos_cos = cos[block.cache_len : block.cache_len + block.seq_len]
     pos_sin = sin[block.cache_len : block.cache_len + block.seq_len]
@@ -115,47 +114,47 @@ def run_block(block, x, weights, cos, sin, r3_q15, prof, cache_k=None, cache_v=N
         attn = prof.time("attention_cache_i8v8_fused_static", lambda: block.attn_i8v8_fused_cache_static(q_attn, cache_k[0], cache_v[0], k_attn, v_attn, weights.q_post_rope_i8_scale, cache_k[1], cache_v[1], weights.k_post_rope_i8_scale, weights.v_i8_scale, block.lut_exp))
     attn8, attn_s8 = prof.time("dq8_attn", lambda: block.dq8_q(attn))
     attn_out = prof.time("o_proj_i8", lambda: block.o_proj(attn8, attn_s8, weights.o_proj.weight, weights.o_proj.scale))
-    h, h8, hs8 = prof.time("residual_attn_rms_dq8_fast", lambda: block.add_rms_dq8_hidden_fast(x, attn_out, weights.post_attention_layernorm, block.lut_rsqrt))
-    gate, up = prof.time("gate_up_proj_i8", lambda: block.gate_up_proj_i8(h8, hs8, weights.gate_proj.weight, weights.gate_proj.scale, weights.up_proj.weight, weights.up_proj.scale))
-    if mlp_i16:
-        gated, gs = prof.time("silu_mul_dq16_mid_fast", lambda: block.silu_mul_dq16_mid_fast(gate, up, block.lut_sigmoid))
-        return prof.time("down_residual_i16", lambda: block.down_residual_i16(gated, gs, weights.down_proj.weight, weights.down_proj.scale, h))
-    gated, gs = prof.time("silu_mul_dq8_mid_fast", lambda: block.silu_mul_dq8_mid_fast(gate, up, block.lut_sigmoid))
-    return prof.time("down_residual_i8", lambda: block.down_residual_i8(gated, gs, weights.down_proj.weight, weights.down_proj.scale, h))
+    h, post = prof.time("residual_attn_rms_q15", lambda: block.add_rms_hidden_q15(x, attn_out, weights.post_attention_layernorm, block.lut_rsqrt))
+    h8, hs8 = prof.time("sq8_hidden_static", lambda: block.sq8_hidden(post, weights.post_mlp_i8_scale))
+    gate, up = prof.time("gate_up_proj_static", lambda: block.gate_up_proj_static(h8, hs8, weights.gate_proj.weight, weights.gate_proj.scale, weights.up_proj.weight, weights.up_proj.scale))
+    gated, gs = prof.time("silu_mul_sq16_mid_fast", lambda: block.silu_mul_sq16_mid_fast(gate, up, block.lut_sigmoid, weights.gated_mlp_i16_scale))
+    return prof.time("down_residual_static", lambda: block.down_residual_static(gated, gs, weights.down_proj.weight, weights.down_proj.scale, h))
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-dir", default="/code/Qwen3-0.6B")
+    parser.add_argument("--model-dir", default=DEFAULT_MODEL_DIR)
     parser.add_argument("--packed-dir", default="/tmp/Qwen3-0.6B-static-calib-32x2048")
     parser.add_argument("--max-tokens", type=int, default=2049)
     parser.add_argument("--layers", type=int, default=28)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeat", type=int, default=3)
-    parser.add_argument("--mlp-i16", action="store_true")
-    parser.add_argument("--mlp-i16-layers", default="")
     parser.add_argument("--cache-prompt", default="你是一个有用而无害的聊天助手。")
     parser.add_argument("--jsonl-out", default="")
     args = parser.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir, local_files_only=True, trust_remote_code=True)
-    ids = tokenizer(TEXT_PATH.read_text(encoding="utf-8"), add_special_tokens=False).input_ids[: args.max_tokens]
+    ids = []
+    for text in iter_texts("fineweb", "text"):
+        ids.extend(tokenizer(text, add_special_tokens=False).input_ids)
+        if len(ids) >= args.max_tokens:
+            break
+    ids = ids[: args.max_tokens]
     seq_len = len(ids) - 1
     seq_len -= seq_len % 32
     ids = torch.tensor(ids[:seq_len], device="cuda", dtype=torch.long)
     _packed_r1, packed_r2 = packed_flags(args.packed_dir)
     cache_kv, cache_len = build_cache_kv(args.model_dir, tokenizer, args.cache_prompt, args.layers, packed_r2, True)
     embed, _, _, weights = load_packed_qwen3(args.packed_dir, QWEN3_0_6B)
-    block = Qwen3IntOnlyBlock(seq_len, QWEN3_0_6B, cache_len=cache_len, use_r3=True, fast_hadamard=True, mlp_i16=args.mlp_i16 or bool(args.mlp_i16_layers))
+    block = Qwen3IntOnlyBlock(seq_len, QWEN3_0_6B, cache_len=cache_len, use_r3=True, fast_hadamard=True)
     cos, sin, _ = rope_tables_q15_16(seq_len + cache_len, QWEN3_0_6B.head_dim, QWEN3_0_6B.rope_theta)
     r3_q15 = q15_16(random_hadamard_rotation(QWEN3_0_6B.head_dim, ROTATE_SEED + 2))
-    mlp_i16_layers = parse_layer_set(args.mlp_i16_layers)
 
     def run_layers(prof):
         x = q15_16(embed[ids])
         for layer_idx in range(args.layers):
             cache_k, cache_v = cache_kv[layer_idx]
-            x = run_block(block, x, weights[layer_idx], cos, sin, r3_q15, prof, cache_k, cache_v, args.mlp_i16 or layer_idx in mlp_i16_layers)
+            x = run_block(block, x, weights[layer_idx], cos, sin, r3_q15, prof, cache_k, cache_v)
         return x
 
     ops = op_counts(seq_len, QWEN3_0_6B, cache_len)
@@ -172,8 +171,7 @@ def main():
             "layers": args.layers,
             "warmup": args.warmup,
             "repeat": args.repeat,
-            "mlp_i16": args.mlp_i16,
-            "mlp_i16_layers": args.mlp_i16_layers,
+            "static_mlp": True,
             "cache_len": cache_len,
             "fused_static": True,
             "fast_hadamard": True,
