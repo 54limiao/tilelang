@@ -19,10 +19,6 @@ from examples.qwen3_int_only.utils.lut import exp_lut_neg, rsqrt_lut, sigmoid_lu
 Q15_16 = 1 << 16
 
 
-def compile_(func, out_idx):
-    return tilelang.compile(func, out_idx=out_idx, target="cuda")
-
-
 class Qwen3IntOnlyBlock:
     def __init__(self, seq_len, config=QWEN3_0_6B, cache_len=0):
         self.seq_len = seq_len
@@ -36,20 +32,19 @@ class Qwen3IntOnlyBlock:
         self.zero_k = torch.zeros((seq_len * kvh, hd), device="cuda", dtype=torch.int32)
         self.empty_cache_k = torch.empty((kvh, cache_len, hd), device="cuda", dtype=torch.int8)
         self.empty_cache_v = torch.empty((kvh, cache_len, hd), device="cuda", dtype=torch.int8)
-        self.empty_cache_s = torch.empty((kvh, cache_len), device="cuda", dtype=torch.uint32)
-        self.rms_q15 = compile_(rms_q15(seq_len, h), [4, 5])
-        self.rms_sq8 = compile_(rms_sq8(seq_len, h), [5, 6, 7])
-        self.rms_q = compile_(rms_q15(seq_len * qh, hd), [4, 5])
-        self.rms_k = compile_(rms_q15(seq_len * kvh, hd), [4, 5])
-        self.quant_v = compile_(quant_v_i8(seq_len, kvh, hd, "int8"), [2])
-        self.rope_q = compile_(rope_sq8(seq_len, qh, hd), [5])
-        self.rope_k = compile_(rope_sq8(seq_len, kvh, hd), [5])
-        self.qkv_proj = compile_(linear_i8(seq_len, h, q_dim + 2 * kv_dim, 64, 128, 64), [4])
-        self.o_proj = compile_(linear_i8(seq_len, q_dim, h, 64, 64, 64), [4])
-        self.gate_up_proj = compile_(linear_i8(seq_len, h, 2 * im, 64, 128, 64), [4])
-        self.silu_mul = compile_(silu_i16(seq_len, im), [4, 5])
-        self.down_proj = compile_(linear_i16(seq_len, im, h, 64, 64, 64), [4])
-        self.attn = compile_(attention_i8(qh, kvh, seq_len, cache_len, hd), [12])
+        self.rms_q15 = tilelang.compile(rms_q15(seq_len, h), out_idx=[4, 5], target="cuda")
+        self.rms_sq8 = tilelang.compile(rms_sq8(seq_len, h), out_idx=[5, 6, 7], target="cuda")
+        self.rms_q = tilelang.compile(rms_q15(seq_len * qh, hd), out_idx=[4, 5], target="cuda")
+        self.rms_k = tilelang.compile(rms_q15(seq_len * kvh, hd), out_idx=[4, 5], target="cuda")
+        self.quant_v = tilelang.compile(quant_v_i8(seq_len, kvh, hd, "int8"), out_idx=[2], target="cuda")
+        self.rope_q = tilelang.compile(rope_sq8(seq_len, qh, hd), out_idx=[5], target="cuda")
+        self.rope_k = tilelang.compile(rope_sq8(seq_len, kvh, hd), out_idx=[5], target="cuda")
+        self.qkv_proj = tilelang.compile(linear_i8(seq_len, h, q_dim + 2 * kv_dim, 64, 128, 64), out_idx=[4], target="cuda")
+        self.o_proj = tilelang.compile(linear_i8(seq_len, q_dim, h, 64, 64, 64), out_idx=[4], target="cuda")
+        self.gate_up_proj = tilelang.compile(linear_i8(seq_len, h, 2 * im, 64, 128, 64), out_idx=[4], target="cuda")
+        self.silu_mul = tilelang.compile(silu_i16(seq_len, im), out_idx=[4, 5], target="cuda")
+        self.down_proj = tilelang.compile(linear_i16(seq_len, im, h, 64, 64, 64), out_idx=[4], target="cuda")
+        self.attn = tilelang.compile(attention_i8(qh, kvh, seq_len, cache_len, hd), out_idx=[10], target="cuda")
         self.lut_rsqrt = torch.from_numpy(rsqrt_lut()).cuda()
         self.lut_sigmoid = torch.from_numpy(sigmoid_lut()).cuda()
         self.lut_exp = torch.from_numpy(exp_lut_neg()).cuda()
@@ -60,8 +55,8 @@ class Qwen3IntOnlyBlock:
 
     def __call__(self, x, weights: Qwen3BlockWeights, cos, sin, cache_k=None, cache_v=None, r3_q15=None, x8=None):
         cfg = self.config
-        cache_k = (self.empty_cache_k, self.empty_cache_s) if cache_k is None else cache_k
-        cache_v = (self.empty_cache_v, self.empty_cache_s) if cache_v is None else cache_v
+        cache_k = self.empty_cache_k if cache_k is None else cache_k
+        cache_v = self.empty_cache_v if cache_v is None else cache_v
         qkv = self.qkv_proj(x8, weights.input_qkv_i8_scale, weights.qkv_proj.weight, weights.qkv_proj.scale)
         q = qkv[:, : cfg.q_size].contiguous()
         k = qkv[:, cfg.q_size : cfg.q_size + cfg.kv_size].contiguous()
@@ -75,13 +70,11 @@ class Qwen3IntOnlyBlock:
         v_attn = self.quant_v(v.reshape(self.seq_len, cfg.num_key_value_heads, cfg.head_dim), weights.v_i8_scale)
         attn8 = self.attn(
             q_attn,
-            cache_k[0],
-            cache_v[0],
+            cache_k,
+            cache_v,
             k_attn,
             v_attn,
             weights.q_post_rope_i8_scale,
-            cache_k[1],
-            cache_v[1],
             weights.k_post_rope_i8_scale,
             weights.v_i8_scale,
             self.lut_exp,
@@ -104,7 +97,7 @@ class Qwen3IntOnlyModel:
         self.config = config
         self.r3_q15 = q15_16(random_hadamard_rotation(config.head_dim, rotate_seed + 2))
         self.block = Qwen3IntOnlyBlock(seq_len, config, cache_len=cache_len)
-        self.final_norm = compile_(rms_q15(seq_len, config.hidden_size), [4, 5])
+        self.final_norm = tilelang.compile(rms_q15(seq_len, config.hidden_size), out_idx=[4, 5], target="cuda")
         self.zero_hidden = torch.zeros((seq_len, config.hidden_size), device="cuda", dtype=torch.int32)
         self.lut_rsqrt = torch.from_numpy(rsqrt_lut()).cuda()
         self.cos, self.sin, _ = rope_tables_q15_16(seq_len + cache_len, config.head_dim, config.rope_theta)

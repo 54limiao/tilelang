@@ -363,8 +363,6 @@ def attention_i8(q_heads, kv_heads, seqlen, cache_len, dim, block_m=16, block_n=
         K: T.Tensor((kv_heads, seqlen, dim), "int8"),
         V: T.Tensor((kv_heads, seqlen, dim), "int8"),
         QS: T.Tensor((q_heads,), "uint32"),
-        CACHE_KS: T.Tensor((kv_heads, cache_len), "uint32"),
-        CACHE_VS: T.Tensor((kv_heads, cache_len), "uint32"),
         KS: T.Tensor((kv_heads,), "uint32"),
         VS: T.Tensor((kv_heads,), "uint32"),
         LUT: T.Tensor((1024,), "int16"),
@@ -377,9 +375,8 @@ def attention_i8(q_heads, kv_heads, seqlen, cache_len, dim, block_m=16, block_n=
             q_shared = T.alloc_shared((block_m, dim), "int8")
             k_shared = T.alloc_shared((block_n, dim), "int8")
             v_shared = T.alloc_shared((block_n, dim), "int8")
-            p2 = T.alloc_shared((block_m, block_n), "int8")
-            p1 = T.alloc_shared((block_m, block_n), "int8")
-            p0 = T.alloc_shared((block_m, block_n), "int8")
+            p_hi = T.alloc_shared((block_m, block_n), "int8")
+            p_mid = T.alloc_shared((block_m, block_n), "int8")
             qk = T.alloc_fragment((block_m, block_n), "int32")
             score = T.alloc_fragment((block_m, block_n), "int32")
             block_max = T.alloc_fragment((block_m,), "int32")
@@ -390,14 +387,14 @@ def attention_i8(q_heads, kv_heads, seqlen, cache_len, dim, block_m=16, block_n=
             denom = T.alloc_fragment((block_m,), "int32")
             q_scale = T.alloc_fragment((1,), "int32")
             k_scale = T.alloc_fragment((block_n,), "int32")
-            v_scale = T.alloc_fragment((block_n,), "int32")
+            v_scale = T.alloc_fragment((1,), "int32")
             o_scale = T.alloc_fragment((1,), "int32")
             out = T.alloc_fragment((block_m, dim), "int32")
             prob = T.alloc_fragment((block_m, block_n), "int32")
-            scaled = T.alloc_fragment((block_m, block_n), "int32")
             pv = T.alloc_fragment((block_m, dim), "int32")
             acc = T.alloc_fragment((block_m, dim), "int32")
             q_scale[0] = T.cast(QS[h], "int32") >> T.int32(4)
+            v_scale[0] = T.max(T.cast(VS[kh], "int32"), T.int32(1))
             o_scale[0] = T.max(T.cast(OS[0], "int32"), T.int32(1))
             for m in T.Parallel(block_m):
                 score_max[m] = T.int32(I32_MIN)
@@ -410,8 +407,7 @@ def attention_i8(q_heads, kv_heads, seqlen, cache_len, dim, block_m=16, block_n=
                     pos = nb * block_n + j
                     k_shared[j, d] = T.if_then_else(pos < cache_len, CACHE_K[kh, pos, d], T.if_then_else(pos < kv_len, K[kh, pos - cache_len, d], T.int8(0)))
                 for j in T.Parallel(block_n):
-                    pos = nb * block_n + j
-                    k_scale[j] = T.if_then_else(pos < cache_len, T.cast(CACHE_KS[kh, pos], "int32"), T.if_then_else(pos < kv_len, T.cast(KS[kh], "int32"), T.int32(1)))
+                    k_scale[j] = T.max(T.cast(KS[kh], "int32"), T.int32(1))
                 T.clear(qk)
                 T.gemm(q_shared, k_shared, qk, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
                 for m, j in T.Parallel(block_m, block_n):
@@ -435,37 +431,33 @@ def attention_i8(q_heads, kv_heads, seqlen, cache_len, dim, block_m=16, block_n=
                     k_shared[j, d] = T.if_then_else(pos < cache_len, CACHE_K[kh, pos, d], T.if_then_else(pos < kv_len, K[kh, pos - cache_len, d], T.int8(0)))
                     v_shared[j, d] = T.if_then_else(pos < cache_len, CACHE_V[kh, pos, d], T.if_then_else(pos < kv_len, V[kh, pos - cache_len, d], T.int8(0)))
                 for j in T.Parallel(block_n):
-                    pos = nb * block_n + j
-                    k_scale[j] = T.if_then_else(pos < cache_len, T.cast(CACHE_KS[kh, pos], "int32"), T.if_then_else(pos < kv_len, T.cast(KS[kh], "int32"), T.int32(1)))
-                    v_scale[j] = T.if_then_else(pos < cache_len, T.cast(CACHE_VS[kh, pos], "int32"), T.if_then_else(pos < kv_len, T.cast(VS[kh], "int32"), T.int32(0)))
+                    k_scale[j] = T.max(T.cast(KS[kh], "int32"), T.int32(1))
                 T.clear(qk)
                 T.gemm(q_shared, k_shared, qk, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
                 for m, j in T.Parallel(block_m, block_n):
                     pos = nb * block_n + j
                     score[m, j] = ((qk[m, j] >> T.int32(8)) * (((q_scale[0] * (k_scale[j] >> T.int32(4))) >> T.int32(8)) * T.int32(5793))) >> T.int32(score_shift - 8)
                     score[m, j] = T.if_then_else(pos <= cache_len + row_base + m, T.fix.lut_10bit(score[m, j] - score_max[m], LUT, scale=lut_scale, out_dtype="int32"), T.int32(0))
-                    prob[m, j] = T.min(T.truncdiv((score[m, j] * T.int32(16383)) + (denom[m] >> T.int32(1)), denom[m]), T.int32(16383))
-                    scaled[m, j] = T.truncdiv((prob[m, j] * v_scale[j]) + T.int32(8191), T.int32(16383))
-                    p2[m, j] = T.cast(scaled[m, j] >> T.int32(14), "int8")
-                    p1[m, j] = T.cast((scaled[m, j] >> T.int32(7)) - ((scaled[m, j] >> T.int32(14)) << T.int32(7)), "int8")
-                    p0[m, j] = T.cast(scaled[m, j] - ((scaled[m, j] >> T.int32(7)) << T.int32(7)), "int8")
+                    prob[m, j] = T.min(T.truncdiv((score[m, j] * T.int32(32767)) + (denom[m] >> T.int32(1)), denom[m]), T.int32(32767))
+                    p_hi[m, j] = T.cast(prob[m, j] >> T.int32(8), "int8")
+                    p_mid[m, j] = T.cast((prob[m, j] - ((prob[m, j] >> T.int32(8)) << T.int32(8))) >> T.int32(1), "int8")
                 T.clear(pv)
-                T.gemm(p2, v_shared, pv, policy=T.GemmWarpPolicy.FullRow)
+                T.gemm(p_hi, v_shared, pv, policy=T.GemmWarpPolicy.FullRow)
                 for m, d in T.Parallel(block_m, dim):
-                    acc[m, d] += pv[m, d] << T.int32(14)
+                    acc[m, d] += pv[m, d] << T.int32(8)
                 T.clear(pv)
-                T.gemm(p1, v_shared, pv, policy=T.GemmWarpPolicy.FullRow)
+                T.gemm(p_mid, v_shared, pv, policy=T.GemmWarpPolicy.FullRow)
                 for m, d in T.Parallel(block_m, dim):
-                    acc[m, d] += pv[m, d] << T.int32(7)
-                T.clear(pv)
-                T.gemm(p0, v_shared, pv, policy=T.GemmWarpPolicy.FullRow)
-                for m, d in T.Parallel(block_m, dim):
-                    acc[m, d] += pv[m, d]
+                    acc[m, d] += pv[m, d] << T.int32(1)
             for m, d in T.Parallel(block_m, dim):
                 out[m, d] = acc[m, d]
                 if out[m, d] < T.int32(0):
                     out[m, d] = T.int32(0) - out[m, d]
-                out[m, d] = (out[m, d] + (o_scale[0] >> T.int32(1))) // o_scale[0]
+                out[m, d] = T.cast(
+                    (T.cast(out[m, d], "int64") * T.cast(v_scale[0], "int64") + ((T.cast(o_scale[0], "int64") * T.int64(32767)) >> T.int32(1)))
+                    // (T.cast(o_scale[0], "int64") * T.int64(32767)),
+                    "int32",
+                )
                 if acc[m, d] < T.int32(0):
                     out[m, d] = T.int32(0) - out[m, d]
                 out[m, d] = T.min(T.max(out[m, d], T.int32(-128)), T.int32(127))

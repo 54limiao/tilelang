@@ -42,11 +42,13 @@ def scale_from_amax(amax, qmax):
     return torch.div(amax + qmax - 1, qmax, rounding_mode="floor").clamp(min=1).to(torch.uint32)
 
 
-def load_calib_ids(model_dir, calib_text, calib_dataset, calib_parquet, calib_column, tokens, device):
+def load_calib_ids(model_dir, calib_text, calib_dataset, calib_parquet, calib_column, tokens, device, cache_prompt=""):
     tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True, trust_remote_code=True)
     ids = []
+    prefix = tokenizer(cache_prompt, add_special_tokens=False).input_ids if cache_prompt else []
     source = calib_parquet or calib_dataset or calib_text
     for text in iter_texts(source, calib_column):
+        ids.extend(prefix)
         ids.extend(tokenizer(text, add_special_tokens=False).input_ids)
         if len(ids) >= tokens:
             return torch.tensor(ids[:tokens], device=device, dtype=torch.long)
@@ -76,6 +78,7 @@ def write_timestamp(path, args, calib_tokens, calib_seq_len, metadata=None):
                 f"calib_seq_len={value('calib_seq_len', calib_seq_len)}",
                 f"calib_batches={value('calib_batches', args.calib_batches)}",
                 f"calib_prefix_tokens={value('calib_prefix_tokens', args.calib_prefix_tokens)}",
+                f"cache_prompt={value('cache_prompt', args.cache_prompt)}",
                 f"use_r1={value('use_r1', int(args.use_r1))}",
                 f"use_r2={value('use_r2', int(args.use_r2))}",
                 f"use_r3={value('use_r3', int(args.use_r3))}",
@@ -129,11 +132,11 @@ def run_calib_segment(x, w, norms, cos, sin, config, r3, prefix_tokens):
     v = v.reshape(batch, seq_len, config.num_key_value_heads, config.head_dim)
     stats = {
         "input_qkv_i8": q15_16(h[:, prefix_tokens:]),
-        "q_pre_rope_i16": q15_16(q[:, prefix_tokens:]).reshape(-1, config.num_attention_heads, config.head_dim),
-        "k_pre_rope_i16": q15_16(k[:, prefix_tokens:]).reshape(-1, config.num_key_value_heads, config.head_dim),
-        "q_post_rope_i8": q15_16(q_rope[:, prefix_tokens:]).reshape(-1, config.num_attention_heads, config.head_dim),
-        "k_post_rope_i8": q15_16(k_rope[:, prefix_tokens:]).reshape(-1, config.num_key_value_heads, config.head_dim),
-        "v_i8": q15_16(v[:, prefix_tokens:]).reshape(-1, config.num_key_value_heads, config.head_dim),
+        "q_pre_rope_i16": q15_16(q).reshape(-1, config.num_attention_heads, config.head_dim),
+        "k_pre_rope_i16": q15_16(k).reshape(-1, config.num_key_value_heads, config.head_dim),
+        "q_post_rope_i8": q15_16(q_rope).reshape(-1, config.num_attention_heads, config.head_dim),
+        "k_post_rope_i8": q15_16(k_rope).reshape(-1, config.num_key_value_heads, config.head_dim),
+        "v_i8": q15_16(v).reshape(-1, config.num_key_value_heads, config.head_dim),
     }
     group = config.num_attention_heads // config.num_key_value_heads
     q_attn = q_rope.permute(0, 2, 1, 3)
@@ -200,6 +203,7 @@ def main():
     parser.add_argument("--calib-seq-len", type=int, default=0)
     parser.add_argument("--calib-batches", type=int, default=0)
     parser.add_argument("--calib-prefix-tokens", type=int, default=0)
+    parser.add_argument("--cache-prompt", default="")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
@@ -279,8 +283,9 @@ def main():
             calib_norms.append((input_norm, post_norm, q_norm, k_norm))
 
     if calib_tokens:
-        ids = load_calib_ids(args.model_dir, args.calib_text, args.calib_dataset, args.calib_parquet, args.calib_column, calib_tokens, args.device)
-        for layer_idx, scales in enumerate(calibrate_attention_scales(embed, calib_weights, calib_norms, ids, QWEN3_0_6B, r3, args.calib_prefix_tokens, calib_seq_len)):
+        ids = load_calib_ids(args.model_dir, args.calib_text, args.calib_dataset, args.calib_parquet, args.calib_column, calib_tokens, args.device, args.cache_prompt)
+        all_scales = calibrate_attention_scales(embed, calib_weights, calib_norms, ids, QWEN3_0_6B, r3, args.calib_prefix_tokens, calib_seq_len)
+        for layer_idx, scales in enumerate(all_scales):
             dst = f"layers.{layer_idx}"
             for name, scale in scales.items():
                 tensors[f"{dst}.{name}.scale"] = scale.cpu().contiguous()
@@ -298,6 +303,7 @@ def main():
             "calib_seq_len": str(calib_seq_len),
             "calib_batches": str(args.calib_batches),
             "calib_prefix_tokens": str(args.calib_prefix_tokens),
+            "cache_prompt": args.cache_prompt,
         },
     )
     write_timestamp(timestamp, args, calib_tokens, calib_seq_len)

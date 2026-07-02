@@ -35,6 +35,7 @@ PREPACK_ARGS=(
   --calib-seq-len "${CALIB_SEQ_LEN}"
   --calib-batches "${CALIB_BATCHES}"
   --calib-prefix-tokens "${CALIB_PREFIX_TOKENS}"
+  --cache-prompt "${CACHE_PROMPT}"
 )
 
 if [[ -n "${CALIB_PARQUET}" ]]; then

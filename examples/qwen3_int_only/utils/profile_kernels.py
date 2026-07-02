@@ -6,7 +6,7 @@ from safetensors import safe_open
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from examples.qwen3_int_only.model import Q15_16, QWEN3_0_6B, Qwen3IntOnlyBlock
-from examples.qwen3_int_only.utils.ppl import iter_texts, quant_i8_q15_16
+from examples.qwen3_int_only.utils.ppl import iter_texts, quant_i8_static_q15_16
 from examples.qwen3_int_only.utils import ROTATE_SEED, load_packed_qwen3, q15_16, random_hadamard_rotation, rope_tables_q15_16
 
 
@@ -23,20 +23,23 @@ def op_counts(seq_len, cfg, cache_len=0):
     qk_ops = 2 * cfg.num_attention_heads * seq_len * (seq_len + cache_len) * cfg.head_dim
     pv_ops = 2 * cfg.num_attention_heads * seq_len * (seq_len + cache_len) * cfg.head_dim
     return {
-        "qkv_proj_i8": 2 * seq_len * cfg.hidden_size * (cfg.q_size + 2 * cfg.kv_size),
-        "o_proj_i8_static": 2 * seq_len * cfg.q_size * cfg.hidden_size,
-        "gate_up_proj_static": 2 * seq_len * cfg.hidden_size * (2 * cfg.intermediate_size),
-        "down_proj_static": 2 * seq_len * cfg.intermediate_size * cfg.hidden_size,
-        "attention_cache_i8v8_fused_static": qk_ops + pv_ops,
+        "linear_i8_qkv": 2 * seq_len * cfg.hidden_size * (cfg.q_size + 2 * cfg.kv_size),
+        "linear_i8_o": 2 * seq_len * cfg.q_size * cfg.hidden_size,
+        "linear_i8_gate_up": 2 * seq_len * cfg.hidden_size * (2 * cfg.intermediate_size),
+        "linear_i16_down": 2 * seq_len * cfg.intermediate_size * cfg.hidden_size,
+        "attention_i8": qk_ops + pv_ops,
     }
 
 
-def actual_op_counts(seq_len, cfg, cache_len=0):
+def tc_op_counts(seq_len, cfg, cache_len=0):
+    # math_ops is the model matmul work. tc_ops is the int8 tensorcore work we
+    # actually issue: attention recomputes QK and splits P16@V8 into two int8
+    # GEMMs, and int16@int8 is implemented as two int8@int8 GEMMs.
     ops = op_counts(seq_len, cfg, cache_len)
     qk_ops = 2 * cfg.num_attention_heads * seq_len * (seq_len + cache_len) * cfg.head_dim
     pv_ops = qk_ops
-    ops["attention_cache_i8v8_fused_static"] = 2 * qk_ops + 3 * pv_ops
-    ops["down_proj_static"] *= 2
+    ops["attention_i8"] = 2 * qk_ops + 2 * pv_ops
+    ops["linear_i16_down"] *= 2
     return ops
 
 
@@ -48,10 +51,10 @@ def default_int8_peak_tops():
 
 
 class Profiler:
-    def __init__(self, ops, peak_tops=0.0, actual_ops=None):
+    def __init__(self, math_ops, peak_tops=0.0, tc_ops=None):
         self.rows = []
-        self.ops = ops
-        self.actual_ops = actual_ops or ops
+        self.math_ops = math_ops
+        self.tc_ops = tc_ops or math_ops
         self.peak_tops = peak_tops
 
     def time(self, name, fn):
@@ -75,25 +78,22 @@ class Profiler:
         items = []
         for name, ms in sorted(totals.items(), key=lambda x: x[1], reverse=True):
             row = {"name": name, "avg_ms": ms / counts[name], "total_ms": ms, "count": counts[name], "pct": ms / total * 100.0}
-            if name in self.ops:
-                row["gops"] = self.ops[name] * counts[name] / 1.0e9
-                row["tops"] = row["gops"] / ms
+            if name in self.math_ops:
+                row["math_gops"] = self.math_ops[name] * counts[name] / 1.0e9
+                row["math_tops"] = row["math_gops"] / ms
                 if self.peak_tops:
-                    row["util_pct"] = row["tops"] / self.peak_tops * 100.0
-                if self.actual_ops.get(name, self.ops[name]) != self.ops[name]:
-                    row["actual_gops"] = self.actual_ops[name] * counts[name] / 1.0e9
-                    row["actual_tops"] = row["actual_gops"] / ms
-                    if self.peak_tops:
-                        row["actual_util_pct"] = row["actual_tops"] / self.peak_tops * 100.0
+                    row["math_util_pct"] = row["math_tops"] / self.peak_tops * 100.0
+                row["tc_gops"] = self.tc_ops.get(name, self.math_ops[name]) * counts[name] / 1.0e9
+                row["tc_tops"] = row["tc_gops"] / ms
+                if self.peak_tops:
+                    row["tc_util_pct"] = row["tc_tops"] / self.peak_tops * 100.0
             items.append(row)
             if print_rows:
                 perf = ""
-                if "tops" in row:
-                    util = f" util={row['util_pct']:5.2f}%" if "util_pct" in row else ""
-                    perf = f" {row['tops']:7.2f} TOPS{util}"
-                    if "actual_tops" in row:
-                        actual_util = f" util={row['actual_util_pct']:5.2f}%" if "actual_util_pct" in row else ""
-                        perf += f" actual={row['actual_tops']:7.2f} TOPS{actual_util}"
+                if "math_tops" in row:
+                    math_util = f" util={row['math_util_pct']:5.2f}%" if "math_util_pct" in row else ""
+                    tc_util = f" util={row['tc_util_pct']:5.2f}%" if "tc_util_pct" in row else ""
+                    perf = f" math={row['math_tops']:7.2f} TOPS{math_util} tc={row['tc_tops']:7.2f} TOPS{tc_util}"
                 print(f"{name:28s} avg={row['avg_ms']:8.3f} ms total={ms:9.3f} ms {row['pct']:6.2f}%{perf}")
         if print_rows:
             print(f"{'total':28s} {total:9.3f} ms")
@@ -101,7 +101,7 @@ class Profiler:
 
 
 @torch.no_grad()
-def build_cache_kv(model_dir, tokenizer, cache_prompt, layers, use_r2=True):
+def build_cache_kv(model_dir, tokenizer, cache_prompt, layer_weights, use_r2=True):
     hf_model = AutoModelForCausalLM.from_pretrained(model_dir, local_files_only=True, trust_remote_code=True, dtype=torch.bfloat16).to("cuda")
     cache_ids = torch.tensor(tokenizer(cache_prompt, add_special_tokens=False).input_ids, device="cuda", dtype=torch.long)
     past = hf_model(cache_ids[None, :], use_cache=True).past_key_values
@@ -112,13 +112,15 @@ def build_cache_kv(model_dir, tokenizer, cache_prompt, layers, use_r2=True):
     r2 = random_hadamard_rotation(QWEN3_0_6B.head_dim, ROTATE_SEED + 1, "cuda") if use_r2 else None
     r3 = random_hadamard_rotation(QWEN3_0_6B.head_dim, ROTATE_SEED + 2, "cuda")
     cache_kv = []
-    for k, v in past[:layers]:
+    for weights, (k, v) in zip(layer_weights, past[: len(layer_weights)]):
         k = k[0].float().contiguous()
         v = v[0].float().contiguous()
         k = (k.to(torch.float64) @ r3.to(torch.float64)).to(torch.float32)
         if r2 is not None:
             v = (v.to(torch.float64) @ r2.to(torch.float64)).to(torch.float32)
-        cache_kv.append((quant_i8_q15_16(k), quant_i8_q15_16(v)))
+        kq = quant_i8_static_q15_16(k, weights.k_post_rope_i8_scale[:, None])
+        vq = quant_i8_static_q15_16(v, weights.v_i8_scale[:, None])
+        cache_kv.append((kq, vq))
     return cache_kv, int(cache_ids.numel())
 
 
@@ -127,28 +129,28 @@ def run_block(block, x, x8, xs8, weights, cos, sin, r3_q15, prof, cache_k=None, 
     cfg = block.config
     pos_cos = cos[block.cache_len : block.cache_len + block.seq_len]
     pos_sin = sin[block.cache_len : block.cache_len + block.seq_len]
-    qkv = prof.time("qkv_proj_i8", lambda: block.qkv_proj(x8, weights.input_qkv_i8_scale, weights.qkv_proj.weight, weights.qkv_proj.scale))
+    qkv = prof.time("linear_i8_qkv", lambda: block.qkv_proj(x8, weights.input_qkv_i8_scale, weights.qkv_proj.weight, weights.qkv_proj.scale))
     q = qkv[:, : cfg.q_size].contiguous()
     k = qkv[:, cfg.q_size : cfg.q_size + cfg.kv_size].contiguous()
     v = qkv[:, cfg.q_size + cfg.kv_size :].contiguous()
     v_heads = v.reshape(block.seq_len * cfg.num_key_value_heads, cfg.head_dim)
-    _q, q_heads = prof.time("rms_q_q15", lambda: block.rms_q(q.reshape(block.seq_len * cfg.num_attention_heads, cfg.head_dim).contiguous(), block.zero_q, weights.q_norm, block.lut_rsqrt))
-    _k, k_heads = prof.time("rms_k_q15", lambda: block.rms_k(k.reshape(block.seq_len * cfg.num_key_value_heads, cfg.head_dim).contiguous(), block.zero_k, weights.k_norm, block.lut_rsqrt))
-    q_attn = prof.time("rope_sq8_q_attn_hadamard", lambda: block.rope_q(q_heads, pos_cos, pos_sin, r3_q15, weights.q_post_rope_i8_scale))
-    k_attn = prof.time("rope_sq8_k_attn_hadamard", lambda: block.rope_k(k_heads, pos_cos, pos_sin, r3_q15, weights.k_post_rope_i8_scale))
-    v_attn = prof.time("sq8_v_attn_noscale", lambda: block.quant_v(v_heads.reshape(block.seq_len, cfg.num_key_value_heads, cfg.head_dim), weights.v_i8_scale))
-    cache_k = (block.empty_cache_k, block.empty_cache_s) if cache_k is None else cache_k
-    cache_v = (block.empty_cache_v, block.empty_cache_s) if cache_v is None else cache_v
-    attn8 = prof.time("attention_cache_i8v8_fused_static", lambda: block.attn(q_attn, cache_k[0], cache_v[0], k_attn, v_attn, weights.q_post_rope_i8_scale, cache_k[1], cache_v[1], weights.k_post_rope_i8_scale, weights.v_i8_scale, block.lut_exp, weights.attn_i8_scale))
-    attn_out = prof.time("o_proj_i8_static", lambda: block.o_proj(attn8, weights.attn_i8_scale, weights.o_proj.weight, weights.o_proj.scale))
-    h, h8, _hs8 = prof.time("residual_rms_sq8", lambda: block.rms_sq8(x, attn_out, weights.post_attention_layernorm, block.lut_rsqrt, weights.post_mlp_i8_scale))
+    _q, q_heads = prof.time("rms_q15_q", lambda: block.rms_q(q.reshape(block.seq_len * cfg.num_attention_heads, cfg.head_dim).contiguous(), block.zero_q, weights.q_norm, block.lut_rsqrt))
+    _k, k_heads = prof.time("rms_q15_k", lambda: block.rms_k(k.reshape(block.seq_len * cfg.num_key_value_heads, cfg.head_dim).contiguous(), block.zero_k, weights.k_norm, block.lut_rsqrt))
+    q_attn = prof.time("rope_sq8_q", lambda: block.rope_q(q_heads, pos_cos, pos_sin, r3_q15, weights.q_post_rope_i8_scale))
+    k_attn = prof.time("rope_sq8_k", lambda: block.rope_k(k_heads, pos_cos, pos_sin, r3_q15, weights.k_post_rope_i8_scale))
+    v_attn = prof.time("quant_v_i8", lambda: block.quant_v(v_heads.reshape(block.seq_len, cfg.num_key_value_heads, cfg.head_dim), weights.v_i8_scale))
+    cache_k = block.empty_cache_k if cache_k is None else cache_k
+    cache_v = block.empty_cache_v if cache_v is None else cache_v
+    attn8 = prof.time("attention_i8", lambda: block.attn(q_attn, cache_k, cache_v, k_attn, v_attn, weights.q_post_rope_i8_scale, weights.k_post_rope_i8_scale, weights.v_i8_scale, block.lut_exp, weights.attn_i8_scale))
+    attn_out = prof.time("linear_i8_o", lambda: block.o_proj(attn8, weights.attn_i8_scale, weights.o_proj.weight, weights.o_proj.scale))
+    h, h8, _hs8 = prof.time("rms_sq8_post_attn", lambda: block.rms_sq8(x, attn_out, weights.post_attention_layernorm, block.lut_rsqrt, weights.post_mlp_i8_scale))
     hs8 = weights.post_mlp_i8_scale
-    gate_up = prof.time("gate_up_proj_static", lambda: block.gate_up_proj(h8, hs8, weights.gate_up_proj.weight, weights.gate_up_proj.scale))
+    gate_up = prof.time("linear_i8_gate_up", lambda: block.gate_up_proj(h8, hs8, weights.gate_up_proj.weight, weights.gate_up_proj.scale))
     gate = gate_up[:, : cfg.intermediate_size].contiguous()
     up = gate_up[:, cfg.intermediate_size :].contiguous()
-    gated, _gs = prof.time("silu_mul_sq16_mid_fast", lambda: block.silu_mul(gate, up, block.lut_sigmoid, weights.gated_mlp_i16_scale))
+    gated, _gs = prof.time("silu_i16", lambda: block.silu_mul(gate, up, block.lut_sigmoid, weights.gated_mlp_i16_scale))
     gs = weights.gated_mlp_i16_scale
-    mlp = prof.time("down_proj_static", lambda: block.down_proj(gated, gs, weights.down_proj.weight, weights.down_proj.scale))
+    mlp = prof.time("linear_i16_down", lambda: block.down_proj(gated, gs, weights.down_proj.weight, weights.down_proj.scale))
     return h, mlp
 
 
@@ -176,8 +178,8 @@ def main():
     seq_len -= seq_len % 32
     ids = torch.tensor(ids[:seq_len], device="cuda", dtype=torch.long)
     _packed_r1, packed_r2 = packed_flags(args.packed_dir)
-    cache_kv, cache_len = build_cache_kv(args.model_dir, tokenizer, args.cache_prompt, args.layers, packed_r2)
     embed, _, _, weights = load_packed_qwen3(args.packed_dir, QWEN3_0_6B)
+    cache_kv, cache_len = build_cache_kv(args.model_dir, tokenizer, args.cache_prompt, weights[: args.layers], packed_r2)
     block = Qwen3IntOnlyBlock(seq_len, QWEN3_0_6B, cache_len=cache_len)
     cos, sin, _ = rope_tables_q15_16(seq_len + cache_len, QWEN3_0_6B.head_dim, QWEN3_0_6B.rope_theta)
     r3_q15 = q15_16(random_hadamard_rotation(QWEN3_0_6B.head_dim, ROTATE_SEED + 2))
@@ -185,41 +187,41 @@ def main():
     def run_layers(prof):
         residual = q15_16(embed[ids])
         _res, x8, xs8 = prof.time(
-            "rms_input_sq8",
+            "rms_sq8_input",
             lambda: block.rms_sq8(residual, block.zero_hidden, weights[0].input_layernorm, block.lut_rsqrt, weights[0].input_qkv_i8_scale),
         )
         mlp = None
         for layer_idx in range(args.layers):
             if layer_idx:
                 residual, x8, xs8 = prof.time(
-                    "residual_rms_sq8",
+                    "rms_sq8_layer",
                     lambda: block.rms_sq8(residual, mlp, weights[layer_idx].input_layernorm, block.lut_rsqrt, weights[layer_idx].input_qkv_i8_scale),
                 )
             cache_k, cache_v = cache_kv[layer_idx]
             residual, mlp = run_block(block, residual, x8, xs8, weights[layer_idx], cos, sin, r3_q15, prof, cache_k, cache_v)
         return residual, mlp
 
-    ops = op_counts(seq_len, QWEN3_0_6B, cache_len)
-    actual_ops = actual_op_counts(seq_len, QWEN3_0_6B, cache_len)
+    math_ops = op_counts(seq_len, QWEN3_0_6B, cache_len)
+    tc_ops = tc_op_counts(seq_len, QWEN3_0_6B, cache_len)
     peak_tops = args.peak_tops or default_int8_peak_tops()
     for _ in range(args.warmup):
-        run_layers(Profiler(ops, peak_tops, actual_ops))
-    prof = Profiler(ops, peak_tops, actual_ops)
+        run_layers(Profiler(math_ops, peak_tops, tc_ops))
+    prof = Profiler(math_ops, peak_tops, tc_ops)
     for _ in range(args.repeat):
         run_layers(prof)
     summary = prof.summary(print_rows=True)
-    counted_ops_top = sum(row.get("gops", 0.0) for row in summary["kernels"]) / 1000.0
-    actual_counted_ops_top = sum(row.get("actual_gops", row.get("gops", 0.0)) for row in summary["kernels"]) / 1000.0
-    counted_tops = counted_ops_top / (summary["total_ms"] / 1000.0)
-    actual_counted_tops = actual_counted_ops_top / (summary["total_ms"] / 1000.0)
-    util = counted_tops / peak_tops * 100.0 if peak_tops else 0.0
-    actual_util = actual_counted_tops / peak_tops * 100.0 if peak_tops else 0.0
+    math_ops_top = sum(row.get("math_gops", 0.0) for row in summary["kernels"]) / 1000.0
+    tc_ops_top = sum(row.get("tc_gops", row.get("math_gops", 0.0)) for row in summary["kernels"]) / 1000.0
+    math_tops = math_ops_top / (summary["total_ms"] / 1000.0)
+    tc_tops = tc_ops_top / (summary["total_ms"] / 1000.0)
+    math_util = math_tops / peak_tops * 100.0 if peak_tops else 0.0
+    tc_util = tc_tops / peak_tops * 100.0 if peak_tops else 0.0
     print(
         f"profile seq_len={seq_len} tokens layers={args.layers} repeats={args.repeat} "
         f"total_ms={summary['total_ms']:.3f} per_pass_ms={summary['total_ms'] / args.repeat:.3f} "
-        f"counted_ops_per_pass={counted_ops_top / args.repeat:.3f} TOP counted_tops={counted_tops:.2f} "
-        f"actual_ops_per_pass={actual_counted_ops_top / args.repeat:.3f} TOP actual_tops={actual_counted_tops:.2f} "
-        f"peak_tops={peak_tops:.2f} util={util:.2f}% actual_util={actual_util:.2f}%"
+        f"math_ops_per_pass={math_ops_top / args.repeat:.3f} TOP math_tops={math_tops:.2f} "
+        f"tc_ops_per_pass={tc_ops_top / args.repeat:.3f} TOP tc_tops={tc_tops:.2f} "
+        f"peak_tops={peak_tops:.2f} math_util={math_util:.2f}% tc_util={tc_util:.2f}%"
     )
     if args.jsonl_out:
         row = {
@@ -231,15 +233,15 @@ def main():
             "static_mlp": True,
             "cache_len": cache_len,
             "fused_static": True,
-            "counted_ops_top": counted_ops_top,
-            "counted_ops_per_pass_top": counted_ops_top / args.repeat,
-            "actual_counted_ops_top": actual_counted_ops_top,
-            "actual_counted_ops_per_pass_top": actual_counted_ops_top / args.repeat,
-            "counted_tops": counted_tops,
-            "actual_counted_tops": actual_counted_tops,
+            "math_ops_top": math_ops_top,
+            "math_ops_per_pass_top": math_ops_top / args.repeat,
+            "tc_ops_top": tc_ops_top,
+            "tc_ops_per_pass_top": tc_ops_top / args.repeat,
+            "math_tops": math_tops,
+            "tc_tops": tc_tops,
             "peak_tops": peak_tops,
-            "util_pct": util,
-            "actual_util_pct": actual_util,
+            "math_util_pct": math_util,
+            "tc_util_pct": tc_util,
             **summary,
         }
         with open(args.jsonl_out, "a", encoding="utf-8") as f:

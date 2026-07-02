@@ -9,7 +9,7 @@ from safetensors import safe_open
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from examples.qwen3_int_only.model import Q15_16, QWEN3_0_6B, Qwen3IntOnlyModel
-from examples.qwen3_int_only.utils import ROTATE_SEED, random_hadamard_rotation
+from examples.qwen3_int_only.utils import ROTATE_SEED, load_packed_qwen3, random_hadamard_rotation
 
 
 DEFAULT_MODEL_DIR = "/publicdata/huggingface.co/Qwen/Qwen3-0.6B"
@@ -60,12 +60,10 @@ def load_ids(tokenizer, args, total_tokens, device):
     return torch.tensor(ids[:total_tokens], device=device, dtype=torch.long)
 
 
-def quant_i8_q15_16(x):
+def quant_i8_static_q15_16(x, scale):
     xq = torch.clamp(torch.round(x * Q15_16), -(1 << 31), (1 << 31) - 1).to(torch.int32)
-    scale = torch.div(xq.abs().amax(dim=-1) + 126, 127, rounding_mode="floor").clamp(min=1).to(torch.uint32)
     y = torch.div(xq.abs() + (scale.int()[..., None] >> 1), scale.int()[..., None], rounding_mode="floor")
-    y = torch.where(xq < 0, -y, y).clamp(-128, 127).to(torch.int8)
-    return y, scale
+    return torch.where(xq < 0, -y, y).clamp(-128, 127).to(torch.int8)
 
 
 def new_acc():
@@ -120,7 +118,7 @@ def hf_logits(model, windows, cache_prompt, tokenizer):
 
 
 @torch.no_grad()
-def build_cache_kv(hf_model, tokenizer, cache_prompt, layers, use_r2):
+def build_cache_kv(hf_model, tokenizer, cache_prompt, layer_weights, use_r2):
     cache_ids = torch.tensor(tokenizer(cache_prompt, add_special_tokens=False).input_ids, device="cuda", dtype=torch.long)
     past = hf_model(cache_ids[None, :], use_cache=True).past_key_values
     if hasattr(past, "layers"):
@@ -130,12 +128,14 @@ def build_cache_kv(hf_model, tokenizer, cache_prompt, layers, use_r2):
     r2 = random_hadamard_rotation(QWEN3_0_6B.head_dim, ROTATE_SEED + 1, "cuda") if use_r2 else None
     r3 = random_hadamard_rotation(QWEN3_0_6B.head_dim, ROTATE_SEED + 2, "cuda")
     cache_kv = []
-    for k, v in past[:layers]:
+    for weights, (k, v) in zip(layer_weights, past[: len(layer_weights)]):
         k = (k[0].float().contiguous().to(torch.float64) @ r3.to(torch.float64)).to(torch.float32)
         v = v[0].float().contiguous()
         if r2 is not None:
             v = (v.to(torch.float64) @ r2.to(torch.float64)).to(torch.float32)
-        cache_kv.append((quant_i8_q15_16(k), quant_i8_q15_16(v)))
+        kq = quant_i8_static_q15_16(k, weights.k_post_rope_i8_scale[:, None])
+        vq = quant_i8_static_q15_16(v, weights.v_i8_scale[:, None])
+        cache_kv.append((kq, vq))
     return cache_kv, int(cache_ids.numel())
 
 
@@ -173,7 +173,8 @@ def main():
         print_metrics("hf", finish_metrics(acc), "none")
         return
 
-    cache_kv, cache_len = build_cache_kv(hf_model, tokenizer, args.cache_prompt, args.layers, args.use_r2 or packed_use_r2(args.packed_dir))
+    _, _, _, packed_layers = load_packed_qwen3(args.packed_dir, QWEN3_0_6B)
+    cache_kv, cache_len = build_cache_kv(hf_model, tokenizer, args.cache_prompt, packed_layers[: args.layers], args.use_r2 or packed_use_r2(args.packed_dir))
     int_model = Qwen3IntOnlyModel(windows.shape[1] - 1, model_dir=args.model_dir, packed_dir=args.packed_dir, cache_len=cache_len)
     golden = hf_logits(hf_model, windows, args.cache_prompt, tokenizer) if args.compare_backend == "hf" else None
     acc = new_acc()
