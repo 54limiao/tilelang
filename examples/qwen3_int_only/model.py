@@ -10,12 +10,9 @@ from examples.qwen3_int_only.kernels import (
     add_rmsnorm_static_quant_q15_16_weighted,
     attention_i8v8_q15_16_gqa_cache_fused_static_current,
     compile_kernel,
-    exp_lut_neg,
     linear_static_int8_q15_16,
     linear_static_int16_q15_16,
     rope_rotate_static_quant_q15_16_attn_hadamard_approx,
-    rsqrt_lut,
-    sigmoid_lut,
     silu_mul_static_quant_q15_16_i16_fast,
     static_quant_q15_16_per_head_attn_noscale,
 )
@@ -34,6 +31,7 @@ from examples.qwen3_int_only.utils import (
     rmsnorm_torch,
     rope_tables_q15_16,
 )
+from examples.qwen3_int_only.utils.lut import exp_lut_neg, rsqrt_lut, sigmoid_lut
 
 class Qwen3IntOnlyBlock:
     def __init__(self, seq_len, config=QWEN3_0_6B, cache_len=0):
