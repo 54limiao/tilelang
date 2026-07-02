@@ -8,11 +8,7 @@ import torch
 from safetensors import safe_open
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from examples.qwen3_int_only.model import (
-    Q15_16,
-    QWEN3_0_6B,
-    Qwen3IntOnlyModel,
-)
+from examples.qwen3_int_only.model import Q15_16, QWEN3_0_6B, Qwen3IntOnlyModel
 from examples.qwen3_int_only.utils import ROTATE_SEED, random_hadamard_rotation
 
 
@@ -25,12 +21,9 @@ DATASETS = {
 }
 
 
-def packed_flags(packed_dir):
-    if packed_dir is None:
-        return False, False
+def packed_use_r2(packed_dir):
     with safe_open(f"{packed_dir}/qwen3_int_only.safetensors", framework="pt", device="cpu") as f:
-        metadata = f.metadata() or {}
-    return metadata.get("use_r1") == "1", metadata.get("use_r2") == "1"
+        return (f.metadata() or {}).get("use_r2") == "1"
 
 
 def resolve_dataset(name):
@@ -60,22 +53,11 @@ def iter_texts(source, column):
 def load_ids(tokenizer, args, total_tokens, device):
     ids = []
     source = args.eval_parquet or args.eval_dataset or args.eval_text
-    column = args.eval_column
-    for text in iter_texts(source, column):
+    for text in iter_texts(source, args.eval_column):
         ids.extend(tokenizer(text, add_special_tokens=False).input_ids)
         if len(ids) >= total_tokens:
-            return torch.tensor(ids[:total_tokens], device=device, dtype=torch.long)
+            break
     return torch.tensor(ids[:total_tokens], device=device, dtype=torch.long)
-
-
-def eval_windows(tokenizer, args, device):
-    windows = args.batch_size * args.num_batches
-    window_tokens = args.max_tokens + 1
-    ids = load_ids(tokenizer, args, window_tokens * windows, device)
-    if ids.numel() < window_tokens:
-        return ids[None, :]
-    windows = min(windows, ids.numel() // window_tokens)
-    return ids[: window_tokens * windows].reshape(windows, window_tokens)
 
 
 def quant_i8_q15_16(x):
@@ -87,29 +69,18 @@ def quant_i8_q15_16(x):
 
 
 def new_acc():
-    return {
-        "loss_sum": 0.0,
-        "tokens": 0,
-        "dot": 0.0,
-        "got2": 0.0,
-        "ref2": 0.0,
-        "se": 0.0,
-        "ae": 0.0,
-        "max_abs": 0.0,
-        "logits": 0,
-    }
+    return {"loss_sum": 0.0, "tokens": 0, "dot": 0.0, "got2": 0.0, "ref2": 0.0, "se": 0.0, "ae": 0.0, "max_abs": 0.0, "logits": 0}
 
 
 def add_metrics(acc, logits, labels, golden=None):
     logits = logits.float()
     labels = labels.reshape(-1)
-    flat = logits.reshape(-1, logits.shape[-1])
-    loss_sum = torch.nn.functional.cross_entropy(flat, labels, reduction="sum")
+    loss_sum = torch.nn.functional.cross_entropy(logits.reshape(-1, logits.shape[-1]), labels, reduction="sum")
     acc["loss_sum"] += float(loss_sum)
     acc["tokens"] += int(labels.numel())
     if golden is not None:
-        ref = golden.float().reshape(-1)
         got = logits.reshape(-1)
+        ref = golden.float().reshape(-1)
         diff = got - ref
         acc["dot"] += float(torch.dot(got, ref))
         acc["got2"] += float(torch.dot(got, got))
@@ -124,66 +95,44 @@ def finish_metrics(acc):
     loss = acc["loss_sum"] / acc["tokens"]
     out = {"tokens": acc["tokens"], "loss": loss, "ppl": math.exp(loss)}
     if acc["logits"]:
-        out["cos"] = acc["dot"] / math.sqrt(max(acc["got2"] * acc["ref2"], 1e-30))
-        out["mse"] = acc["se"] / acc["logits"]
-        out["mae"] = acc["ae"] / acc["logits"]
-        out["max_abs"] = acc["max_abs"]
-        out["rel_mse"] = acc["se"] / max(acc["ref2"], 1e-30)
+        out.update(
+            cos=acc["dot"] / math.sqrt(max(acc["got2"] * acc["ref2"], 1e-30)),
+            mse=acc["se"] / acc["logits"],
+            mae=acc["ae"] / acc["logits"],
+            max_abs=acc["max_abs"],
+            rel_mse=acc["se"] / max(acc["ref2"], 1e-30),
+        )
     return out
 
 
-def print_metrics(backend, metrics, compare_backend):
+def print_metrics(backend, metrics, compare_backend="hf"):
     msg = f"backend={backend} tokens={metrics['tokens']} loss={metrics['loss']:.6f} ppl={metrics['ppl']:.6f}"
     if "cos" in metrics:
-        msg += (
-            f" compare={compare_backend} cos={metrics['cos']:.8f} mse={metrics['mse']:.8e}"
-            f" mae={metrics['mae']:.8e} max_abs={metrics['max_abs']:.8e} rel_mse={metrics['rel_mse']:.8e}"
-        )
+        msg += f" compare={compare_backend} cos={metrics['cos']:.8f} mse={metrics['mse']:.8e} mae={metrics['mae']:.8e} max_abs={metrics['max_abs']:.8e} rel_mse={metrics['rel_mse']:.8e}"
     print(msg)
-
-
-def parse_layer_sweep(value, default_layers):
-    if not value:
-        return [default_layers]
-    if value == "all":
-        return list(range(1, default_layers + 1))
-    layers = []
-    for item in value.split(","):
-        item = item.strip()
-        if not item:
-            continue
-        layers.append(default_layers if item == "full" else int(item))
-    return layers
 
 
 @torch.no_grad()
 def hf_logits(model, windows, cache_prompt, tokenizer):
-    if cache_prompt:
-        prefix = torch.tensor(tokenizer(cache_prompt, add_special_tokens=False).input_ids, device=windows.device, dtype=torch.long)
-        prefix = prefix[None, :].expand(windows.shape[0], prefix.numel())
-        full = torch.cat((prefix, windows), dim=1)
-        return model(full[:, :-1]).logits.float()[:, prefix.shape[1] :]
-    return model(windows[:, :-1]).logits.float()
+    prefix = torch.tensor(tokenizer(cache_prompt, add_special_tokens=False).input_ids, device=windows.device, dtype=torch.long)
+    full = torch.cat((prefix[None, :].expand(windows.shape[0], prefix.numel()), windows), dim=1)
+    return model(full[:, :-1]).logits.float()[:, prefix.numel() :]
 
 
 @torch.no_grad()
 def build_cache_kv(hf_model, tokenizer, cache_prompt, layers, use_r2):
-    if not cache_prompt:
-        return None, 0
     cache_ids = torch.tensor(tokenizer(cache_prompt, add_special_tokens=False).input_ids, device="cuda", dtype=torch.long)
     past = hf_model(cache_ids[None, :], use_cache=True).past_key_values
     if hasattr(past, "layers"):
         past = [(layer.keys, layer.values) for layer in past.layers]
     elif hasattr(past, "to_legacy_cache"):
         past = past.to_legacy_cache()
-    n_layers = QWEN3_0_6B.num_hidden_layers if layers is None else layers
     r2 = random_hadamard_rotation(QWEN3_0_6B.head_dim, ROTATE_SEED + 1, "cuda") if use_r2 else None
     r3 = random_hadamard_rotation(QWEN3_0_6B.head_dim, ROTATE_SEED + 2, "cuda")
     cache_kv = []
-    for k, v in past[:n_layers]:
-        k = k[0].float().contiguous()
+    for k, v in past[:layers]:
+        k = (k[0].float().contiguous().to(torch.float64) @ r3.to(torch.float64)).to(torch.float32)
         v = v[0].float().contiguous()
-        k = (k.to(torch.float64) @ r3.to(torch.float64)).to(torch.float32)
         if r2 is not None:
             v = (v.to(torch.float64) @ r2.to(torch.float64)).to(torch.float32)
         cache_kv.append((quant_i8_q15_16(k), quant_i8_q15_16(v)))
@@ -191,66 +140,6 @@ def build_cache_kv(hf_model, tokenizer, cache_prompt, layers, use_r2):
 
 
 @torch.no_grad()
-def prepare_eval(args):
-    tokenizer = AutoTokenizer.from_pretrained(args.model_dir, local_files_only=True, trust_remote_code=True)
-    windows = eval_windows(tokenizer, args, "cuda")
-    seq_len = windows.shape[1] - 1
-    layer_sweep = parse_layer_sweep(args.layer_sweep, QWEN3_0_6B.num_hidden_layers if args.layers is None else args.layers)
-    need_hf = args.backend == "hf" or args.compare_backend == "hf" or (args.backend == "int-only" and args.cache_prompt)
-    hf_model = None
-    if need_hf:
-        hf_model = AutoModelForCausalLM.from_pretrained(
-            args.model_dir, local_files_only=True, trust_remote_code=True, dtype=torch.bfloat16
-        ).to("cuda")
-
-    cache_kv, cache_len = None, 0
-    if args.backend == "int-only":
-        _packed_r1, packed_r2 = packed_flags(args.packed_dir)
-        cache_kv, cache_len = build_cache_kv(
-            hf_model, tokenizer, args.cache_prompt, max(layer_sweep), args.use_r2 or packed_r2
-        )
-        int_model = Qwen3IntOnlyModel(
-            seq_len,
-            model_dir=args.model_dir,
-            packed_dir=args.packed_dir,
-            cache_len=cache_len,
-        )
-    else:
-        int_model = None
-    return tokenizer, windows, hf_model, int_model, cache_kv, layer_sweep
-
-
-@torch.no_grad()
-def run_eval(args, tokenizer, windows, hf_model, int_model, cache_kv, layers):
-    acc = new_acc()
-    window_rows = []
-    for start in range(0, windows.shape[0], args.batch_size):
-        batch = windows[start : start + args.batch_size]
-        golden = None
-        if args.compare_backend == "hf":
-            golden = hf_logits(hf_model, batch, args.cache_prompt, tokenizer)
-
-        if args.backend == "hf":
-            logits = hf_logits(hf_model, batch, args.cache_prompt, tokenizer)
-            add_metrics(acc, logits, batch[:, 1:], golden)
-            if args.jsonl_windows:
-                for idx in range(batch.shape[0]):
-                    wacc = new_acc()
-                    ref = None if golden is None else golden[idx]
-                    add_metrics(wacc, logits[idx], batch[idx, 1:], ref)
-                    window_rows.append((start + idx, finish_metrics(wacc)))
-        else:
-            for idx, row in enumerate(batch):
-                logits = int_model.logits(row[:-1], layers=layers, verbose=args.verbose, cache_kv=cache_kv).float()
-                ref = None if golden is None else golden[idx]
-                add_metrics(acc, logits, row[1:], ref)
-                if args.jsonl_windows:
-                    wacc = new_acc()
-                    add_metrics(wacc, logits, row[1:], ref)
-                    window_rows.append((start + idx, finish_metrics(wacc)))
-    return finish_metrics(acc), window_rows
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-dir", default=DEFAULT_MODEL_DIR)
@@ -264,48 +153,34 @@ def main():
     parser.add_argument("--eval-dataset", default="fineweb")
     parser.add_argument("--eval-parquet", default="")
     parser.add_argument("--eval-column", default="text")
-    parser.add_argument("--layers", type=int)
-    parser.add_argument("--layer-sweep", default="")
-    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--layers", type=int, default=QWEN3_0_6B.num_hidden_layers)
     parser.add_argument("--cache-prompt", default="你是一个有用而无害的聊天助手。")
     parser.add_argument("--use-r1", action="store_true")
     parser.add_argument("--use-r2", action="store_true")
-    parser.add_argument("--jsonl-out", default="")
-    parser.add_argument("--jsonl-windows", action="store_true")
     args = parser.parse_args()
-    tokenizer, windows, hf_model, int_model, cache_kv, layer_sweep = prepare_eval(args)
-    for layers in layer_sweep:
-        metrics, window_rows = run_eval(args, tokenizer, windows, hf_model, int_model, cache_kv, layers)
-        if args.layer_sweep:
-            print(f"layers={layers} ", end="")
-        print_metrics(args.backend, metrics, args.compare_backend)
-        if args.jsonl_out:
-            common = {
-                "backend": args.backend,
-                "compare_backend": args.compare_backend,
-                "layers": layers,
-                "max_tokens": args.max_tokens,
-                "batch_size": args.batch_size,
-                "num_batches": args.num_batches,
-                "eval_dataset": args.eval_dataset,
-                "eval_parquet": args.eval_parquet,
-                "eval_text": args.eval_text,
-                "eval_column": args.eval_column,
-                "use_r1": args.use_r1,
-                "use_r2": args.use_r2,
-                "use_r3": True,
-                "fused_static": True,
-                "static_mlp": True,
-            }
-            row = {
-                "kind": "summary",
-                **common,
-                **metrics,
-            }
-            with open(args.jsonl_out, "a", encoding="utf-8") as f:
-                f.write(json.dumps(row, sort_keys=True) + "\n")
-                for window, values in window_rows:
-                    f.write(json.dumps({"kind": "window", "window": window, **common, **values}, sort_keys=True) + "\n")
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model_dir, local_files_only=True, trust_remote_code=True)
+    window_tokens = args.max_tokens + 1
+    ids = load_ids(tokenizer, args, window_tokens * args.batch_size * args.num_batches, "cuda")
+    windows = ids[: (ids.numel() // window_tokens) * window_tokens].reshape(-1, window_tokens)
+    windows = windows[: args.batch_size * args.num_batches]
+    hf_model = AutoModelForCausalLM.from_pretrained(args.model_dir, local_files_only=True, trust_remote_code=True, dtype=torch.bfloat16).to("cuda")
+
+    if args.backend == "hf":
+        acc = new_acc()
+        logits = hf_logits(hf_model, windows, args.cache_prompt, tokenizer)
+        add_metrics(acc, logits, windows[:, 1:])
+        print_metrics("hf", finish_metrics(acc), "none")
+        return
+
+    cache_kv, cache_len = build_cache_kv(hf_model, tokenizer, args.cache_prompt, args.layers, args.use_r2 or packed_use_r2(args.packed_dir))
+    int_model = Qwen3IntOnlyModel(windows.shape[1] - 1, model_dir=args.model_dir, packed_dir=args.packed_dir, cache_len=cache_len)
+    golden = hf_logits(hf_model, windows, args.cache_prompt, tokenizer) if args.compare_backend == "hf" else None
+    acc = new_acc()
+    for idx, row in enumerate(windows):
+        logits = int_model.logits(row[:-1], layers=args.layers, cache_kv=cache_kv).float()
+        add_metrics(acc, logits, row[1:], None if golden is None else golden[idx])
+    print_metrics("int-only", finish_metrics(acc), args.compare_backend)
 
 
 if __name__ == "__main__":

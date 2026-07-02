@@ -6,12 +6,11 @@ import tilelang.language as T
 from tilelang.language.fix import Q_MULTIPLIER_WIDTH
 
 MASK = (1 << Q_MULTIPLIER_WIDTH) - 1
-Q15_16 = 1 << 16
 ATTN_VALUE_SHIFT = 7
 I32_MIN = -2147483648
 
 
-def static_quant_q15_16_per_head_attn_noscale(tokens, heads, head_dim, out_dtype="int8", qmax_override=None):
+def quant_v_i8(tokens, heads, head_dim, out_dtype="int8", qmax_override=None):
     qmax = 127 if out_dtype == "int8" else 32767
     if qmax_override is not None:
         qmax = qmax_override
@@ -39,7 +38,7 @@ def static_quant_q15_16_per_head_attn_noscale(tokens, heads, head_dim, out_dtype
     return main
 
 
-def add_rmsnorm_q15_16_weighted(rows, cols, qmax=32767):
+def rms_q15(rows, cols, qmax=32767):
     mean_shift = int(math.log2(cols))
 
     @T.prim_func
@@ -116,7 +115,7 @@ def _warp_hadamard_i32(local, buf, thread_elem, warp_size, rounds):
             local[j] = T.if_then_else(sign == 0, local[j] + buf[j], buf[j] - local[j])
 
 
-def rope_rotate_static_quant_q15_16_attn_hadamard_approx(seq_len, heads, dim, qmax=127):
+def rope_sq8(seq_len, heads, dim, qmax=127):
     thread_elem = 8
     threads = 16
     thread_round = 3
@@ -176,7 +175,7 @@ def rope_rotate_static_quant_q15_16_attn_hadamard_approx(seq_len, heads, dim, qm
     return main
 
 
-def add_rmsnorm_static_quant_q15_16_weighted(rows, cols, qmax=127):
+def rms_sq8(rows, cols, qmax=127):
     mean_shift = int(math.log2(cols))
 
     @T.prim_func
@@ -255,7 +254,7 @@ def add_rmsnorm_static_quant_q15_16_weighted(rows, cols, qmax=127):
     return main
 
 
-def silu_mul_static_quant_q15_16_i16_fast(rows, cols):
+def silu_i16(rows, cols):
     @T.prim_func
     def main(
         Gate: T.Tensor((rows, cols), "int32"),
@@ -285,7 +284,7 @@ def silu_mul_static_quant_q15_16_i16_fast(rows, cols):
     return main
 
 
-def linear_static_int8_q15_16(rows, in_features, out_features, block_m=16, block_n=32, block_k=64):
+def linear_i8(rows, in_features, out_features, block_m=16, block_n=32, block_k=64):
     @T.prim_func
     def main(
         X: T.Tensor((rows, in_features), "int8"),
@@ -313,7 +312,7 @@ def linear_static_int8_q15_16(rows, in_features, out_features, block_m=16, block
     return main
 
 
-def linear_static_int16_q15_16(rows, in_features, out_features, block_m=16, block_n=32, block_k=64):
+def linear_i16(rows, in_features, out_features, block_m=16, block_n=32, block_k=64):
     @T.prim_func
     def main(
         X: T.Tensor((rows, in_features), "int16"),
@@ -351,7 +350,7 @@ def linear_static_int16_q15_16(rows, in_features, out_features, block_m=16, bloc
     return main
 
 
-def attention_i8v8_q15_16_gqa_cache_fused_static_current(q_heads, kv_heads, seqlen, cache_len, dim, block_m=16, block_n=64, score_shift=26, lut_scale=0.125):
+def attention_i8(q_heads, kv_heads, seqlen, cache_len, dim, block_m=16, block_n=64, score_shift=26, lut_scale=0.125):
     group = q_heads // kv_heads
     kv_len = cache_len + seqlen
     q_size = q_heads * dim
@@ -473,7 +472,3 @@ def attention_i8v8_q15_16_gqa_cache_fused_static_current(q_heads, kv_heads, seql
                 O[row_base + m, h * dim + d] = T.cast(out[m, d], "int8")
 
     return main
-
-
-def compile_kernel(func, out_idx):
-    return tilelang.compile(func, out_idx=out_idx, target="cuda")
