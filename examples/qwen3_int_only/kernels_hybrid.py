@@ -149,11 +149,15 @@ def qk_norm_rope_quant_hybrid(seq_len, heads, dim):
 
 def silu_hadamard_quant_hybrid(rows, cols, block_dim=128):
     thread_elem = 8
-    threads = 16
+    lanes = 16
     thread_round = 3
     warp_round = 4
     groups = cols // block_dim
     inv_sqrt_block = 1.0 / math.sqrt(block_dim)
+    # Pack several independent 128-wide groups per block (16 lanes each). No
+    # cross-group reduction, so this matches the one-group-per-block version.
+    gpb = 8 if groups % 8 == 0 else (4 if groups % 4 == 0 else (2 if groups % 2 == 0 else 1))
+    threads = lanes * gpb
 
     @T.prim_func
     def main(
@@ -162,12 +166,15 @@ def silu_hadamard_quant_hybrid(rows, cols, block_dim=128):
         SCALE: T.Tensor((1,), "float32"),
         Q: T.Tensor((rows, cols), "int8"),
     ):
-        with T.Kernel(rows, groups, threads=threads) as (r, g):
+        with T.Kernel(rows, groups // gpb, threads=threads) as (r, gb):
             tx = T.get_thread_binding(0)
+            grp = tx // lanes
+            lane = tx - grp * lanes
+            g = gb * gpb + grp
             local = T.alloc_local((thread_elem,), "float32")
             other = T.alloc_local((thread_elem,), "float32")
             for i in T.serial(thread_elem):
-                c = g * T.int32(block_dim) + tx * T.int32(thread_elem) + i
+                c = g * T.int32(block_dim) + lane * T.int32(thread_elem) + i
                 gate = T.cast(Gate[r, c], "float32") / T.float32(Q15_16_F)
                 up = T.cast(Up[r, c], "float32") / T.float32(Q15_16_F)
                 sig = T.sigmoid(gate)
@@ -186,9 +193,9 @@ def silu_hadamard_quant_hybrid(rows, cols, block_dim=128):
                         b = local[chunkbase + k + chunksize // 2]
                         local[chunkbase + k] = a + b
                         local[chunkbase + k + chunksize // 2] = local[chunkbase + k] - T.float32(2.0) * b
-            _warp_hadamard_f32(local, other, thread_elem, threads, warp_round)
+            _warp_hadamard_f32(local, other, thread_elem, lanes, warp_round)
             for i in T.serial(thread_elem):
-                Q[r, g * T.int32(block_dim) + tx * T.int32(thread_elem) + i] = _quant_i8_f32(local[i] * T.float32(inv_sqrt_block), SCALE[0])
+                Q[r, g * T.int32(block_dim) + lane * T.int32(thread_elem) + i] = _quant_i8_f32(local[i] * T.float32(inv_sqrt_block), SCALE[0])
 
     return main
 

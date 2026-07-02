@@ -325,10 +325,15 @@ def rms_sq8(rows, cols, qmax=127):
 
 def silu_hadamard_i8(rows, cols, block_dim=128):
     thread_elem = 8
-    threads = 16
+    lanes = 16
     thread_round = 3
     warp_round = 4
     groups = cols // block_dim
+    # Pack several independent 128-wide groups into one block (each uses a 16-lane
+    # sub-group) to raise occupancy. There is no cross-group reduction here, so this
+    # is numerically identical to the one-group-per-block version.
+    gpb = 8 if groups % 8 == 0 else (4 if groups % 4 == 0 else (2 if groups % 2 == 0 else 1))
+    threads = lanes * gpb
 
     @T.prim_func
     def main(
@@ -339,15 +344,19 @@ def silu_hadamard_i8(rows, cols, block_dim=128):
         Q: T.Tensor((rows, cols), "int8"),
         S: T.Tensor((rows,), "uint32"),
     ):
-        with T.Kernel(rows, groups, threads=threads) as (r, g):
+        with T.Kernel(rows, groups // gpb, threads=threads) as (r, gb):
             tx = T.get_thread_binding(0)
+            grp = tx // lanes
+            lane = tx - grp * lanes
+            g = gb * gpb + grp
             local = T.alloc_local((thread_elem,), "int32")
             other = T.alloc_local((thread_elem,), "int32")
             qt = T.alloc_local((1,), "uint32")
             qt[0] = QT[0]
-            S[r] = QT[0]
+            if tx == 0:
+                S[r] = QT[0]
             for i in T.serial(thread_elem):
-                c = g * T.int32(block_dim) + tx * T.int32(thread_elem) + i
+                c = g * T.int32(block_dim) + lane * T.int32(thread_elem) + i
                 sig = T.fix.lut_10bit(Gate[r, c], LUT, scale=SCALE_INV_1024, out_dtype="int32")
                 local[i] = ((((Gate[r, c] * sig) >> T.int32(10)) >> T.int32(8)) * (Up[r, c] >> T.int32(8)))
                 local[i] = T.if_then_else(
@@ -369,9 +378,9 @@ def silu_hadamard_i8(rows, cols, block_dim=128):
                         b = local[chunkbase + k + chunksize // 2]
                         local[chunkbase + k] = a + b
                         local[chunkbase + k + chunksize // 2] = local[chunkbase + k] - T.int32(2) * b
-            _warp_hadamard_i32(local, other, thread_elem, threads, warp_round)
+            _warp_hadamard_i32(local, other, thread_elem, lanes, warp_round)
             for i in T.serial(thread_elem):
-                Q[r, g * T.int32(block_dim) + tx * T.int32(thread_elem) + i] = T.fix.quant(local[i], scale=qt[0], out_dtype="int8")
+                Q[r, g * T.int32(block_dim) + lane * T.int32(thread_elem) + i] = T.fix.quant(local[i], scale=qt[0], out_dtype="int8")
 
     return main
 
