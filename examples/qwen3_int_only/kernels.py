@@ -855,14 +855,13 @@ def linear_static_int8_q15_16(rows, in_features, out_features, block_m=16, block
     return main
 
 
-def linear_static_int16_residual_q15_16(rows, in_features, out_features, block_m=16, block_n=32, block_k=64):
+def linear_static_int16_q15_16(rows, in_features, out_features, block_m=16, block_n=32, block_k=64):
     @T.prim_func
     def main(
         X: T.Tensor((rows, in_features), "int16"),
         XS: T.Tensor((1,), "uint32"),
         W: T.Tensor((out_features, in_features), "int8"),
         WS: T.Tensor((out_features,), "uint32"),
-        RES: T.Tensor((rows, out_features), "int32"),
         Y: T.Tensor((rows, out_features), "int32"),
     ):
         with T.Kernel(T.ceildiv(out_features, block_n), T.ceildiv(rows, block_m), threads=128) as (bo, br):
@@ -885,12 +884,10 @@ def linear_static_int16_residual_q15_16(rows, in_features, out_features, block_m
                 T.gemm(x_mid, w_shared, acc_mid, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
 
             for m, n in T.Parallel(block_m, block_n):
-                Y[br * block_m + m, bo * block_n + n] = RES[br * block_m + m, bo * block_n + n] + (
-                    T.cast(
-                        (T.cast(acc_hi[m, n] + (acc_mid[m, n] >> T.int32(7)), "int64") * T.cast(XS[0], "int64") * T.cast(WS[bo * block_n + n], "int64"))
-                        >> T.int32(8),
-                        "int32",
-                    )
+                Y[br * block_m + m, bo * block_n + n] = T.cast(
+                    (T.cast(acc_hi[m, n] + (acc_mid[m, n] >> T.int32(7)), "int64") * T.cast(XS[0], "int64") * T.cast(WS[bo * block_n + n], "int64"))
+                    >> T.int32(8),
+                    "int32",
                 )
 
     return main

@@ -26,7 +26,7 @@ def op_counts(seq_len, cfg, cache_len=0):
         "qkv_proj_i8": 2 * seq_len * cfg.hidden_size * (cfg.q_size + 2 * cfg.kv_size),
         "o_proj_i8_static": 2 * seq_len * cfg.q_size * cfg.hidden_size,
         "gate_up_proj_static": 2 * seq_len * cfg.hidden_size * (2 * cfg.intermediate_size),
-        "down_residual_static": 2 * seq_len * cfg.intermediate_size * cfg.hidden_size,
+        "down_proj_static": 2 * seq_len * cfg.intermediate_size * cfg.hidden_size,
         "attention_i8v8_fused_static": qk_ops + pv_ops,
         "attention_cache_i8v8_fused_static": qk_ops + pv_ops,
     }
@@ -117,7 +117,8 @@ def run_block(block, x, weights, cos, sin, r3_q15, prof, cache_k=None, cache_v=N
     gate, up = prof.time("gate_up_proj_static", lambda: block.gate_up_proj_static(h8, hs8, weights.gate_proj.weight, weights.gate_proj.scale, weights.up_proj.weight, weights.up_proj.scale))
     gated, _gs = prof.time("silu_mul_sq16_mid_fast", lambda: block.silu_mul_sq16_mid_fast(gate, up, block.lut_sigmoid, weights.gated_mlp_i16_scale))
     gs = weights.gated_mlp_i16_scale
-    return prof.time("down_residual_static", lambda: block.down_residual_static(gated, gs, weights.down_proj.weight, weights.down_proj.scale, h))
+    mlp = prof.time("down_proj_static", lambda: block.down_proj_static(gated, gs, weights.down_proj.weight, weights.down_proj.scale))
+    return prof.time("add_mlp_residual", lambda: block.add_hidden(h, mlp))
 
 
 def main():

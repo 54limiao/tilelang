@@ -16,7 +16,7 @@ from examples.qwen3_int_only.kernels import (
     linear_dynamic_int8_qkv_q15_16,
     linear_static_int8_q15_16,
     linear_static_int8_pair_q15_16,
-    linear_static_int16_residual_q15_16,
+    linear_static_int16_q15_16,
     rmsnorm_dynamic_quant_q15_16_weighted_fast,
     rmsnorm_q15_16_grouped_weighted_rowwise,
     rmsnorm_q15_16_weighted,
@@ -79,7 +79,7 @@ class Qwen3IntOnlyBlock:
         self.sq8_hidden = compile_kernel(static_quant_q15_16(seq_len, h, "int8"), [2, 3])
         self.gate_up_proj_static = compile_kernel(linear_static_int8_pair_q15_16(seq_len, h, im, 64, 128, 64), [6, 7])
         self.silu_mul_sq16_mid_fast = compile_kernel(silu_mul_static_quant_q15_16_i16_fast(seq_len, im), [4, 5])
-        self.down_residual_static = compile_kernel(linear_static_int16_residual_q15_16(seq_len, im, h, 64, 64, 64), [5])
+        self.down_proj_static = compile_kernel(linear_static_int16_q15_16(seq_len, im, h, 64, 64, 64), [4])
         self.rope_q = compile_kernel(rope_rotate_q15_16_heads(seq_len, qh, hd), [4]) if use_r3 else compile_kernel(rope_q15_16_heads(seq_len, qh, hd), [3])
         self.rope_k = compile_kernel(rope_rotate_q15_16_heads(seq_len, kvh, hd), [4]) if use_r3 else compile_kernel(rope_q15_16_heads(seq_len, kvh, hd), [3])
         self.add_hidden = compile_kernel(add_q15_16(seq_len, h), [2])
@@ -158,15 +158,15 @@ class Qwen3IntOnlyBlock:
         gated8, _gs8 = self.silu_mul_sq16_mid_fast(gate, up, self.lut_sigmoid, weights.gated_mlp_i16_scale)
         gs8 = weights.gated_mlp_i16_scale
         if collect:
-            zero = torch.zeros_like(h)
-            mlp_q15 = self.down_residual_static(gated8, gs8, weights.down_proj.weight, weights.down_proj.scale, zero)
+            mlp_q15 = self.down_proj_static(gated8, gs8, weights.down_proj.weight, weights.down_proj.scale)
             gated = gated8.float() * gs8.float()[0] / Q15_16
             mlp = mlp_q15.float() / Q15_16
             layer_out = self.add_hidden(h, mlp_q15)
         else:
             gated = None
             mlp = None
-            layer_out = self.down_residual_static(gated8, gs8, weights.down_proj.weight, weights.down_proj.scale, h)
+            mlp_q15 = self.down_proj_static(gated8, gs8, weights.down_proj.weight, weights.down_proj.scale)
+            layer_out = self.add_hidden(h, mlp_q15)
         if not collect:
             return layer_out
         q_trace = qr.reshape(self.seq_len, self.config.num_attention_heads, self.config.head_dim).reshape(self.seq_len, self.config.q_size)
@@ -198,10 +198,10 @@ class Qwen3IntOnlyBlock:
             "post_s8": hs8,
             "gate": gate.float() / Q15_16,
             "up": up.float() / Q15_16,
-            "gated": gated.float() / Q15_16,
+            "gated": gated,
             "gated8": gated8,
             "gated_s8": gs8,
-            "mlp": mlp.float() / Q15_16,
+            "mlp": mlp,
             "layer_out": layer_out.float() / Q15_16,
             "layer_out_q15": layer_out,
         }

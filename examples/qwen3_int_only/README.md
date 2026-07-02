@@ -26,21 +26,22 @@ Kernel profile for the int-only LLM block path: 2048 tokens, 28 layers, prefix K
 
 | kernel | avg ms | total ms | pct | TOPS |
 | --- | ---: | ---: | ---: | ---: |
-| attention_cache_i8v8_fused_static | 1.021 | 85.775 | 49.89 | 33.85 |
-| down_residual_static | 0.196 | 16.465 | 9.58 | 65.74 |
-| qkv_proj_i8 | 0.146 | 12.265 | 7.13 | 117.66 |
-| gate_up_proj_static | 0.139 | 11.702 | 6.81 | 184.99 |
-| rope_sq8_q_attn_hadamard | 0.092 | 7.770 | 4.52 | - |
-| rms_q_q15 | 0.070 | 5.852 | 3.40 | - |
-| o_proj_i8_static | 0.066 | 5.571 | 3.24 | 129.51 |
-| silu_mul_sq16_mid_fast | 0.065 | 5.420 | 3.15 | - |
-| rope_sq8_k_attn_hadamard | 0.057 | 4.751 | 2.76 | - |
-| rms_k_q15 | 0.045 | 3.795 | 2.21 | - |
-| rms_input_dq8_fast | 0.041 | 3.434 | 2.00 | - |
-| sq8_v_attn_noscale | 0.039 | 3.246 | 1.89 | - |
-| residual_attn_rms_q15 | 0.038 | 3.196 | 1.86 | - |
-| sq8_hidden_static | 0.032 | 2.674 | 1.56 | - |
-| total | 2.047 | 171.915 | 100.00 | 48.37 |
+| attention_cache_i8v8_fused_static | 1.079 | 90.626 | 49.43 | 32.00 |
+| down_proj_static | 0.200 | 16.841 | 9.18 | 64.27 |
+| qkv_proj_i8 | 0.152 | 12.774 | 6.97 | 112.97 |
+| gate_up_proj_static | 0.147 | 12.345 | 6.73 | 175.35 |
+| rope_sq8_q_attn_hadamard | 0.096 | 8.072 | 4.40 | - |
+| rms_q_q15 | 0.072 | 6.080 | 3.32 | - |
+| o_proj_i8_static | 0.070 | 5.892 | 3.21 | 122.46 |
+| silu_mul_sq16_mid_fast | 0.067 | 5.610 | 3.06 | - |
+| rope_sq8_k_attn_hadamard | 0.060 | 5.010 | 2.73 | - |
+| rms_k_q15 | 0.047 | 3.988 | 2.18 | - |
+| residual_attn_rms_q15 | 0.043 | 3.599 | 1.96 | - |
+| rms_input_dq8_fast | 0.043 | 3.584 | 1.95 | - |
+| sq8_v_attn_noscale | 0.041 | 3.479 | 1.90 | - |
+| sq8_hidden_static | 0.034 | 2.856 | 1.56 | - |
+| add_mlp_residual | 0.031 | 2.603 | 1.42 | - |
+| total | 2.183 | 183.359 | 100.00 | 45.33 |
 
 The first run writes `qwen3_int_only.safetensors` and `timestamp`; later runs skip packing when the pack matches the current static schema. Use `FORCE_PACK=1 examples/qwen3_int_only/test_static_path.sh` to rebuild.
 
