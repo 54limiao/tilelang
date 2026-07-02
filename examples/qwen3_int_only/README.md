@@ -108,7 +108,7 @@ Attention is the main difference between the two backends. `int-only` keeps onli
 
 The hybrid backend is intended for hardware where tensorcore/NPU handles the GEMM-heavy work and a DSP can cheaply handle scalar fp32/fp16-style operations. Hybrid kernels do not use `T.fix`; int-only kernels keep the fixed-point path for the pure integer target.
 
-Quality is reported against HF bf16 logits with PPL, cosine, MSE, MAE, max_abs, and rel_mse. `fake-quant` uses the same packed int8 weights and static activation scales but performs QDQ math in torch float, giving the current quantization ceiling before kernel arithmetic error.
+Quality is reported against HF bf16 logits with PPL, cosine, MSE. `fake-quant` uses the same packed int8 weights and static activation scales but performs QDQ math in torch float, giving the current quantization ceiling before kernel arithmetic error.
 
 ## Runtime Flow
 
@@ -116,23 +116,24 @@ Int-only keeps the whole block in fixed-point integer form. The block order is R
 
 ```mermaid
 flowchart TD
-  A[Q15.16 residual int32] --> B[Residual RMSNorm\nT.fix rsqrt LUT]
-  B --> C[input_qkv int8 quant]:::quant
-  C --> D[QKV int8 x int8 GEMM]
-  D --> E[Q/K RMSNorm + RoPE + R3\nT.fix, int8 output]:::quant
-  D --> F[V int8 quant]:::quant
-  F --> G[V cache/current int8]
-  E --> H[QK int8 x int8 GEMM]
-  H --> I[Online softmax -> P int16\nT.fix.lut_10bit]
-  G --> K[PV integer GEMM\nP int16 x V int8]
+  A["Q15.16 residual int32"] --> B["Residual RMSNorm<br/>T.fix rsqrt LUT"]
+  B --> C["input_qkv int8 quant"]
+  C --> D["QKV int8 x int8 GEMM"]
+  D --> E["QK RMSNorm, RoPE, R3<br/>T.fix int8 output"]
+  D --> F["V int8 quant"]
+  F --> G["V cache and current int8"]
+  E --> H["QK int8 x int8 GEMM"]
+  H --> I["Online softmax to P int16<br/>T.fix.lut_10bit"]
+  G --> K["PV integer GEMM<br/>P int16 x V int8"]
   I --> K
-  K --> L[attention int8 quant]:::quant
-  L --> M[O int8 x int8 GEMM]
-  M --> N[Residual RMSNorm + MLP int8 quant\nT.fix rsqrt LUT]:::quant
-  N --> O[Gate/Up int8 x int8 GEMM]
-  O --> P[SiLU LUT + R4 Hadamard\nint8 quant]:::quant
-  P --> Q[Down int8 x int8 GEMM]
-  Q --> R[next Q15.16 residual int32]
+  K --> L["attention int8 quant"]
+  L --> M["O int8 x int8 GEMM"]
+  M --> N["Residual RMSNorm and MLP int8 quant<br/>T.fix rsqrt LUT"]
+  N --> O["Gate Up int8 x int8 GEMM"]
+  O --> P["SiLU LUT and R4 Hadamard<br/>int8 quant"]
+  P --> Q["Down int8 x int8 GEMM"]
+  Q --> R["next Q15.16 residual int32"]
+  class C,E,F,L,N,P quant;
   classDef quant fill:#fff3cd,stroke:#d39e00,stroke-width:2px,color:#24292f;
 ```
 
@@ -140,22 +141,23 @@ Hybrid uses the same integer GEMM dataflow but moves scalar-heavy work to TileLa
 
 ```mermaid
 flowchart TD
-  A[fp32 residual] --> B[RMSNorm + input int8 quant\nfp32 residual + Q15.16 linear]:::quant
-  B --> C[QKV int8 x int8 GEMM]
-  C --> D[Q/K RMSNorm + RoPE + R3\nTileLang fp32, int8 output]:::quant
-  C --> E[V int8 quant]:::quant
-  E --> F[V cache/current int8]
-  D --> G[QK int8 x int8 GEMM]
-  G --> H[Single-pass online softmax -> P int16\nTileLang fp32 state]
-  F --> J[PV integer GEMM\nP int16 x V int8]
+  A["fp32 residual"] --> B["RMSNorm and input int8 quant<br/>fp32 residual plus Q15.16 linear"]
+  B --> C["QKV int8 x int8 GEMM"]
+  C --> D["QK RMSNorm, RoPE, R3<br/>TileLang fp32 int8 output"]
+  C --> E["V int8 quant"]
+  E --> F["V cache and current int8"]
+  D --> G["QK int8 x int8 GEMM"]
+  G --> H["Single-pass online softmax to P int16<br/>TileLang fp32 state"]
+  F --> J["PV integer GEMM<br/>P int16 x V int8"]
   H --> J
-  J --> K[attention int8 quant\nTileLang fp32 scale]:::quant
-  K --> L[O int8 x int8 GEMM]
-  L --> M[RMSNorm + MLP int8 quant\nfp32 residual + Q15.16 O output]:::quant
-  M --> N[Gate/Up int8 x int8 GEMM]
-  N --> O[SiLU + R4 Hadamard + int8 quant\nTileLang fp32]:::quant
-  O --> P[Down int8 x int8 GEMM]
-  P --> Q[next fp32 residual path]
+  J --> K["attention int8 quant<br/>TileLang fp32 scale"]
+  K --> L["O int8 x int8 GEMM"]
+  L --> M["RMSNorm and MLP int8 quant<br/>fp32 residual plus Q15.16 O output"]
+  M --> N["Gate Up int8 x int8 GEMM"]
+  N --> O["SiLU, R4 Hadamard, int8 quant<br/>TileLang fp32"]
+  O --> P["Down int8 x int8 GEMM"]
+  P --> Q["next fp32 residual path"]
+  class B,D,E,K,M,O quant;
   classDef quant fill:#fff3cd,stroke:#d39e00,stroke-width:2px,color:#24292f;
 ```
 
