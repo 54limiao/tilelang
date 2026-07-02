@@ -74,9 +74,11 @@ class Qwen3BlockWeights:
     q_proj: Int8LinearWeight
     k_proj: Int8LinearWeight
     v_proj: Int8LinearWeight
+    qkv_proj: Int8LinearWeight
     o_proj: Int8LinearWeight
     gate_proj: Int8LinearWeight
     up_proj: Int8LinearWeight
+    gate_up_proj: Int8LinearWeight
     down_proj: Int8LinearWeight
     input_layernorm: torch.Tensor
     post_attention_layernorm: torch.Tensor
@@ -125,33 +127,26 @@ class Qwen3BlockWeights:
         if k_norm is None:
             k_norm = torch.ones(head_dim, device=device)
         return Qwen3BlockWeights(
-            Int8LinearWeight.pack(q_proj),
-            Int8LinearWeight.pack(k_proj),
-            Int8LinearWeight.pack(v_proj),
-            Int8LinearWeight.pack(o_proj),
-            Int8LinearWeight.pack(gate_proj),
-            Int8LinearWeight.pack(up_proj),
-            Int8LinearWeight.pack(down_proj),
-            q15_16(input_layernorm),
-            q15_16(post_attention_layernorm),
-            q15_16(q_norm),
-            q15_16(k_norm),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            q_proj,
-            k_proj,
-            v_proj,
-            o_proj,
-            gate_proj,
-            up_proj,
-            down_proj,
+            q_proj=Int8LinearWeight.pack(q_proj),
+            k_proj=Int8LinearWeight.pack(k_proj),
+            v_proj=Int8LinearWeight.pack(v_proj),
+            qkv_proj=Int8LinearWeight.pack(torch.cat((q_proj, k_proj, v_proj), dim=0)),
+            o_proj=Int8LinearWeight.pack(o_proj),
+            gate_proj=Int8LinearWeight.pack(gate_proj),
+            up_proj=Int8LinearWeight.pack(up_proj),
+            gate_up_proj=Int8LinearWeight.pack(torch.cat((gate_proj, up_proj), dim=0)),
+            down_proj=Int8LinearWeight.pack(down_proj),
+            input_layernorm=q15_16(input_layernorm),
+            post_attention_layernorm=q15_16(post_attention_layernorm),
+            q_norm=q15_16(q_norm),
+            k_norm=q15_16(k_norm),
+            q_proj_fp=q_proj,
+            k_proj_fp=k_proj,
+            v_proj_fp=v_proj,
+            o_proj_fp=o_proj,
+            gate_proj_fp=gate_proj,
+            up_proj_fp=up_proj,
+            down_proj_fp=down_proj,
         )
 
 
@@ -162,30 +157,43 @@ def load_packed_qwen3(packed_dir, config=QWEN3_0_6B, device="cuda"):
     def optional(name):
         return tensors[name] if name in tensors else None
 
+    def linear(name):
+        return Int8LinearWeight(tensors[f"{name}.weight"], tensors[f"{name}.scale"])
+
+    def cat_linear(prefix, names):
+        if f"{prefix}.weight" in tensors:
+            return linear(prefix)
+        return Int8LinearWeight(
+            torch.cat([tensors[f"{name}.weight"] for name in names], dim=0),
+            torch.cat([tensors[f"{name}.scale"] for name in names], dim=0),
+        )
+
     for layer_idx in range(config.num_hidden_layers):
         p = f"layers.{layer_idx}"
         blocks.append(
             Qwen3BlockWeights(
-                Int8LinearWeight(tensors[f"{p}.q_proj.weight"], tensors[f"{p}.q_proj.scale"]),
-                Int8LinearWeight(tensors[f"{p}.k_proj.weight"], tensors[f"{p}.k_proj.scale"]),
-                Int8LinearWeight(tensors[f"{p}.v_proj.weight"], tensors[f"{p}.v_proj.scale"]),
-                Int8LinearWeight(tensors[f"{p}.o_proj.weight"], tensors[f"{p}.o_proj.scale"]),
-                Int8LinearWeight(tensors[f"{p}.gate_proj.weight"], tensors[f"{p}.gate_proj.scale"]),
-                Int8LinearWeight(tensors[f"{p}.up_proj.weight"], tensors[f"{p}.up_proj.scale"]),
-                Int8LinearWeight(tensors[f"{p}.down_proj.weight"], tensors[f"{p}.down_proj.scale"]),
-                tensors[f"{p}.input_layernorm"],
-                tensors[f"{p}.post_attention_layernorm"],
-                tensors[f"{p}.q_norm"],
-                tensors[f"{p}.k_norm"],
-                optional(f"{p}.q_pre_rope_i16.scale"),
-                optional(f"{p}.k_pre_rope_i16.scale"),
-                optional(f"{p}.input_qkv_i8.scale"),
-                optional(f"{p}.q_post_rope_i8.scale"),
-                optional(f"{p}.k_post_rope_i8.scale"),
-                optional(f"{p}.v_i8.scale"),
-                optional(f"{p}.attn_i8.scale"),
-                optional(f"{p}.post_mlp_i8.scale"),
-                optional(f"{p}.gated_mlp_i16.scale"),
+                q_proj=linear(f"{p}.q_proj"),
+                k_proj=linear(f"{p}.k_proj"),
+                v_proj=linear(f"{p}.v_proj"),
+                qkv_proj=cat_linear(f"{p}.qkv_proj", (f"{p}.q_proj", f"{p}.k_proj", f"{p}.v_proj")),
+                o_proj=linear(f"{p}.o_proj"),
+                gate_proj=linear(f"{p}.gate_proj"),
+                up_proj=linear(f"{p}.up_proj"),
+                gate_up_proj=cat_linear(f"{p}.gate_up_proj", (f"{p}.gate_proj", f"{p}.up_proj")),
+                down_proj=linear(f"{p}.down_proj"),
+                input_layernorm=tensors[f"{p}.input_layernorm"],
+                post_attention_layernorm=tensors[f"{p}.post_attention_layernorm"],
+                q_norm=tensors[f"{p}.q_norm"],
+                k_norm=tensors[f"{p}.k_norm"],
+                q_pre_rope_i16_scale=optional(f"{p}.q_pre_rope_i16.scale"),
+                k_pre_rope_i16_scale=optional(f"{p}.k_pre_rope_i16.scale"),
+                input_qkv_i8_scale=optional(f"{p}.input_qkv_i8.scale"),
+                q_post_rope_i8_scale=optional(f"{p}.q_post_rope_i8.scale"),
+                k_post_rope_i8_scale=optional(f"{p}.k_post_rope_i8.scale"),
+                v_i8_scale=optional(f"{p}.v_i8.scale"),
+                attn_i8_scale=optional(f"{p}.attn_i8.scale"),
+                post_mlp_i8_scale=optional(f"{p}.post_mlp_i8.scale"),
+                gated_mlp_i16_scale=optional(f"{p}.gated_mlp_i16.scale"),
             )
         )
     return tensors["model.embed_tokens.weight"], tensors["lm_head.weight"], tensors["model.norm.weight"], blocks

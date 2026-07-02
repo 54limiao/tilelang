@@ -93,6 +93,10 @@ def current_pack_metadata(path):
     ok = all(
         key in keys
         for key in (
+            "layers.0.qkv_proj.weight",
+            "layers.0.qkv_proj.scale",
+            "layers.0.gate_up_proj.weight",
+            "layers.0.gate_up_proj.scale",
             "layers.0.q_post_rope_i8.scale",
             "layers.0.input_qkv_i8.scale",
             "layers.0.k_post_rope_i8.scale",
@@ -255,6 +259,13 @@ def main():
                 w, s = per_channel_i8_weight(weight)
                 tensors[f"{dst}.{name}.weight"] = w.cpu().contiguous()
                 tensors[f"{dst}.{name}.scale"] = s.cpu().contiguous()
+            for packed_name, parts in (
+                ("qkv_proj", ("q_proj", "k_proj", "v_proj")),
+                ("gate_up_proj", ("gate_proj", "up_proj")),
+            ):
+                w, s = per_channel_i8_weight(torch.cat([layer_float[name] for name in parts], dim=0))
+                tensors[f"{dst}.{packed_name}.weight"] = w.cpu().contiguous()
+                tensors[f"{dst}.{packed_name}.scale"] = s.cpu().contiguous()
             if args.use_r1:
                 input_norm = torch.ones_like(input_norm)
                 post_norm = torch.ones_like(post_norm)
