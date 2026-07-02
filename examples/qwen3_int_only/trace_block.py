@@ -1,4 +1,5 @@
 import argparse
+import json
 
 import torch
 from transformers import AutoTokenizer
@@ -13,7 +14,7 @@ from examples.qwen3_int_only.model import (
     q15_16,
     rmsnorm_torch,
 )
-from examples.qwen3_int_only.ppl import FINEWEB_PATH, load_ids
+from examples.qwen3_int_only.ppl import load_ids
 from examples.qwen3_int_only.quarot import ROTATE_SEED, random_hadamard_rotation
 
 
@@ -25,7 +26,14 @@ def metrics(a, b):
     x2 = torch.dot(x, x)
     y2 = torch.dot(y, y)
     se = torch.dot(diff, diff)
-    return float(dot / torch.sqrt((x2 * y2).clamp_min(1e-30))), float(se / x.numel()), float(se / y2.clamp_min(1e-30))
+    ae = torch.sum(torch.abs(diff))
+    return {
+        "cos": float(dot / torch.sqrt((x2 * y2).clamp_min(1e-30))),
+        "mse": float(se / x.numel()),
+        "mae": float(ae / x.numel()),
+        "max_abs": float(torch.max(torch.abs(diff))),
+        "rel_mse": float(se / y2.clamp_min(1e-30)),
+    }
 
 
 def attention_refs(trace):
@@ -69,8 +77,12 @@ def attach_dequant_fp(weights: Qwen3BlockWeights):
 
 
 def print_metric(name, value, ref):
-    cos, mse, rel = metrics(value, ref)
-    print(f"{name:14s} cos={cos:.8f} mse={mse:.8e} rel_mse={rel:.8e}")
+    row = metrics(value, ref)
+    print(
+        f"{name:14s} cos={row['cos']:.8f} mse={row['mse']:.8e} "
+        f"mae={row['mae']:.8e} max_abs={row['max_abs']:.8e} rel_mse={row['rel_mse']:.8e}"
+    )
+    return row
 
 
 def print_rel_to(name, value, ref, denom):
@@ -78,7 +90,9 @@ def print_rel_to(name, value, ref, denom):
     se = torch.dot(diff, diff)
     den = torch.dot(denom.float().reshape(-1), denom.float().reshape(-1)).clamp_min(1e-30)
     energy = torch.dot(ref.float().reshape(-1), ref.float().reshape(-1)) / den
-    print(f"{name:14s} rel_to_out={float(se / den):.8e} ref_energy={float(energy):.8e}")
+    row = {"rel_to_out": float(se / den), "ref_energy": float(energy)}
+    print(f"{name:14s} rel_to_out={row['rel_to_out']:.8e} ref_energy={row['ref_energy']:.8e}")
+    return row
 
 
 def parse_layers(value, fallback):
@@ -87,35 +101,42 @@ def parse_layers(value, fallback):
     return [int(item.strip()) for item in value.split(",") if item.strip()]
 
 
+def add_row(rows, layer_idx, seq_len, name, kind, values):
+    row = {"layer": layer_idx, "tokens": seq_len, "name": name, "kind": kind}
+    row.update(values)
+    rows.append(row)
+
+
 def print_trace(layer_idx, seq_len, x_int, xf, itrace, ftrace, layer):
+    rows = []
     print(f"layer={layer_idx} tokens={seq_len}")
-    print_metric("hidden_in", x_int, xf)
+    add_row(rows, layer_idx, seq_len, "hidden_in", "metric", print_metric("hidden_in", x_int, xf))
     for name in ("input_rms", "q", "k", "v", "attn", "attn_out", "attn_residual", "post_rms", "gate", "up", "gated", "mlp", "layer_out"):
-        print_metric(name, itrace[name], ftrace[name])
-    print_rel_to("hidden_in_out", x_int, xf, ftrace["layer_out"])
+        add_row(rows, layer_idx, seq_len, name, "metric", print_metric(name, itrace[name], ftrace[name]))
+    add_row(rows, layer_idx, seq_len, "hidden_in_out", "rel_to_out", print_rel_to("hidden_in_out", x_int, xf, ftrace["layer_out"]))
     for name in ("attn_out", "mlp", "layer_out"):
-        print_rel_to(name + "_out", itrace[name], ftrace[name], ftrace["layer_out"])
+        add_row(rows, layer_idx, seq_len, name + "_out", "rel_to_out", print_rel_to(name + "_out", itrace[name], ftrace[name], ftrace["layer_out"]))
     input_rms_ref = rmsnorm_torch(x_int, layer.input_layernorm.float() / Q15_16)
     post_rms_ref = rmsnorm_torch(itrace["attn_residual"], layer.post_attention_layernorm.float() / Q15_16)
-    print_metric("input_rms_kern", itrace["input_rms"], input_rms_ref)
-    print_metric("input_rms_int", input_rms_ref, ftrace["input_rms"])
-    print_metric("attn_resid_add", itrace["attn_residual"], x_int + itrace["attn_out"])
-    print_metric("post_rms_kern", itrace["post_rms"], post_rms_ref)
-    print_metric("post_rms_int", post_rms_ref, ftrace["post_rms"])
-    print_metric("layer_out_add", itrace["layer_out"], itrace["attn_residual"] + itrace["mlp"])
+    add_row(rows, layer_idx, seq_len, "input_rms_kern", "metric", print_metric("input_rms_kern", itrace["input_rms"], input_rms_ref))
+    add_row(rows, layer_idx, seq_len, "input_rms_int", "metric", print_metric("input_rms_int", input_rms_ref, ftrace["input_rms"]))
+    add_row(rows, layer_idx, seq_len, "attn_resid_add", "metric", print_metric("attn_resid_add", itrace["attn_residual"], x_int + itrace["attn_out"]))
+    add_row(rows, layer_idx, seq_len, "post_rms_kern", "metric", print_metric("post_rms_kern", itrace["post_rms"], post_rms_ref))
+    add_row(rows, layer_idx, seq_len, "post_rms_int", "metric", print_metric("post_rms_int", post_rms_ref, ftrace["post_rms"]))
+    add_row(rows, layer_idx, seq_len, "layer_out_add", "metric", print_metric("layer_out_add", itrace["layer_out"], itrace["attn_residual"] + itrace["mlp"]))
     qdq = dequant_qkv(itrace)
     for name, value in zip(("q_qdq", "k_qdq", "v_qdq"), qdq):
         base = name[:1]
-        print_metric(name, value, ftrace[base])
-        print_metric(name + "_loss", value, itrace[base])
+        add_row(rows, layer_idx, seq_len, name, "metric", print_metric(name, value, ftrace[base]))
+        add_row(rows, layer_idx, seq_len, name + "_loss", "metric", print_metric(name + "_loss", value, itrace[base]))
     for name, q_name, s_name, base in (
         ("attn_qdq", "attn8", "attn_s8", "attn"),
         ("post_qdq", "post8", "post_s8", "post_rms"),
         ("gated_qdq", "gated8", "gated_s8", "gated"),
     ):
         value = dequant_rows(itrace[q_name], itrace[s_name])
-        print_metric(name, value, ftrace[base])
-        print_metric(name + "_loss", value, itrace[base])
+        add_row(rows, layer_idx, seq_len, name, "metric", print_metric(name, value, ftrace[base]))
+        add_row(rows, layer_idx, seq_len, name + "_loss", "metric", print_metric(name + "_loss", value, itrace[base]))
     attn_qdq = dequant_rows(itrace["attn8"], itrace["attn_s8"])
     post_qdq = dequant_rows(itrace["post8"], itrace["post_s8"])
     gated_qdq = dequant_rows(itrace["gated8"], itrace["gated_s8"])
@@ -129,13 +150,14 @@ def print_trace(layer_idx, seq_len, x_int, xf, itrace, ftrace, layer):
         ("up_from_post_qdq", itrace["up"], up_qdq_ref),
         ("down_from_gated_qdq", itrace["mlp"], down_qdq_ref),
     ):
-        print_metric(name, value, ref)
+        add_row(rows, layer_idx, seq_len, name, "metric", print_metric(name, value, ref))
     silu_ref = torch.nn.functional.silu(itrace["gate"]) * itrace["up"]
-    print_metric("silu_mul", itrace["gated"], silu_ref)
+    add_row(rows, layer_idx, seq_len, "silu_mul", "metric", print_metric("silu_mul", itrace["gated"], silu_ref))
     if itrace["prob_i16"] is not None:
         prob_ref, pv_ref = attention_refs(itrace)
-        print_metric("softmax_i16", itrace["prob_i16"].float() / 16383.0, prob_ref)
-        print_metric("pv_i16v8", itrace["attn"], pv_ref)
+        add_row(rows, layer_idx, seq_len, "softmax_i16", "metric", print_metric("softmax_i16", itrace["prob_i16"].float() / 16383.0, prob_ref))
+        add_row(rows, layer_idx, seq_len, "pv_i16v8", "metric", print_metric("pv_i16v8", itrace["attn"], pv_ref))
+    return rows
 
 
 @torch.no_grad()
@@ -143,7 +165,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-dir", default="/code/Qwen3-0.6B")
     parser.add_argument("--packed-dir", default="/tmp/Qwen3-0.6B-int-only-static")
-    parser.add_argument("--eval-parquet", default="fineweb")
+    parser.add_argument("--eval-dataset", default="fineweb")
+    parser.add_argument("--eval-parquet", default="")
     parser.add_argument("--eval-column", default="text")
     parser.add_argument("--eval-text", default="examples/qwen3_int_only/data/declaration_of_independence.txt")
     parser.add_argument("--max-tokens", type=int, default=257)
@@ -151,9 +174,8 @@ def main():
     parser.add_argument("--layers", default="")
     parser.add_argument("--use-r3", action="store_true")
     parser.add_argument("--split-attn", action="store_true")
+    parser.add_argument("--jsonl-out", default="")
     args = parser.parse_args()
-    if args.eval_parquet == "fineweb":
-        args.eval_parquet = FINEWEB_PATH
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir, local_files_only=True, trust_remote_code=True)
     ids = load_ids(tokenizer, args, args.max_tokens, "cuda")
@@ -168,16 +190,32 @@ def main():
     max_layer = targets[-1]
     xf = embed[ids[:-1]]
     xi = q15_16(imodel.embed[ids[:-1]])
+    json_rows = []
     for layer_idx in range(max_layer + 1):
         if layer_idx in targets:
             ftrace = block_torch_trace(xf, fweights[layer_idx], imodel.cos, imodel.sin, imodel.config, r3)
             itrace = imodel.block.trace(xi, imodel.layers[layer_idx], imodel.cos, imodel.sin, r3_q15=imodel.r3_q15)
-            print_trace(layer_idx, seq_len, xi.float() / Q15_16, xf, itrace, ftrace, imodel.layers[layer_idx])
+            json_rows.extend(print_trace(layer_idx, seq_len, xi.float() / Q15_16, xf, itrace, ftrace, imodel.layers[layer_idx]))
             xf = ftrace["layer_out"]
             xi = itrace["layer_out_q15"]
         else:
             xf = block_torch(xf, fweights[layer_idx], imodel.cos, imodel.sin, imodel.config, r3)
             xi = imodel.block(xi, imodel.layers[layer_idx], imodel.cos, imodel.sin, r3_q15=imodel.r3_q15)
+    if args.jsonl_out:
+        with open(args.jsonl_out, "a", encoding="utf-8") as f:
+            for row in json_rows:
+                row.update(
+                    {
+                        "model_dir": args.model_dir,
+                        "packed_dir": args.packed_dir,
+                        "eval_dataset": args.eval_dataset,
+                        "eval_parquet": args.eval_parquet,
+                        "eval_text": args.eval_text,
+                        "use_r3": args.use_r3,
+                        "split_attn": args.split_attn,
+                    }
+                )
+                f.write(json.dumps(row, sort_keys=True) + "\n")
 
 
 if __name__ == "__main__":

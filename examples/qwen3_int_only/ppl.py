@@ -1,4 +1,6 @@
 import argparse
+import gzip
+import json
 import math
 from pathlib import Path
 
@@ -11,12 +13,18 @@ from examples.qwen3_int_only.model import (
     QWEN3_0_6B,
     Qwen3FloatModel,
     Qwen3IntOnlyModel,
+    parse_layer_set,
 )
 from examples.qwen3_int_only.quarot import ROTATE_SEED, random_hadamard_rotation
 
 
 TEXT_PATH = Path(__file__).resolve().parent / "data" / "declaration_of_independence.txt"
 FINEWEB_PATH = "/publicdata/huggingface.co/datasets/HuggingFaceFW/fineweb/sample/10BT/000_00000.parquet"
+C4_PATH = "/publicdata/huggingface.co/datasets/allenai/c4/en/c4-train.00000-of-01024.json.gz"
+DATASETS = {
+    "fineweb": ("parquet", FINEWEB_PATH),
+    "c4": ("jsonl.gz", C4_PATH),
+}
 
 
 def packed_flags(packed_dir):
@@ -27,18 +35,38 @@ def packed_flags(packed_dir):
     return metadata.get("use_r1") == "1", metadata.get("use_r2") == "1"
 
 
-def load_ids(tokenizer, args, total_tokens, device):
-    if args.eval_parquet:
+def resolve_dataset(name):
+    return DATASETS.get(name, ("", name))
+
+
+def iter_texts(source, column):
+    kind, path = resolve_dataset(source)
+    if kind == "parquet" or path.endswith(".parquet"):
         import pyarrow.parquet as pq
 
-        ids = []
-        parquet = pq.ParquetFile(args.eval_parquet)
-        for batch in parquet.iter_batches(batch_size=256, columns=[args.eval_column]):
-            for item in batch.column(args.eval_column).to_pylist():
+        parquet = pq.ParquetFile(path)
+        for batch in parquet.iter_batches(batch_size=256, columns=[column]):
+            for item in batch.column(column).to_pylist():
                 if item:
-                    ids.extend(tokenizer(str(item), add_special_tokens=False).input_ids)
-                    if len(ids) >= total_tokens:
-                        return torch.tensor(ids[:total_tokens], device=device, dtype=torch.long)
+                    yield str(item)
+    elif kind == "jsonl.gz" or path.endswith(".json.gz") or path.endswith(".jsonl.gz"):
+        with gzip.open(path, "rt", encoding="utf-8") as f:
+            for line in f:
+                item = json.loads(line).get(column)
+                if item:
+                    yield str(item)
+    else:
+        yield Path(path).read_text(encoding="utf-8")
+
+
+def load_ids(tokenizer, args, total_tokens, device):
+    ids = []
+    source = args.eval_parquet or args.eval_dataset or args.eval_text
+    column = args.eval_column
+    for text in iter_texts(source, column):
+        ids.extend(tokenizer(text, add_special_tokens=False).input_ids)
+        if len(ids) >= total_tokens:
+            return torch.tensor(ids[:total_tokens], device=device, dtype=torch.long)
     text = Path(args.eval_text).read_text(encoding="utf-8")
     ids = tokenizer(text, add_special_tokens=False).input_ids[:total_tokens]
     return torch.tensor(ids, device=device, dtype=torch.long)
@@ -61,6 +89,20 @@ def quant_i8_q15_16(x):
     return y, scale
 
 
+def new_acc():
+    return {
+        "loss_sum": 0.0,
+        "tokens": 0,
+        "dot": 0.0,
+        "got2": 0.0,
+        "ref2": 0.0,
+        "se": 0.0,
+        "ae": 0.0,
+        "max_abs": 0.0,
+        "logits": 0,
+    }
+
+
 def add_metrics(acc, logits, labels, golden=None):
     logits = logits.float()
     labels = labels.reshape(-1)
@@ -76,6 +118,8 @@ def add_metrics(acc, logits, labels, golden=None):
         acc["got2"] += float(torch.dot(got, got))
         acc["ref2"] += float(torch.dot(ref, ref))
         acc["se"] += float(torch.dot(diff, diff))
+        acc["ae"] += float(torch.sum(torch.abs(diff)))
+        acc["max_abs"] = max(acc["max_abs"], float(torch.max(torch.abs(diff))))
         acc["logits"] += int(got.numel())
 
 
@@ -85,6 +129,8 @@ def finish_metrics(acc):
     if acc["logits"]:
         out["cos"] = acc["dot"] / math.sqrt(max(acc["got2"] * acc["ref2"], 1e-30))
         out["mse"] = acc["se"] / acc["logits"]
+        out["mae"] = acc["ae"] / acc["logits"]
+        out["max_abs"] = acc["max_abs"]
         out["rel_mse"] = acc["se"] / max(acc["ref2"], 1e-30)
     return out
 
@@ -92,7 +138,10 @@ def finish_metrics(acc):
 def print_metrics(backend, metrics, compare_backend):
     msg = f"backend={backend} tokens={metrics['tokens']} loss={metrics['loss']:.6f} ppl={metrics['ppl']:.6f}"
     if "cos" in metrics:
-        msg += f" compare={compare_backend} cos={metrics['cos']:.8f} mse={metrics['mse']:.8e} rel_mse={metrics['rel_mse']:.8e}"
+        msg += (
+            f" compare={compare_backend} cos={metrics['cos']:.8f} mse={metrics['mse']:.8e}"
+            f" mae={metrics['mae']:.8e} max_abs={metrics['max_abs']:.8e} rel_mse={metrics['rel_mse']:.8e}"
+        )
     print(msg)
 
 
@@ -179,6 +228,10 @@ def prepare_eval(args):
             cache_len=cache_len,
             use_r3=args.use_r3,
             split_attn=args.split_attn,
+            fused_attn=args.fused_attn,
+            fast_hadamard=args.fast_hadamard,
+            mlp_i16=args.mlp_i16,
+            mlp_i16_layers=parse_layer_set(args.mlp_i16_layers),
         )
     else:
         int_model = None
@@ -187,7 +240,8 @@ def prepare_eval(args):
 
 @torch.no_grad()
 def run_eval(args, tokenizer, windows, hf_model, local_model, int_model, cache_kv, layers):
-    acc = {"loss_sum": 0.0, "tokens": 0, "dot": 0.0, "got2": 0.0, "ref2": 0.0, "se": 0.0, "logits": 0}
+    acc = new_acc()
+    window_rows = []
     for start in range(0, windows.shape[0], args.batch_size):
         batch = windows[start : start + args.batch_size]
         golden = None
@@ -199,17 +253,31 @@ def run_eval(args, tokenizer, windows, hf_model, local_model, int_model, cache_k
         if args.backend == "hf":
             logits = hf_logits(hf_model, batch, args.cache_prompt, tokenizer)
             add_metrics(acc, logits, batch[:, 1:], golden)
+            if args.jsonl_windows:
+                for idx in range(batch.shape[0]):
+                    wacc = new_acc()
+                    ref = None if golden is None else golden[idx]
+                    add_metrics(wacc, logits[idx], batch[idx, 1:], ref)
+                    window_rows.append((start + idx, finish_metrics(wacc)))
         elif args.backend == "local-float":
             for idx, row in enumerate(batch):
                 logits = local_float_logits(local_model, row, layers, args.verbose)
                 ref = None if golden is None else golden[idx]
                 add_metrics(acc, logits, row[1:], ref)
+                if args.jsonl_windows:
+                    wacc = new_acc()
+                    add_metrics(wacc, logits, row[1:], ref)
+                    window_rows.append((start + idx, finish_metrics(wacc)))
         else:
             for idx, row in enumerate(batch):
                 logits = int_model.logits(row[:-1], layers=layers, verbose=args.verbose, cache_kv=cache_kv).float()
                 ref = None if golden is None else golden[idx]
                 add_metrics(acc, logits, row[1:], ref)
-    return finish_metrics(acc)
+                if args.jsonl_windows:
+                    wacc = new_acc()
+                    add_metrics(wacc, logits, row[1:], ref)
+                    window_rows.append((start + idx, finish_metrics(wacc)))
+    return finish_metrics(acc), window_rows
 
 
 def main():
@@ -222,6 +290,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-batches", type=int, default=1)
     parser.add_argument("--eval-text", default=str(TEXT_PATH))
+    parser.add_argument("--eval-dataset", default="")
     parser.add_argument("--eval-parquet", default="")
     parser.add_argument("--eval-column", default="text")
     parser.add_argument("--layers", type=int)
@@ -232,15 +301,49 @@ def main():
     parser.add_argument("--use-r2", action="store_true")
     parser.add_argument("--use-r3", action="store_true")
     parser.add_argument("--split-attn", action="store_true")
+    parser.add_argument("--fused-attn", action="store_true")
+    parser.add_argument("--fast-hadamard", action="store_true")
+    parser.add_argument("--mlp-i16", action="store_true")
+    parser.add_argument("--mlp-i16-layers", default="")
+    parser.add_argument("--jsonl-out", default="")
+    parser.add_argument("--jsonl-windows", action="store_true")
     args = parser.parse_args()
-    if args.eval_parquet == "fineweb":
-        args.eval_parquet = FINEWEB_PATH
     tokenizer, windows, hf_model, local_model, int_model, cache_kv, layer_sweep = prepare_eval(args)
     for layers in layer_sweep:
-        metrics = run_eval(args, tokenizer, windows, hf_model, local_model, int_model, cache_kv, layers)
+        metrics, window_rows = run_eval(args, tokenizer, windows, hf_model, local_model, int_model, cache_kv, layers)
         if args.layer_sweep:
             print(f"layers={layers} ", end="")
         print_metrics(args.backend, metrics, args.compare_backend)
+        if args.jsonl_out:
+            common = {
+                "backend": args.backend,
+                "compare_backend": args.compare_backend,
+                "layers": layers,
+                "max_tokens": args.max_tokens,
+                "batch_size": args.batch_size,
+                "num_batches": args.num_batches,
+                "eval_dataset": args.eval_dataset,
+                "eval_parquet": args.eval_parquet,
+                "eval_text": args.eval_text,
+                "eval_column": args.eval_column,
+                "split_attn": args.split_attn,
+                "fused_attn": args.fused_attn,
+                "fast_hadamard": args.fast_hadamard,
+                "use_r1": args.use_r1,
+                "use_r2": args.use_r2,
+                "use_r3": args.use_r3,
+                "mlp_i16": args.mlp_i16,
+                "mlp_i16_layers": args.mlp_i16_layers,
+            }
+            row = {
+                "kind": "summary",
+                **common,
+                **metrics,
+            }
+            with open(args.jsonl_out, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row, sort_keys=True) + "\n")
+                for window, values in window_rows:
+                    f.write(json.dumps({"kind": "window", "window": window, **common, **values}, sort_keys=True) + "\n")
 
 
 if __name__ == "__main__":

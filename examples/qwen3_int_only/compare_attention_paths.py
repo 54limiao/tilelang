@@ -16,7 +16,6 @@ from examples.qwen3_int_only.model import (
     rmsnorm_torch,
     rope_tables_q15_16,
 )
-from examples.qwen3_int_only.ppl import ppl_from_logits
 
 
 TEXT_PATH = Path(__file__).resolve().parent / "data" / "declaration_of_independence.txt"
@@ -24,9 +23,21 @@ TEXT_PATH = Path(__file__).resolve().parent / "data" / "declaration_of_independe
 
 def metric(name, a, b):
     af, bf = a.float().flatten(), b.float().flatten()
+    diff = af - bf
     cos = torch.nn.functional.cosine_similarity(af, bf, dim=0).item()
-    rel_mse = (torch.mean((af - bf) ** 2) / (torch.mean(af * af) + 1e-12)).item()
-    print(f"{name:10s} cos={cos:.8f} rel_mse={rel_mse:.6e} amax_ref={a.abs().max().item()} amax_split={b.abs().max().item()}")
+    mse = torch.mean(diff * diff).item()
+    rel_mse = (torch.mean(diff * diff) / (torch.mean(af * af) + 1e-12)).item()
+    mae = torch.mean(torch.abs(diff)).item()
+    max_abs = torch.max(torch.abs(diff)).item()
+    print(
+        f"{name:10s} cos={cos:.8f} mse={mse:.8e} mae={mae:.8e} max_abs={max_abs:.8e}"
+        f" rel_mse={rel_mse:.6e} amax_ref={a.abs().max().item()} amax_split={b.abs().max().item()}"
+    )
+
+
+def loss_ppl(logits, labels):
+    loss = torch.nn.functional.cross_entropy(logits.float(), labels, reduction="mean")
+    return float(loss), float(torch.exp(loss))
 
 
 @torch.no_grad()
@@ -69,8 +80,8 @@ def main():
     logits_ref = norm_ref @ lm_head.T
     logits_split = norm_split @ lm_head.T
     labels = ids[1:]
-    ppl_ref, loss_ref, _ = ppl_from_logits(logits_ref, labels)
-    ppl_split, loss_split, _ = ppl_from_logits(logits_split, labels)
+    loss_ref, ppl_ref = loss_ppl(logits_ref, labels)
+    loss_split, ppl_split = loss_ppl(logits_split, labels)
     print(f"default loss={loss_ref:.6f} ppl={ppl_ref:.6f}")
     print(f"split   loss={loss_split:.6f} ppl={ppl_split:.6f}")
 

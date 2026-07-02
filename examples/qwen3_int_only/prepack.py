@@ -7,6 +7,7 @@ from safetensors.torch import save_file
 from transformers import AutoTokenizer
 
 from examples.qwen3_int_only.model import QWEN3_0_6B, per_channel_i8_weight, q15_16, rmsnorm_torch, rope_tables_q15_16, rope_torch
+from examples.qwen3_int_only.ppl import iter_texts
 from examples.qwen3_int_only.quarot import (
     ROTATE_SEED,
     random_hadamard_rotation,
@@ -30,22 +31,14 @@ def scale_from_amax(amax, qmax):
     return torch.div(amax + qmax - 1, qmax, rounding_mode="floor").clamp(min=1).to(torch.uint32)
 
 
-def load_calib_ids(model_dir, calib_text, calib_parquet, calib_column, tokens, device):
+def load_calib_ids(model_dir, calib_text, calib_dataset, calib_parquet, calib_column, tokens, device):
     tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True, trust_remote_code=True)
-    if calib_parquet:
-        import pyarrow.parquet as pq
-
-        ids = []
-        parquet = pq.ParquetFile(calib_parquet)
-        for batch in parquet.iter_batches(batch_size=256, columns=[calib_column]):
-            for item in batch.column(calib_column).to_pylist():
-                if item:
-                    ids.extend(tokenizer(str(item), add_special_tokens=False).input_ids)
-                    if len(ids) >= tokens:
-                        return torch.tensor(ids[:tokens], device=device, dtype=torch.long)
-    else:
-        text = Path(calib_text).read_text(encoding="utf-8")
-        ids = tokenizer(text, add_special_tokens=False).input_ids[:tokens]
+    ids = []
+    source = calib_parquet or calib_dataset or calib_text
+    for text in iter_texts(source, calib_column):
+        ids.extend(tokenizer(text, add_special_tokens=False).input_ids)
+        if len(ids) >= tokens:
+            return torch.tensor(ids[:tokens], device=device, dtype=torch.long)
     return torch.tensor(ids, device=device, dtype=torch.long)
 
 
@@ -118,6 +111,7 @@ def main():
     parser.add_argument("--use-r3", action="store_true")
     parser.add_argument("--rotate-seed", type=int, default=ROTATE_SEED)
     parser.add_argument("--calib-text", default=str(TEXT_PATH))
+    parser.add_argument("--calib-dataset", default="")
     parser.add_argument("--calib-parquet")
     parser.add_argument("--calib-column", default="text")
     parser.add_argument("--calib-tokens", type=int, default=0)
@@ -191,7 +185,7 @@ def main():
     elif args.calib_tokens:
         calib_seq_len = args.calib_tokens
     if calib_tokens:
-        ids = load_calib_ids(args.model_dir, args.calib_text, args.calib_parquet, args.calib_column, calib_tokens, args.device)
+        ids = load_calib_ids(args.model_dir, args.calib_text, args.calib_dataset, args.calib_parquet, args.calib_column, calib_tokens, args.device)
         for layer_idx, scales in enumerate(calibrate_attention_scales(embed, calib_weights, calib_norms, ids, QWEN3_0_6B, r3, args.calib_prefix_tokens, calib_seq_len)):
             dst = f"layers.{layer_idx}"
             for name, scale in scales.items():
@@ -206,6 +200,8 @@ def main():
             "use_r2": str(int(args.use_r2)),
             "use_r3": str(int(args.use_r3)),
             "calib_tokens": str(calib_tokens),
+            "calib_dataset": args.calib_dataset,
+            "calib_parquet": str(args.calib_parquet or ""),
             "calib_seq_len": str(calib_seq_len),
             "calib_batches": str(args.calib_batches),
             "calib_prefix_tokens": str(args.calib_prefix_tokens),

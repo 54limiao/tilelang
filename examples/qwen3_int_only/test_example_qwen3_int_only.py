@@ -10,12 +10,17 @@ from examples.qwen3_int_only.kernels import (
     ATTN_VALUE_SHIFT,
     MASK,
     Q_MULTIPLIER_WIDTH,
+    add_rmsnorm_dynamic_quant_q15_16_weighted_fast,
     add_dynamic_quant_q15_16,
     add_rmsnorm_q15_16_weighted,
     add_q15_16,
     attention_i16v8_q15_16_gqa_cache,
     attention_i8_q15_16_gqa_softmax_i16,
     attention_i8_q15_16_gqa_cache_softmax_i16,
+    attention_i8v8_q15_16_gqa_fused,
+    attention_i8v8_q15_16_gqa_fused_static,
+    attention_i8v8_q15_16_gqa_cache_fused,
+    attention_i8v8_q15_16_gqa_cache_fused_static_current,
     attention_i16v8_q15_16_gqa,
     attention_normalize_q15_16,
     compile_kernel,
@@ -27,15 +32,29 @@ from examples.qwen3_int_only.kernels import (
     flash_attention_i8_q15_16_gqa_cache,
     flash_attention_i8_q15_16_gqa_tiled,
     gemm_int16_int8_split,
+    linear_dynamic_int16_residual_q15_16,
     linear_dynamic_int8_pair_q15_16,
     linear_dynamic_int8_qkv_q15_16,
+    linear_dynamic_int8_residual_q15_16,
     linear_dynamic_int8_q15_16,
     rope_rotate_q15_16,
+    rope_rotate_q15_16_heads,
+    rope_rotate_static_quant_q15_16_attn,
+    rope_rotate_static_quant_q15_16_attn_hadamard_approx,
+    rope_rotate_static_quant_q15_16_attn_noscale,
+    rope_q15_16,
+    rope_q15_16_heads,
+    rmsnorm_dynamic_quant_q15_16_weighted_fast,
     rmsnorm_q15_16_grouped_weighted,
+    rmsnorm_q15_16_grouped_weighted_rowwise,
     rmsnorm_q15_16_weighted,
     rsqrt_lut,
     sigmoid_lut,
     silu_mul_dynamic_quant_q15_16,
+    silu_mul_dynamic_quant_q15_16_fast,
+    silu_mul_dynamic_quant_q15_16_i16_fast,
+    static_quant_q15_16_per_head_attn,
+    static_quant_q15_16_per_head_attn_noscale,
     static_quant_q15_16_per_head,
 )
 
@@ -124,6 +143,29 @@ def test_static_quant_per_head_i8():
 
 
 @tilelang.testing.requires_cuda
+def test_static_quant_per_head_attn_layout_matches_permute():
+    torch.manual_seed(0)
+    tokens, heads, head_dim = 9, 4, 16
+    x = torch.randint(-70000, 70001, (tokens, heads, head_dim), device="cuda", dtype=torch.int32)
+    scale = torch.randint(300, 900, (heads,), device="cuda", dtype=torch.uint32)
+    ref = compile_kernel(static_quant_q15_16_per_head(tokens, heads, head_dim, "int8"), [2])(x, scale)
+    y, sy = compile_kernel(static_quant_q15_16_per_head_attn(tokens, heads, head_dim, "int8"), [2, 3])(x, scale)
+    torch.testing.assert_close(y, ref.permute(1, 0, 2).contiguous(), rtol=0, atol=0)
+    torch.testing.assert_close(sy, scale[:, None].expand(heads, tokens).contiguous(), rtol=0, atol=0)
+
+
+@tilelang.testing.requires_cuda
+def test_static_quant_per_head_attn_noscale_matches_scaled():
+    torch.manual_seed(0)
+    tokens, heads, head_dim = 9, 4, 16
+    x = torch.randint(-70000, 70001, (tokens, heads, head_dim), device="cuda", dtype=torch.int32)
+    scale = torch.randint(300, 900, (heads,), device="cuda", dtype=torch.uint32)
+    ref, _ = compile_kernel(static_quant_q15_16_per_head_attn(tokens, heads, head_dim, "int8"), [2, 3])(x, scale)
+    y = compile_kernel(static_quant_q15_16_per_head_attn_noscale(tokens, heads, head_dim, "int8"), [2])(x, scale)
+    torch.testing.assert_close(y, ref, rtol=0, atol=0)
+
+
+@tilelang.testing.requires_cuda
 def test_add_dynamic_quant_i16_matches_unfused():
     torch.manual_seed(0)
     rows, cols = 5, 64
@@ -153,6 +195,36 @@ def test_add_rmsnorm_q15_matches_unfused():
 
 
 @tilelang.testing.requires_cuda
+def test_add_rmsnorm_dynamic_quant_fast_matches_two_step():
+    torch.manual_seed(0)
+    rows, cols = 5, 128
+    a = torch.randint(-180000, 180001, (rows, cols), device="cuda", dtype=torch.int32)
+    b = torch.randint(-180000, 180001, (rows, cols), device="cuda", dtype=torch.int32)
+    wq = q15((torch.randn(cols, device="cuda") * 0.03 + 1.0).clamp(0.8, 1.2))
+    lut = torch.from_numpy(rsqrt_lut()).cuda()
+    ref_y, ref_n = compile_kernel(add_rmsnorm_q15_16_weighted(rows, cols), [4, 5])(a, b, wq, lut)
+    ref_q, ref_s = compile_kernel(dynamic_quant_q15_16(rows, cols, "int8"), [1, 2])(ref_n)
+    y, q, s = compile_kernel(add_rmsnorm_dynamic_quant_q15_16_weighted_fast(rows, cols), [4, 5, 6])(a, b, wq, lut)
+    torch.testing.assert_close(y, ref_y, rtol=0, atol=0)
+    torch.testing.assert_close(q, ref_q, rtol=0, atol=0)
+    torch.testing.assert_close(s, ref_s, rtol=0, atol=0)
+
+
+@tilelang.testing.requires_cuda
+def test_rmsnorm_dynamic_quant_fast_matches_two_step():
+    torch.manual_seed(0)
+    rows, cols = 5, 128
+    x = torch.randint(-180000, 180001, (rows, cols), device="cuda", dtype=torch.int32)
+    wq = q15((torch.randn(cols, device="cuda") * 0.03 + 1.0).clamp(0.8, 1.2))
+    lut = torch.from_numpy(rsqrt_lut()).cuda()
+    ref_n = compile_kernel(rmsnorm_q15_16_weighted(rows, cols), [3])(x, wq, lut)
+    ref_q, ref_s = compile_kernel(dynamic_quant_q15_16(rows, cols, "int8"), [1, 2])(ref_n)
+    q, s = compile_kernel(rmsnorm_dynamic_quant_q15_16_weighted_fast(rows, cols), [3, 4])(x, wq, lut)
+    torch.testing.assert_close(q, ref_q, rtol=0, atol=0)
+    torch.testing.assert_close(s, ref_s, rtol=0, atol=0)
+
+
+@tilelang.testing.requires_cuda
 def test_linear_i8_tiled():
     torch.manual_seed(0)
     rows, in_features, out_features = 16, 64, 32
@@ -168,6 +240,20 @@ def test_linear_i8_tiled():
 
 
 @tilelang.testing.requires_cuda
+def test_linear_i8_residual_matches_linear_add():
+    torch.manual_seed(0)
+    rows, in_features, out_features = 16, 64, 32
+    x = torch.randint(-128, 127, (rows, in_features), device="cuda", dtype=torch.int8)
+    w = torch.randint(-128, 127, (out_features, in_features), device="cuda", dtype=torch.int8)
+    xs = torch.randint(1, 256, (rows,), device="cuda", dtype=torch.uint32)
+    ws = torch.randint(1, 512, (out_features,), device="cuda", dtype=torch.uint32)
+    residual = torch.randint(-100000, 100001, (rows, out_features), device="cuda", dtype=torch.int32)
+    ref = compile_kernel(linear_dynamic_int8_q15_16(rows, in_features, out_features), [4])(x, xs, w, ws) + residual
+    y = compile_kernel(linear_dynamic_int8_residual_q15_16(rows, in_features, out_features), [5])(x, xs, w, ws, residual)
+    torch.testing.assert_close(y, ref, rtol=0, atol=0)
+
+
+@tilelang.testing.requires_cuda
 def test_gemm_int16_int8():
     torch.manual_seed(0)
     rows, in_features, out_features = 64, 128, 64
@@ -180,6 +266,22 @@ def test_gemm_int16_int8():
     rel_mse = torch.mean((yf - ref) ** 2) / torch.mean(ref**2)
     assert cos > 0.99999
     assert rel_mse < 1e-6
+
+
+@tilelang.testing.requires_cuda
+def test_linear_i16_residual_matches_torch_ref():
+    torch.manual_seed(0)
+    rows, in_features, out_features = 16, 64, 32
+    x = torch.randint(-32768, 32767, (rows, in_features), device="cuda", dtype=torch.int16)
+    w = torch.randint(-128, 127, (out_features, in_features), device="cuda", dtype=torch.int8)
+    xs = torch.randint(1, 256, (rows,), device="cuda", dtype=torch.uint32)
+    ws = torch.randint(1, 512, (out_features,), device="cuda", dtype=torch.uint32)
+    residual = torch.randint(-100000, 100001, (rows, out_features), device="cuda", dtype=torch.int32)
+    y = compile_kernel(linear_dynamic_int16_residual_q15_16(rows, in_features, out_features), [5])(x, xs, w, ws, residual)
+    acc = (x.cpu().to(torch.int64) @ w.cpu().to(torch.int64).T).cuda()
+    ref = residual + (((acc >> 8) * xs[:, None].long() * ws[None, :].long()) >> 8).int()
+    rel_mse = torch.mean((y.float() - ref.float()) ** 2) / torch.mean(ref.float() ** 2)
+    assert float(rel_mse) < 1e-6
 
 
 @tilelang.testing.requires_cuda
@@ -263,6 +365,18 @@ def test_rmsnorm_q15_grouped_matches_dynamic_i16():
 
 
 @tilelang.testing.requires_cuda
+def test_rmsnorm_q15_grouped_rowwise_matches_grouped():
+    torch.manual_seed(0)
+    rows, groups, cols = 7, 4, 128
+    xq = torch.randint(-220000, 220001, (rows, groups * cols), device="cuda", dtype=torch.int32)
+    wq = q15((torch.randn(cols, device="cuda") * 0.03 + 1.0).clamp(0.8, 1.2))
+    lut = torch.from_numpy(rsqrt_lut()).cuda()
+    ref = compile_kernel(rmsnorm_q15_16_grouped_weighted(rows, groups, cols), [3])(xq, wq, lut)
+    y = compile_kernel(rmsnorm_q15_16_grouped_weighted_rowwise(rows, groups, cols), [3])(xq, wq, lut)
+    torch.testing.assert_close(y, ref, rtol=0, atol=0)
+
+
+@tilelang.testing.requires_cuda
 def test_rope_rotate_q15_16():
     torch.manual_seed(0)
     rows, dim = 7, 32
@@ -277,6 +391,79 @@ def test_rope_rotate_q15_16():
     rope = torch.cat((lo, hi), dim=-1)
     ref = ((rope[:, :, None] >> 8) * (hq[None, :, :] >> 8)).sum(dim=1).to(torch.int32)
     torch.testing.assert_close(y, ref, rtol=0, atol=0)
+
+
+@tilelang.testing.requires_cuda
+def test_rope_head_kernels_match_expanded_tables():
+    torch.manual_seed(0)
+    seq_len, heads, dim = 5, 4, 128
+    x = torch.randn((seq_len * heads, dim), device="cuda") * 0.2
+    cos = torch.cos(torch.randn((seq_len, dim // 2), device="cuda") * 0.1)
+    sin = torch.sin(torch.randn((seq_len, dim // 2), device="cuda") * 0.1)
+    h = hadamard(dim, "cuda")
+    xq, cq, sq, hq = q15(x), q15(cos), q15(sin), q15(h)
+    cexp = cq[:, None, :].expand(seq_len, heads, dim // 2).reshape(seq_len * heads, dim // 2).contiguous()
+    sexp = sq[:, None, :].expand(seq_len, heads, dim // 2).reshape(seq_len * heads, dim // 2).contiguous()
+    ref_rope = compile_kernel(rope_q15_16(seq_len * heads, dim), [3])(xq, cexp, sexp)
+    got_rope = compile_kernel(rope_q15_16_heads(seq_len, heads, dim), [3])(xq, cq, sq)
+    ref_rot = compile_kernel(rope_rotate_q15_16(seq_len * heads, dim), [4])(xq, cexp, sexp, hq)
+    got_rot = compile_kernel(rope_rotate_q15_16_heads(seq_len, heads, dim), [4])(xq, cq, sq, hq)
+    torch.testing.assert_close(got_rope, ref_rope, rtol=0, atol=0)
+    torch.testing.assert_close(got_rot, ref_rot, rtol=0, atol=0)
+
+
+@tilelang.testing.requires_cuda
+def test_rope_rotate_static_quant_attn_matches_unfused():
+    torch.manual_seed(0)
+    seq_len, heads, dim = 5, 3, 32
+    x = torch.randn((seq_len * heads, dim), device="cuda") * 0.2
+    cos = torch.cos(torch.randn((seq_len, dim // 2), device="cuda") * 0.1)
+    sin = torch.sin(torch.randn((seq_len, dim // 2), device="cuda") * 0.1)
+    h = hadamard(dim, "cuda")
+    xq, cq, sq, hq = q15(x), q15(cos), q15(sin), q15(h)
+    scale = torch.randint(300, 900, (heads,), device="cuda", dtype=torch.uint32)
+    rot = compile_kernel(rope_rotate_q15_16_heads(seq_len, heads, dim), [4])(xq, cq, sq, hq)
+    ref, ref_s = compile_kernel(static_quant_q15_16_per_head_attn(seq_len, heads, dim, "int8"), [2, 3])(
+        rot.reshape(seq_len, heads, dim), scale
+    )
+    y, sy = compile_kernel(rope_rotate_static_quant_q15_16_attn(seq_len, heads, dim), [5, 6])(xq, cq, sq, hq, scale)
+    torch.testing.assert_close(y, ref, rtol=0, atol=0)
+    torch.testing.assert_close(sy, ref_s, rtol=0, atol=0)
+
+
+@tilelang.testing.requires_cuda
+def test_rope_rotate_static_quant_attn_noscale_matches_scaled():
+    torch.manual_seed(0)
+    seq_len, heads, dim = 5, 3, 32
+    x = torch.randn((seq_len * heads, dim), device="cuda") * 0.2
+    cos = torch.cos(torch.randn((seq_len, dim // 2), device="cuda") * 0.1)
+    sin = torch.sin(torch.randn((seq_len, dim // 2), device="cuda") * 0.1)
+    h = hadamard(dim, "cuda")
+    xq, cq, sq, hq = q15(x), q15(cos), q15(sin), q15(h)
+    scale = torch.randint(300, 900, (heads,), device="cuda", dtype=torch.uint32)
+    ref, _ = compile_kernel(rope_rotate_static_quant_q15_16_attn(seq_len, heads, dim), [5, 6])(xq, cq, sq, hq, scale)
+    y = compile_kernel(rope_rotate_static_quant_q15_16_attn_noscale(seq_len, heads, dim), [5])(xq, cq, sq, hq, scale)
+    torch.testing.assert_close(y, ref, rtol=0, atol=0)
+
+
+@tilelang.testing.requires_cuda
+def test_rope_rotate_static_quant_attn_hadamard_approx_close():
+    torch.manual_seed(0)
+    seq_len, heads, dim = 64, 16, 128
+    x = torch.randn((seq_len * heads, dim), device="cuda") * 0.2
+    cos = torch.cos(torch.randn((seq_len, dim // 2), device="cuda") * 0.1)
+    sin = torch.sin(torch.randn((seq_len, dim // 2), device="cuda") * 0.1)
+    h = hadamard(dim, "cuda")
+    xq, cq, sq, hq = q15(x), q15(cos), q15(sin), q15(h)
+    scale = torch.randint(300, 900, (heads,), device="cuda", dtype=torch.uint32)
+    ref = compile_kernel(rope_rotate_static_quant_q15_16_attn_noscale(seq_len, heads, dim), [5])(xq, cq, sq, hq, scale)
+    y = compile_kernel(rope_rotate_static_quant_q15_16_attn_hadamard_approx(seq_len, heads, dim), [5])(xq, cq, sq, hq, scale)
+    rf, yf = ref.float().flatten(), y.float().flatten()
+    diff = yf - rf
+    cos_sim = torch.nn.functional.cosine_similarity(yf, rf, dim=0)
+    rel_mse = (diff * diff).sum() / (rf * rf).sum().clamp_min(1e-30)
+    assert float(cos_sim) > 0.999
+    assert float(rel_mse) < 0.003
 
 
 @tilelang.testing.requires_cuda
@@ -435,6 +622,44 @@ def test_attention_i8_q15_16_gqa_softmax_i16v8_matches_torch_pv():
 
 
 @tilelang.testing.requires_cuda
+def test_attention_i8v8_q15_16_gqa_fused_matches_split():
+    torch.manual_seed(0)
+    q_heads, kv_heads, seqlen, dim, block_n = 16, 8, 128, 128, 64
+    q = torch.randint(-127, 128, (q_heads, seqlen, dim), device="cuda", dtype=torch.int8)
+    k = torch.randint(-127, 128, (kv_heads, seqlen, dim), device="cuda", dtype=torch.int8)
+    v = torch.randint(-127, 128, (kv_heads, seqlen, dim), device="cuda", dtype=torch.int8)
+    qs = torch.round((torch.rand((q_heads, seqlen), device="cuda") * 0.02 + 0.005) * Q15_16).to(torch.uint32)
+    ks = torch.round((torch.rand((kv_heads, seqlen), device="cuda") * 0.02 + 0.005) * Q15_16).to(torch.uint32)
+    vs = torch.round((torch.rand((kv_heads, seqlen), device="cuda") * 0.03 + 0.004) * Q15_16).to(torch.uint32)
+    lut = torch.from_numpy(exp_lut_neg()).cuda()
+    p = compile_kernel(attention_i8_q15_16_gqa_softmax_i16(q_heads, kv_heads, seqlen, dim, block_n=block_n), [5])(q, k, qs, ks, lut)
+    ref = compile_kernel(attention_i16v8_q15_16_gqa(q_heads, kv_heads, seqlen, dim, block_n=block_n), [3])(p, v, vs)
+    y = compile_kernel(attention_i8v8_q15_16_gqa_fused(q_heads, kv_heads, seqlen, dim, block_n=block_n), [7])(q, k, v, qs, ks, vs, lut)
+    torch.testing.assert_close(y, ref, rtol=0, atol=0)
+
+
+@tilelang.testing.requires_cuda
+def test_attention_i8v8_q15_16_gqa_fused_static_matches_expanded_scale():
+    torch.manual_seed(0)
+    q_heads, kv_heads, seqlen, dim, block_n = 16, 8, 128, 128, 64
+    q = torch.randint(-127, 128, (q_heads, seqlen, dim), device="cuda", dtype=torch.int8)
+    k = torch.randint(-127, 128, (kv_heads, seqlen, dim), device="cuda", dtype=torch.int8)
+    v = torch.randint(-127, 128, (kv_heads, seqlen, dim), device="cuda", dtype=torch.int8)
+    qs_head = torch.round((torch.rand((q_heads,), device="cuda") * 0.02 + 0.005) * Q15_16).to(torch.uint32)
+    ks_head = torch.round((torch.rand((kv_heads,), device="cuda") * 0.02 + 0.005) * Q15_16).to(torch.uint32)
+    vs_head = torch.round((torch.rand((kv_heads,), device="cuda") * 0.03 + 0.004) * Q15_16).to(torch.uint32)
+    qs = qs_head[:, None].expand(q_heads, seqlen).contiguous()
+    ks = ks_head[:, None].expand(kv_heads, seqlen).contiguous()
+    vs = vs_head[:, None].expand(kv_heads, seqlen).contiguous()
+    lut = torch.from_numpy(exp_lut_neg()).cuda()
+    ref = compile_kernel(attention_i8v8_q15_16_gqa_fused(q_heads, kv_heads, seqlen, dim, block_n=block_n), [7])(q, k, v, qs, ks, vs, lut)
+    y = compile_kernel(attention_i8v8_q15_16_gqa_fused_static(q_heads, kv_heads, seqlen, dim, block_n=block_n), [7])(
+        q, k, v, qs_head, ks_head, vs_head, lut
+    )
+    torch.testing.assert_close(y, ref, rtol=0, atol=0)
+
+
+@tilelang.testing.requires_cuda
 def test_attention_i8_q15_16_gqa_cache_matches_repeated_kv():
     torch.manual_seed(0)
     q_heads, kv_heads, cache_len, seqlen, dim = 16, 8, 17, 73, 128
@@ -491,6 +716,56 @@ def test_attention_i8_q15_16_gqa_cache_softmax_i16v8_matches_cache_attention():
 
 
 @tilelang.testing.requires_cuda
+def test_attention_i8v8_q15_16_gqa_cache_fused_matches_split():
+    torch.manual_seed(0)
+    q_heads, kv_heads, cache_len, seqlen, dim, block_n = 16, 8, 17, 73, 128, 64
+    q = torch.randint(-127, 128, (q_heads, seqlen, dim), device="cuda", dtype=torch.int8)
+    k = torch.randint(-127, 128, (kv_heads, seqlen, dim), device="cuda", dtype=torch.int8)
+    v = torch.randint(-127, 128, (kv_heads, seqlen, dim), device="cuda", dtype=torch.int8)
+    ck = torch.randint(-127, 128, (kv_heads, cache_len, dim), device="cuda", dtype=torch.int8)
+    cv = torch.randint(-127, 128, (kv_heads, cache_len, dim), device="cuda", dtype=torch.int8)
+    qs = torch.round((torch.rand((q_heads, seqlen), device="cuda") * 0.02 + 0.005) * Q15_16).to(torch.uint32)
+    ks = torch.round((torch.rand((kv_heads, seqlen), device="cuda") * 0.02 + 0.005) * Q15_16).to(torch.uint32)
+    vs = torch.round((torch.rand((kv_heads, seqlen), device="cuda") * 0.03 + 0.004) * Q15_16).to(torch.uint32)
+    cks = torch.round((torch.rand((kv_heads, cache_len), device="cuda") * 0.02 + 0.005) * Q15_16).to(torch.uint32)
+    cvs = torch.round((torch.rand((kv_heads, cache_len), device="cuda") * 0.03 + 0.004) * Q15_16).to(torch.uint32)
+    lut = torch.from_numpy(exp_lut_neg()).cuda()
+    p = compile_kernel(attention_i8_q15_16_gqa_cache_softmax_i16(q_heads, kv_heads, seqlen, cache_len, dim, block_n=block_n), [7])(q, ck, k, qs, cks, ks, lut)
+    ref = compile_kernel(attention_i16v8_q15_16_gqa_cache(q_heads, kv_heads, seqlen, cache_len, dim, block_n=block_n), [5])(p, cv, v, cvs, vs)
+    y = compile_kernel(attention_i8v8_q15_16_gqa_cache_fused(q_heads, kv_heads, seqlen, cache_len, dim, block_n=block_n), [11])(
+        q, ck, cv, k, v, qs, cks, cvs, ks, vs, lut
+    )
+    torch.testing.assert_close(y, ref, rtol=0, atol=0)
+
+
+@tilelang.testing.requires_cuda
+def test_attention_i8v8_q15_16_gqa_cache_fused_static_current_matches_expanded_scale():
+    torch.manual_seed(0)
+    q_heads, kv_heads, cache_len, seqlen, dim, block_n = 16, 8, 17, 73, 128, 64
+    q = torch.randint(-127, 128, (q_heads, seqlen, dim), device="cuda", dtype=torch.int8)
+    k = torch.randint(-127, 128, (kv_heads, seqlen, dim), device="cuda", dtype=torch.int8)
+    v = torch.randint(-127, 128, (kv_heads, seqlen, dim), device="cuda", dtype=torch.int8)
+    ck = torch.randint(-127, 128, (kv_heads, cache_len, dim), device="cuda", dtype=torch.int8)
+    cv = torch.randint(-127, 128, (kv_heads, cache_len, dim), device="cuda", dtype=torch.int8)
+    qs_head = torch.round((torch.rand((q_heads,), device="cuda") * 0.02 + 0.005) * Q15_16).to(torch.uint32)
+    ks_head = torch.round((torch.rand((kv_heads,), device="cuda") * 0.02 + 0.005) * Q15_16).to(torch.uint32)
+    vs_head = torch.round((torch.rand((kv_heads,), device="cuda") * 0.03 + 0.004) * Q15_16).to(torch.uint32)
+    qs = qs_head[:, None].expand(q_heads, seqlen).contiguous()
+    ks = ks_head[:, None].expand(kv_heads, seqlen).contiguous()
+    vs = vs_head[:, None].expand(kv_heads, seqlen).contiguous()
+    cks = torch.round((torch.rand((kv_heads, cache_len), device="cuda") * 0.02 + 0.005) * Q15_16).to(torch.uint32)
+    cvs = torch.round((torch.rand((kv_heads, cache_len), device="cuda") * 0.03 + 0.004) * Q15_16).to(torch.uint32)
+    lut = torch.from_numpy(exp_lut_neg()).cuda()
+    ref = compile_kernel(attention_i8v8_q15_16_gqa_cache_fused(q_heads, kv_heads, seqlen, cache_len, dim, block_n=block_n), [11])(
+        q, ck, cv, k, v, qs, cks, cvs, ks, vs, lut
+    )
+    y = compile_kernel(attention_i8v8_q15_16_gqa_cache_fused_static_current(q_heads, kv_heads, seqlen, cache_len, dim, block_n=block_n), [11])(
+        q, ck, cv, k, v, qs_head, cks, cvs, ks_head, vs_head, lut
+    )
+    torch.testing.assert_close(y, ref, rtol=0, atol=0)
+
+
+@tilelang.testing.requires_cuda
 def test_silu_mul_dynamic_quant_matches_unfused():
     torch.manual_seed(0)
     rows, cols = 3, 64
@@ -501,5 +776,32 @@ def test_silu_mul_dynamic_quant_matches_unfused():
     ref_y = ((((gate >> 10) * fix_lut_10bit(gate, lut, 1.0 / 1024.0)) >> 8) * (up >> 8)).to(torch.int32)
     ref_q, ref_s = compile_kernel(dynamic_quant_q15_16(rows, cols, "int8"), [1, 2])(ref_y)
     torch.testing.assert_close(y, ref_y, rtol=0, atol=0)
+    torch.testing.assert_close(q, ref_q, rtol=0, atol=0)
+    torch.testing.assert_close(s, ref_s, rtol=0, atol=0)
+
+
+@tilelang.testing.requires_cuda
+def test_silu_mul_dynamic_quant_fast_matches_full():
+    torch.manual_seed(0)
+    rows, cols = 3, 64
+    gate = torch.randint(-300000, 300001, (rows, cols), device="cuda", dtype=torch.int32)
+    up = torch.randint(-300000, 300001, (rows, cols), device="cuda", dtype=torch.int32)
+    lut = torch.from_numpy(sigmoid_lut()).cuda()
+    _y, ref_q, ref_s = compile_kernel(silu_mul_dynamic_quant_q15_16(rows, cols), [3, 4, 5])(gate, up, lut)
+    q, s = compile_kernel(silu_mul_dynamic_quant_q15_16_fast(rows, cols), [3, 4])(gate, up, lut)
+    torch.testing.assert_close(q, ref_q, rtol=0, atol=0)
+    torch.testing.assert_close(s, ref_s, rtol=0, atol=0)
+
+
+@tilelang.testing.requires_cuda
+def test_silu_mul_dynamic_quant_i16_fast_matches_dynamic_i16():
+    torch.manual_seed(0)
+    rows, cols = 3, 64
+    gate = torch.randint(-300000, 300001, (rows, cols), device="cuda", dtype=torch.int32)
+    up = torch.randint(-300000, 300001, (rows, cols), device="cuda", dtype=torch.int32)
+    lut = torch.from_numpy(sigmoid_lut()).cuda()
+    y, _q8, _s8 = compile_kernel(silu_mul_dynamic_quant_q15_16(rows, cols), [3, 4, 5])(gate, up, lut)
+    ref_q, ref_s = compile_kernel(dynamic_quant_q15_16(rows, cols, "int16"), [1, 2])(y)
+    q, s = compile_kernel(silu_mul_dynamic_quant_q15_16_i16_fast(rows, cols), [3, 4])(gate, up, lut)
     torch.testing.assert_close(q, ref_q, rtol=0, atol=0)
     torch.testing.assert_close(s, ref_s, rtol=0, atol=0)
