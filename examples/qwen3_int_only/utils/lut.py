@@ -13,7 +13,10 @@ def rsqrt_lut():
 
 def sigmoid_lut():
     def sigmoid(x):
-        x = min(max(x, -7.0), 7.0)
+        if x <= -7.0:
+            return 0.0
+        if x >= 7.0:
+            return 1.0
         return 1.0 / (1.0 + math.exp(-x))
 
     return np.array([round(sigmoid((i - 512) / 64.0) * 1024.0) for i in range(1024)], dtype=np.int32)

@@ -278,7 +278,16 @@ def silu_hadamard_i8(rows, cols, block_dim=128):
             for i in T.serial(thread_elem):
                 c = g * T.int32(block_dim) + tx * T.int32(thread_elem) + i
                 sig = T.fix.lut_10bit(Gate[r, c], LUT, scale=SCALE_INV_1024, out_dtype="int32")
-                local[i] = ((((Gate[r, c] >> T.int32(10)) * sig) >> T.int32(8)) * (Up[r, c] >> T.int32(8)))
+                local[i] = ((((Gate[r, c] * sig) >> T.int32(10)) >> T.int32(8)) * (Up[r, c] >> T.int32(8)))
+                local[i] = T.if_then_else(
+                    Gate[r, c] < T.int32(-458752),
+                    T.int32(0),
+                    T.if_then_else(
+                        Gate[r, c] > T.int32(458752),
+                        (Gate[r, c] >> T.int32(8)) * (Up[r, c] >> T.int32(8)),
+                        local[i],
+                    ),
+                )
             for i in T.serial(thread_round):
                 chunksize = 1 << (i + 1)
                 chunknum = thread_elem // chunksize

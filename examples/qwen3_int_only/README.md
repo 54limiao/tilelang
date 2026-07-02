@@ -16,23 +16,17 @@ model:   /publicdata/huggingface.co/Qwen/Qwen3-0.6B
 data:    /publicdata/huggingface.co/datasets/HuggingFaceFW/fineweb/sample/10BT/000_00000.parquet
 ```
 
-Current 2048-token FineWeb quality result against HF bf16:
+## Qwen3-0.6B
 
-| backend | tokens | loss | ppl | cos | mse | rel_mse |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| HF bf16 | 2048 | 3.801437 | 44.765483 | - | - | - |
-| int-only | 2048 | 3.807890 | 45.055291 | 0.99143751 | 1.94956367e-01 | 1.70894618e-02 |
+2048-token FineWeb quality result against HF bf16:
 
-Current Qwen3-14B 2048-token FineWeb quality result against HF bf16:
+| backend | tokens | loss | ppl | cos | mse |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| HF bf16 | 2048 | 3.801437 | 44.765483 | - | - |
+| fake-quant | 2048 | 3.819883 | 45.598856 | 0.99490349 | 1.16091984e-01 |
+| **int-only** | **2048** | **3.813368** | **45.302766** | **0.99184574** | **1.86436099e-01** |
 
-| backend | tokens | loss | ppl | cos | mse | rel_mse |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| HF bf16 | 2048 | pending local-model rerun | pending local-model rerun | - | - | - |
-| int-only | 2048 | 9.610601 | 14922.141941 | 0.53104687 | 1.39142853e+01 | 8.44334629e-01 |
-
-The 14B quality result is currently not acceptable and needs debugging before it should be treated as a working 14B deployment result. HF-only 14B measurement from publicdata was interrupted because loading the first shard took more than two minutes; copy the model to `/tmp` or `/code` and rerun to fill the HF bf16 row.
-
-Qwen3-0.6B kernel profile for the int-only LLM block path: 2048 tokens, 28 layers, prefix KV cache enabled, 16 measured repeats.
+Kernel profile for the int-only LLM block path: 2048 tokens, 28 layers, prefix KV cache enabled, 16 measured repeats.
 
 | kernel | total ms | math TOPS | tc TOPS | tc util | pct |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -45,18 +39,30 @@ Qwen3-0.6B kernel profile for the int-only LLM block path: 2048 tokens, 28 layer
 | quant_v_i8 | 15.461 | - | - | - | 2.15% |
 | total | 720.156 | 61.56 | 83.04 | 13.31% | 100.00% |
 
-Qwen3-14B uses the same static int-only path, packed with the normal 32 x 2048 FineWeb calibration flow. Kernel profile: 2048 tokens, 40 layers, prefix KV cache enabled, 16 measured repeats.
+## Qwen3-14B
+
+2048-token FineWeb quality result against HF bf16:
+
+| backend | tokens | loss | ppl | cos | mse |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| HF bf16 | 2048 | 3.031365 | 20.725512 | - | - |
+| fake-quant | 2048 | 3.048030 | 21.073791 | 0.98760375 | 4.06879236e-01 |
+| **int-only** | **2048** | **3.093172** | **22.046891** | **0.96337582** | **1.24137745e+00** |
+
+Torch fake-quant uses the same packed int8 weights and static activation scales, but computes matmul, attention, and SiLU in torch float after QDQ. This gives the current pure-i8 quantization ceiling before kernel fixed-point error. The int-only kernel path should first close the gap from the current baseline to this fake-quant ceiling.
+
+Kernel profile for the same static int-only path: 2048 tokens, 40 layers, prefix KV cache enabled, 16 measured repeats.
 
 | kernel | total ms | math TOPS | tc TOPS | tc util | pct |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| linear_i8 | 5707.697 | 151.70 | 151.70 | 24.31% | 77.16% |
-| attention_i8 | 1073.495 | 51.46 | 102.92 | 16.49% | 14.51% |
-| silu_hadamard_i8 | 194.378 | - | - | - | 2.63% |
-| rms_sq8 | 138.434 | - | - | - | 1.87% |
-| rope_sq8 | 130.549 | - | - | - | 1.76% |
-| rms_q15 | 129.884 | - | - | - | 1.76% |
-| quant_v_i8 | 23.081 | - | - | - | 0.31% |
-| total | 7397.517 | 124.52 | 131.98 | 21.15% | 100.00% |
+| linear_i8 | 5684.166 | 152.33 | 152.33 | 24.41% | 77.07% |
+| attention_i8 | 1072.657 | 51.50 | 103.00 | 16.51% | 14.54% |
+| silu_hadamard_i8 | 205.398 | - | - | - | 2.79% |
+| rms_sq8 | 134.289 | - | - | - | 1.82% |
+| rope_sq8 | 129.244 | - | - | - | 1.75% |
+| rms_q15 | 126.678 | - | - | - | 1.72% |
+| quant_v_i8 | 22.601 | - | - | - | 0.31% |
+| total | 7375.033 | 124.90 | 132.39 | 21.22% | 100.00% |
 
 On 0.6B, attention is a large share because the MLP/linear matrices are small. On 14B, the same 2048-token attention work is much less dominant relative to the hidden/intermediate-size linear work, so `linear_i8` becomes the main cost.
 

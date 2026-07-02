@@ -11,7 +11,7 @@ from safetensors import safe_open
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from examples.qwen3_int_only.model import Q15_16, Qwen3IntOnlyModel
-from examples.qwen3_int_only.utils import ROTATE_SEED, Qwen3Config, load_packed_qwen3, random_hadamard_rotation
+from examples.qwen3_int_only.utils import ROTATE_SEED, Qwen3Config, random_hadamard_rotation
 
 
 DEFAULT_MODEL_DIR = "/publicdata/huggingface.co/Qwen/Qwen3-0.6B"
@@ -23,9 +23,9 @@ DATASETS = {
 }
 
 
-def packed_use_r2(packed_dir):
+def packed_flag(packed_dir, name):
     with safe_open(f"{packed_dir}/qwen3_int_only.safetensors", framework="pt", device="cpu") as f:
-        return (f.metadata() or {}).get("use_r2") == "1"
+        return (f.metadata() or {}).get(name) == "1"
 
 
 def load_cache_scales(packed_dir, layers, device="cuda"):
@@ -156,6 +156,8 @@ def hf_logits(model, windows, cache_prompt, tokenizer):
 @torch.no_grad()
 def build_cache_kv(hf_model, tokenizer, cache_prompt, cache_scales, use_r2, config):
     cache_ids = torch.tensor(tokenizer(cache_prompt, add_special_tokens=False).input_ids, device="cuda", dtype=torch.long)
+    if cache_ids.numel() == 0:
+        return None, 0
     past = hf_model(cache_ids[None, :], use_cache=True).past_key_values
     if hasattr(past, "layers"):
         past = [(layer.keys, layer.values) for layer in past.layers]
@@ -216,14 +218,15 @@ def main():
         print_metrics("hf", hf_stats, "none")
     else:
         golden = None
-    use_r2 = args.use_r2 or packed_use_r2(args.packed_dir)
+    use_r2 = args.use_r2 or packed_flag(args.packed_dir, "use_r2")
+    use_r3 = packed_flag(args.packed_dir, "use_r3")
     cache_scales = load_cache_scales(args.packed_dir, args.layers)
     print("building cache kv", file=sys.stderr, flush=True)
     cache_kv, cache_len = build_cache_kv(hf_model, tokenizer, args.cache_prompt, cache_scales, use_r2, config)
     del hf_model, cache_scales
     torch.cuda.empty_cache()
     print("loading int-only model", file=sys.stderr, flush=True)
-    int_model = Qwen3IntOnlyModel(windows.shape[1] - 1, model_dir=args.model_dir, packed_dir=args.packed_dir, config=config, cache_len=cache_len)
+    int_model = Qwen3IntOnlyModel(windows.shape[1] - 1, model_dir=args.model_dir, packed_dir=args.packed_dir, config=config, cache_len=cache_len, layers=args.layers, use_r3=use_r3)
     print("running int-only logits", file=sys.stderr, flush=True)
     acc = new_acc()
     for idx, row in enumerate(windows):

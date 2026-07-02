@@ -89,24 +89,24 @@ class Qwen3IntOnlyBlock:
 
 
 class Qwen3IntOnlyModel:
-    def __init__(self, seq_len, model_dir="/publicdata/huggingface.co/Qwen/Qwen3-0.6B", packed_dir="/tmp/Qwen3-0.6B-static-calib-32x2048", config=None, cache_len=0, rotate_seed=ROTATE_SEED):
+    def __init__(self, seq_len, model_dir="/publicdata/huggingface.co/Qwen/Qwen3-0.6B", packed_dir="/tmp/Qwen3-0.6B-static-calib-32x2048", config=None, cache_len=0, rotate_seed=ROTATE_SEED, layers=None, use_r3=True):
         config = Qwen3Config.from_model_dir(model_dir) if config is None else config
         self.seq_len = seq_len
         self.cache_len = cache_len
         self.config = config
-        self.r3_q15 = q15_16(random_hadamard_rotation(config.head_dim, rotate_seed + 2))
+        self.r3_q15 = q15_16(random_hadamard_rotation(config.head_dim, rotate_seed + 2)) if use_r3 else None
         self.block = Qwen3IntOnlyBlock(seq_len, config, cache_len=cache_len)
         self.final_norm = tilelang.compile(rms_q15(seq_len, config.hidden_size), out_idx=[4, 5], target="cuda")
         self.zero_hidden = torch.zeros((seq_len, config.hidden_size), device="cuda", dtype=torch.int32)
         self.lut_rsqrt = torch.from_numpy(rsqrt_lut()).cuda()
         self.cos, self.sin, _ = rope_tables_q15_16(seq_len + cache_len, config.head_dim, config.rope_theta)
-        self.embed, self.lm_head, self.norm_weight, self.layers = load_packed_qwen3(packed_dir, config)
+        self.embed, self.lm_head, self.norm_weight, self.layers = load_packed_qwen3(packed_dir, config, layers=layers)
 
     def hidden(self, input_ids, layers=None, cache_kv=None):
-        residual = q15_16(self.embed[input_ids])
-        x8 = self.block.input_rms_quant(residual, self.layers[0])
         mlp = None
         n_layers = self.config.num_hidden_layers if layers is None else layers
+        residual = q15_16(self.embed[input_ids])
+        x8 = None if n_layers == 0 else self.block.input_rms_quant(residual, self.layers[0])
         for layer_idx in range(n_layers):
             if layer_idx:
                 residual, x8, _ = self.block.rms_sq8(residual, mlp, self.layers[layer_idx].input_layernorm, self.lut_rsqrt, self.layers[layer_idx].input_qkv_i8_qt)

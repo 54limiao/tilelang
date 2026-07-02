@@ -10,7 +10,8 @@ def proto(Gate, Up, LUT, QT, block_dim=128):
     vals = np.empty((rows, cols), dtype=np.int32)
     for r in range(rows):
         sig = lut_10bit(Gate[r], LUT, 1.0 / 1024.0, "int32").astype(np.int64)
-        vals[r] = ((((Gate[r].astype(np.int64) >> 10) * sig) >> 8) * (Up[r].astype(np.int64) >> 8)).astype(np.int32)
+        vals[r] = (((((Gate[r].astype(np.int64) * sig) >> 10) >> 8) * (Up[r].astype(np.int64) >> 8))).astype(np.int32)
+        vals[r] = np.where(Gate[r] < -458752, 0, np.where(Gate[r] > 458752, (Gate[r].astype(np.int64) >> 8) * (Up[r].astype(np.int64) >> 8), vals[r])).astype(np.int32)
     y = vals.reshape(rows, cols // block_dim, block_dim)
     return fix_quant(fwht(y).reshape(rows, cols), QT[0], "int8")
 

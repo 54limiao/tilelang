@@ -36,9 +36,13 @@ def pack_scale(real_multiplier):
 def ratio_qt(numer, denom):
     n = np.asarray(numer, dtype=np.int64).clip(min=1)
     d = np.asarray(denom, dtype=np.int64).clip(min=1)
-    ratio = n.astype(np.float64) / d.astype(np.float64)
-    best_mul = np.zeros_like(n, dtype=np.int64)
-    best_shift = np.zeros_like(n, dtype=np.int64)
+    return pack_qt_array(n.astype(np.float64) / d.astype(np.float64))
+
+
+def pack_qt_array(ratio):
+    ratio = np.asarray(ratio, dtype=np.float64).clip(min=2.0**-63)
+    best_mul = np.zeros(ratio.shape, dtype=np.int64)
+    best_shift = np.zeros(ratio.shape, dtype=np.int64)
     best_err = np.full(ratio.shape, np.inf, dtype=np.float64)
     for shift in range(64):
         mul_f = np.rint(ratio * float(1 << shift))
@@ -105,7 +109,14 @@ def rsqrt_lut_np():
 
 
 def sigmoid_lut_np():
-    return np.array([round((1.0 / (1.0 + math.exp(-min(max((i - 512) / 64.0, -7.0), 7.0)))) * 1024.0) for i in range(1024)], dtype=np.int32)
+    def sigmoid(x):
+        if x <= -7.0:
+            return 0.0
+        if x >= 7.0:
+            return 1.0
+        return 1.0 / (1.0 + math.exp(-x))
+
+    return np.array([round(sigmoid((i - 512) / 64.0) * 1024.0) for i in range(1024)], dtype=np.int32)
 
 
 def exp_lut_neg_np():

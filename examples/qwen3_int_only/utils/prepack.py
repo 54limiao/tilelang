@@ -129,6 +129,7 @@ def write_timestamp(path, args, calib_tokens, calib_seq_len, metadata=None):
                 f"use_r1={value('use_r1', int(args.use_r1))}",
                 f"use_r2={value('use_r2', int(args.use_r2))}",
                 f"use_r3={value('use_r3', int(args.use_r3))}",
+                f"weight_scale_dtype={value('weight_scale_dtype', 'fp32')}",
             )
         )
         + "\n",
@@ -143,6 +144,8 @@ def current_pack_metadata(path, args, config):
     if metadata.get("model_dir") != args.model_dir:
         return None
     if metadata.get("hidden_size") != str(config.hidden_size) or metadata.get("num_hidden_layers") != str(config.num_hidden_layers):
+        return None
+    if metadata.get("weight_scale_dtype") != "fp32":
         return None
     expected_layers = str(args.max_layers or config.num_hidden_layers)
     if metadata.get("packed_layers") != expected_layers:
@@ -360,6 +363,7 @@ def main():
             "calib_batches": str(args.calib_batches),
             "calib_prefix_tokens": str(args.calib_prefix_tokens),
             "cache_prompt": args.cache_prompt,
+            "weight_scale_dtype": "fp32",
         },
     )
     write_timestamp(timestamp, args, calib_tokens, calib_seq_len)
