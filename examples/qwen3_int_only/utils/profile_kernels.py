@@ -115,9 +115,11 @@ def run_block(block, x, weights, cos, sin, r3_q15, prof, cache_k=None, cache_v=N
     attn8, attn_s8 = prof.time("dq8_attn", lambda: block.dq8_q(attn))
     attn_out = prof.time("o_proj_i8", lambda: block.o_proj(attn8, attn_s8, weights.o_proj.weight, weights.o_proj.scale))
     h, post = prof.time("residual_attn_rms_q15", lambda: block.add_rms_hidden_q15(x, attn_out, weights.post_attention_layernorm, block.lut_rsqrt))
-    h8, hs8 = prof.time("sq8_hidden_static", lambda: block.sq8_hidden(post, weights.post_mlp_i8_scale))
+    h8, _hs8 = prof.time("sq8_hidden_static", lambda: block.sq8_hidden(post, weights.post_mlp_i8_scale))
+    hs8 = weights.post_mlp_i8_scale
     gate, up = prof.time("gate_up_proj_static", lambda: block.gate_up_proj_static(h8, hs8, weights.gate_proj.weight, weights.gate_proj.scale, weights.up_proj.weight, weights.up_proj.scale))
-    gated, gs = prof.time("silu_mul_sq16_mid_fast", lambda: block.silu_mul_sq16_mid_fast(gate, up, block.lut_sigmoid, weights.gated_mlp_i16_scale))
+    gated, _gs = prof.time("silu_mul_sq16_mid_fast", lambda: block.silu_mul_sq16_mid_fast(gate, up, block.lut_sigmoid, weights.gated_mlp_i16_scale))
+    gs = weights.gated_mlp_i16_scale
     return prof.time("down_residual_static", lambda: block.down_residual_static(gated, gs, weights.down_proj.weight, weights.down_proj.scale, h))
 
 
@@ -125,7 +127,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-dir", default=DEFAULT_MODEL_DIR)
     parser.add_argument("--packed-dir", default="/tmp/Qwen3-0.6B-static-calib-32x2048")
-    parser.add_argument("--max-tokens", type=int, default=2049)
+    parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--layers", type=int, default=28)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeat", type=int, default=3)
@@ -140,7 +142,7 @@ def main():
         if len(ids) >= args.max_tokens:
             break
     ids = ids[: args.max_tokens]
-    seq_len = len(ids) - 1
+    seq_len = len(ids)
     seq_len -= seq_len % 32
     ids = torch.tensor(ids[:seq_len], device="cuda", dtype=torch.long)
     _packed_r1, packed_r2 = packed_flags(args.packed_dir)
