@@ -7,9 +7,10 @@ from tvm.tirx import IntImm, PrimExpr
 
 from .tir import ir as T
 
-Q_MULTIPLIER_WIDTH = 16
+Q_MULTIPLIER_WIDTH = 26
 _Q_MULTIPLIER_MASK = (1 << Q_MULTIPLIER_WIDTH) - 1
 _Q_SHIFT_MASK = 0x3F
+_INT32_MIN = -(1 << 31)
 _INT_RANGES = {
     "int8": (-128, 127),
     "int16": (-32768, 32767),
@@ -24,25 +25,41 @@ _SIGNED_INT_RANGES = {
     "int16": (-32768, 32767),
     "int32": (-(1 << 31), (1 << 31) - 1),
 }
+_XP5_QUANT_DTYPES = {
+    ("int8", "int32"),
+    ("int16", "int32"),
+    ("int32", "int32"),
+    ("int32", "int8"),
+    ("int32", "int16"),
+}
+_XP5_MUL_BITS = 26
+_XP5_SHIFT_BITS = 6
 
 
-def quantize_multiplier_like_xprt(real_multiplier: float, precision: int = Q_MULTIPLIER_WIDTH) -> tuple[int, int]:
+def quantize_multiplier_like_xp5(real_multiplier: float) -> tuple[int, int]:
     real_multiplier = float(real_multiplier)
     if real_multiplier <= 0.0:
         raise ValueError("T.fix.quant scale must be positive")
-    shift = precision
-    while real_multiplier < 0.5:
-        real_multiplier *= 2.0
-        shift += 1
-    while real_multiplier >= 1.0:
-        real_multiplier /= 2.0
-        shift -= 1
-    return int(round(real_multiplier * ((1 << precision) - 1))), shift
+    best_mul = 0
+    best_shift = 0
+    best_err = float("inf")
+    for shift in range(1 << _XP5_SHIFT_BITS):
+        mul = int(round(real_multiplier * (1 << shift)))
+        if 1 <= mul < (1 << _XP5_MUL_BITS):
+            err = abs(real_multiplier - (mul / float(1 << shift)))
+            if err <= best_err:
+                best_mul = mul
+                best_shift = shift
+                best_err = err
+    if best_mul == 0:
+        raise ValueError("T.fix.quant scale cannot be represented by XP5 mul/shift")
+    return best_mul, best_shift
 
 
-def pack_scale(real_multiplier: float, precision: int = Q_MULTIPLIER_WIDTH) -> int:
-    mul, shift = quantize_multiplier_like_xprt(real_multiplier, precision)
-    return (int(shift) << Q_MULTIPLIER_WIDTH) | (int(mul) & _Q_MULTIPLIER_MASK)
+def pack_scale(real_multiplier: float) -> int:
+    mul, shift = quantize_multiplier_like_xp5(real_multiplier)
+    qt = (int(shift) << Q_MULTIPLIER_WIDTH) | (int(mul) & _Q_MULTIPLIER_MASK)
+    return qt if qt < (1 << 31) else qt - (1 << 32)
 
 
 def _as_i32(value: PrimExpr | int) -> PrimExpr:
@@ -53,16 +70,22 @@ def _i32(value: int) -> PrimExpr:
     return IntImm("int32", value)
 
 
-def _is_python_real(value) -> bool:
-    return isinstance(value, Real) and not isinstance(value, (bool, Integral))
+def _i64(value: int) -> PrimExpr:
+    return IntImm("int64", value)
 
 
-def _scale_to_qt(scale) -> PrimExpr | int:
-    return pack_scale(float(scale)) if _is_python_real(scale) else scale
+def _dtype_of(value) -> str | None:
+    dtype = getattr(value, "dtype", None)
+    return None if dtype is None else str(dtype)
+
+
+def _check_int_range(name: str, value, lo: int, hi: int) -> None:
+    if isinstance(value, Integral) and not (lo <= int(value) <= hi):
+        raise ValueError(f"T.fix.quant {name} must be in [{lo}, {hi}]")
 
 
 def _unpack_mul_i32(scale_qt) -> PrimExpr:
-    return _as_i32(scale_qt) & _i32(_Q_MULTIPLIER_MASK)
+    return _as_i32(scale_qt) & _i32((1 << _XP5_MUL_BITS) - 1)
 
 
 def _unpack_shift_i32(scale_qt) -> PrimExpr:
@@ -88,6 +111,68 @@ def saturate(x: PrimExpr, out_dtype: str) -> PrimExpr:
     return T.cast(_saturate_i32(_as_i32(x), str(out_dtype)), str(out_dtype))
 
 
+def div(
+    x: PrimExpr,
+    *,
+    scale,
+    out_dtype: str,
+    saturate: bool = True,
+) -> PrimExpr:
+    scale_i32 = _as_i32(scale)
+    x_i32 = _as_i32(x)
+    scale_i64 = T.cast(scale_i32, "int64")
+    x_i64 = T.cast(x_i32, "int64")
+    out = T.if_then_else(
+        scale_i32 == _i32(0),
+        _i64(0),
+        T.if_then_else(
+            (x_i64 == _i64(_INT32_MIN)) & (scale_i64 == _i64(-1)),
+            _i64(_INT32_MIN),
+            T.truncdiv(x_i64, scale_i64),
+        ),
+    )
+    out = T.cast(out, "int32")
+    if saturate and str(out_dtype) != "int32":
+        out = _saturate_i32(out, str(out_dtype))
+    return T.cast(out, str(out_dtype))
+
+
+def _wide_round_shift(x: PrimExpr, mul, shift, *, rounding: str) -> PrimExpr:
+    shift_i32 = _as_i32(shift)
+    x_i64 = T.cast(x, "int64")
+    prod = x_i64 * T.cast(mul, "int64")
+    out = prod >> shift_i32
+    if rounding == "nearest":
+        bit_shift = tirx.max(shift_i32 - _i32(1), _i32(0))
+        out += T.if_then_else(shift_i32 >= _i32(1), T.cast((prod >> bit_shift) & T.cast(1, "int64"), "int64"), T.cast(0, "int64"))
+    return T.cast(out, "int32")
+
+
+def _check_scale(scale) -> None:
+    if isinstance(scale, Real) and not isinstance(scale, (bool, Integral)):
+        raise TypeError("T.fix.quant scale must be packed int32, not float")
+    if isinstance(scale, Integral):
+        scale = int(scale)
+        if not (_INT32_MIN <= scale <= 0xFFFFFFFF):
+            raise ValueError("T.fix.quant packed scale must fit in int32/uint32")
+        qt = scale & 0xFFFFFFFF
+        mul = qt & ((1 << Q_MULTIPLIER_WIDTH) - 1)
+        shift = (qt >> Q_MULTIPLIER_WIDTH) & _Q_SHIFT_MASK
+        _check_int_range("scale.mul", mul, 1, (1 << _XP5_MUL_BITS) - 1)
+        _check_int_range("scale.shift", shift, 0, (1 << _XP5_SHIFT_BITS) - 1)
+
+
+def _quant_scale(x: PrimExpr, scale, out_dtype: str, rounding: str, do_saturate: bool) -> PrimExpr:
+    in_dtype = _dtype_of(x)
+    if in_dtype is not None and (in_dtype, out_dtype) not in _XP5_QUANT_DTYPES:
+        raise TypeError(f"T.fix.quant only supports XP5 vquant dtypes: {sorted(_XP5_QUANT_DTYPES)}")
+    _check_scale(scale)
+    out = _wide_round_shift(x, _unpack_mul_i32(scale), _unpack_shift_i32(scale), rounding=rounding)
+    if do_saturate and out_dtype != "int32":
+        out = _saturate_i32(out, out_dtype)
+    return T.cast(out, out_dtype)
+
+
 def quant(
     x: PrimExpr,
     *,
@@ -97,11 +182,11 @@ def quant(
     saturate: bool = True,
 ) -> PrimExpr:
     out_dtype = str(out_dtype)
-    scale_qt = _scale_to_qt(scale)
-    out = round_shift(_as_i32(x) * _unpack_mul_i32(scale_qt), _unpack_shift_i32(scale_qt), rounding=rounding)
-    if saturate and out_dtype != "int32":
-        out = _saturate_i32(out, out_dtype)
-    return T.cast(out, out_dtype)
+    return _quant_scale(x, scale, out_dtype, rounding, saturate)
+
+
+def quant_i32(x: PrimExpr, *, scale, rounding: str = "nearest") -> PrimExpr:
+    return _quant_scale(x, scale, "int32", rounding, False)
 
 
 def signed_saturate(x: PrimExpr, dtype: str) -> PrimExpr:

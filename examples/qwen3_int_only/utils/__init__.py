@@ -17,6 +17,8 @@ from examples.qwen3_int_only.utils.quarot import (
 )
 
 Q15_16 = 1 << 16
+QT_SHIFT = 25
+QT_WIDTH = 26
 
 
 @dataclass(frozen=True)
@@ -44,6 +46,28 @@ QWEN3_0_6B = Qwen3Config()
 
 def q15_16(x):
     return torch.clamp(torch.round(x * Q15_16), -(1 << 31), (1 << 31) - 1).to(torch.int32)
+
+
+def ratio_qt(numer, denom):
+    n = numer.to(torch.int64).clamp(min=1)
+    d = denom.to(torch.int64).clamp(min=1)
+    ratio = n.to(torch.float64) / d.to(torch.float64)
+    best_mul = torch.zeros_like(n, dtype=torch.int64)
+    best_shift = torch.zeros_like(n, dtype=torch.int64)
+    best_err = torch.full_like(ratio, float("inf"), dtype=torch.float64)
+    for shift in range(64):
+        mul = torch.round(ratio * float(1 << shift)).to(torch.int64)
+        valid = (mul >= 1) & (mul < (1 << QT_WIDTH))
+        err = torch.abs(ratio - (mul.to(torch.float64) / float(1 << shift)))
+        take = valid & (err <= best_err)
+        best_mul = torch.where(take, mul, best_mul)
+        best_shift = torch.where(take, torch.full_like(best_shift, shift), best_shift)
+        best_err = torch.where(take, err, best_err)
+    return (((best_shift << QT_WIDTH) | best_mul).to(torch.uint32)).contiguous()
+
+
+def reciprocal_qt(scale):
+    return ratio_qt(torch.ones_like(scale), scale)
 
 
 def per_channel_i8_weight(w):
@@ -85,12 +109,20 @@ class Qwen3BlockWeights:
     q_norm: torch.Tensor
     k_norm: torch.Tensor
     input_qkv_i8_scale: torch.Tensor | None = None
+    input_qkv_i8_qt: torch.Tensor | None = None
     q_post_rope_i8_scale: torch.Tensor | None = None
+    q_post_rope_i8_qt: torch.Tensor | None = None
     k_post_rope_i8_scale: torch.Tensor | None = None
+    k_post_rope_i8_qt: torch.Tensor | None = None
     v_i8_scale: torch.Tensor | None = None
+    v_i8_qt: torch.Tensor | None = None
     attn_i8_scale: torch.Tensor | None = None
+    attn_i8_qt: torch.Tensor | None = None
+    attn_out_qt: torch.Tensor | None = None
     post_mlp_i8_scale: torch.Tensor | None = None
+    post_mlp_i8_qt: torch.Tensor | None = None
     gated_mlp_i16_scale: torch.Tensor | None = None
+    gated_mlp_i16_qt: torch.Tensor | None = None
 
 
 # Used by small standalone tests and by prepack-compatible float loading.
@@ -119,6 +151,10 @@ def load_packed_qwen3(packed_dir, config=QWEN3_0_6B, device="cuda"):
     def optional(name):
         return tensors[name] if name in tensors else None
 
+    def optional_qt(name):
+        s = optional(name)
+        return None if s is None else reciprocal_qt(s)
+
     def linear(name):
         return Int8LinearWeight(tensors[f"{name}.weight"], tensors[f"{name}.scale"])
 
@@ -145,12 +181,20 @@ def load_packed_qwen3(packed_dir, config=QWEN3_0_6B, device="cuda"):
                 q_norm=tensors[f"{p}.q_norm"],
                 k_norm=tensors[f"{p}.k_norm"],
                 input_qkv_i8_scale=optional(f"{p}.input_qkv_i8.scale"),
+                input_qkv_i8_qt=optional_qt(f"{p}.input_qkv_i8.scale"),
                 q_post_rope_i8_scale=optional(f"{p}.q_post_rope_i8.scale"),
+                q_post_rope_i8_qt=optional_qt(f"{p}.q_post_rope_i8.scale"),
                 k_post_rope_i8_scale=optional(f"{p}.k_post_rope_i8.scale"),
+                k_post_rope_i8_qt=optional_qt(f"{p}.k_post_rope_i8.scale"),
                 v_i8_scale=optional(f"{p}.v_i8.scale"),
+                v_i8_qt=optional_qt(f"{p}.v_i8.scale"),
                 attn_i8_scale=optional(f"{p}.attn_i8.scale"),
+                attn_i8_qt=optional_qt(f"{p}.attn_i8.scale"),
+                attn_out_qt=ratio_qt(optional(f"{p}.v_i8.scale"), optional(f"{p}.attn_i8.scale").to(torch.int64) * 32767),
                 post_mlp_i8_scale=optional(f"{p}.post_mlp_i8.scale"),
+                post_mlp_i8_qt=optional_qt(f"{p}.post_mlp_i8.scale"),
                 gated_mlp_i16_scale=optional(f"{p}.gated_mlp_i16.scale"),
+                gated_mlp_i16_qt=optional_qt(f"{p}.gated_mlp_i16.scale"),
             )
         )
     return tensors["model.embed_tokens.weight"], tensors["lm_head.weight"], tensors["model.norm.weight"], blocks

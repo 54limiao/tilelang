@@ -4,7 +4,7 @@ import numpy as np
 import torch
 
 Q15_16 = 1 << 16
-Q_MULTIPLIER_WIDTH = 16
+Q_MULTIPLIER_WIDTH = 26
 MASK = (1 << Q_MULTIPLIER_WIDTH) - 1
 I32_MIN = -(1 << 31)
 
@@ -19,15 +19,18 @@ def q15(x):
 
 def pack_scale(real_multiplier):
     real_multiplier = float(real_multiplier)
-    shift = Q_MULTIPLIER_WIDTH
-    while real_multiplier < 0.5:
-        real_multiplier *= 2.0
-        shift += 1
-    while real_multiplier >= 1.0:
-        real_multiplier /= 2.0
-        shift -= 1
-    mul = int(round(real_multiplier * ((1 << Q_MULTIPLIER_WIDTH) - 1)))
-    return (shift << Q_MULTIPLIER_WIDTH) | (mul & MASK)
+    if real_multiplier <= 0.0:
+        raise ValueError("scale must be positive")
+    best_mul, best_shift, best_err = 0, 0, float("inf")
+    for shift in range(64):
+        mul = int(round(real_multiplier * (1 << shift)))
+        if 1 <= mul < (1 << Q_MULTIPLIER_WIDTH):
+            err = abs(real_multiplier - (mul / float(1 << shift)))
+            if err <= best_err:
+                best_mul, best_shift, best_err = mul, shift, err
+    if best_mul == 0:
+        raise ValueError("scale cannot be represented")
+    return (best_shift << Q_MULTIPLIER_WIDTH) | (best_mul & MASK)
 
 
 def round_shift(x, shift):
@@ -40,7 +43,7 @@ def round_shift(x, shift):
 
 
 def fix_quant(x, scale, out_dtype="int32"):
-    scale = pack_scale(scale) if isinstance(scale, float) else int(scale)
+    scale = pack_scale(scale) if isinstance(scale, float) else (int(scale) & 0xFFFFFFFF)
     mul = scale & MASK
     shift = (scale >> Q_MULTIPLIER_WIDTH) & 0x3F
     out = round_shift(np.asarray(x, dtype=np.int64) * mul, shift)

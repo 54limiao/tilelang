@@ -3,37 +3,30 @@ import math
 import tilelang
 import tilelang.language as T
 
-from tilelang.language.fix import Q_MULTIPLIER_WIDTH
+from tilelang.language.fix import Q_MULTIPLIER_WIDTH, pack_scale
 
 MASK = (1 << Q_MULTIPLIER_WIDTH) - 1
 ATTN_VALUE_SHIFT = 7
 I32_MIN = -2147483648
+SCALE_1024 = pack_scale(1024.0)
+SCALE_INV_1024 = pack_scale(1.0 / 1024.0)
+SCALE_EXP_LUT = pack_scale(0.125)
+DYN_SCALE_SHIFT = 25
+DYN_SCALE_ONE = 1 << DYN_SCALE_SHIFT
 
 
-def quant_v_i8(tokens, heads, head_dim, out_dtype="int8", qmax_override=None):
-    qmax = 127 if out_dtype == "int8" else 32767
-    if qmax_override is not None:
-        qmax = qmax_override
-
+def quant_v_i8(tokens, heads, head_dim):
     @T.prim_func
     def main(
         X: T.Tensor((tokens, heads, head_dim), "int32"),
-        S: T.Tensor((heads,), "uint32"),
-        Y: T.Tensor((heads, tokens, head_dim), out_dtype),
+        QT: T.Tensor((heads,), "uint32"),
+        Y: T.Tensor((heads, tokens, head_dim), "int8"),
     ):
         with T.Kernel(tokens, heads, threads=128) as (t, h):
-            scale = T.alloc_fragment((1,), "int32")
-            vals = T.alloc_fragment((head_dim,), "int32")
-            scale[0] = T.max(T.cast(S[h], "int32"), T.int32(1))
+            qt = T.alloc_local((1,), "uint32")
+            qt[0] = QT[h]
             for d in T.Parallel(head_dim):
-                vals[d] = X[t, h, d]
-                if vals[d] < T.int32(0):
-                    vals[d] = T.int32(0) - vals[d]
-                vals[d] = (vals[d] + (scale[0] >> T.int32(1))) // scale[0]
-                if X[t, h, d] < T.int32(0):
-                    vals[d] = T.int32(0) - vals[d]
-                vals[d] = T.min(T.max(vals[d], T.int32(0 - qmax - 1)), T.int32(qmax))
-                Y[h, t, d] = T.cast(vals[d], out_dtype)
+                Y[h, t, d] = T.fix.quant(X[t, h, d], scale=qt[0], out_dtype="int8")
 
     return main
 
@@ -55,6 +48,7 @@ def rms_q15(rows, cols, qmax=32767):
             xx = T.alloc_fragment((1, cols), "int32")
             amax = T.alloc_fragment((1,), "int32")
             scale = T.alloc_fragment((1,), "int32")
+            row_qt = T.alloc_fragment((1,), "int32")
             ss = T.alloc_fragment((1,), "int32")
             ns = T.alloc_fragment((1,), "int32")
             wk = T.alloc_fragment((1,), "int32")
@@ -69,14 +63,12 @@ def rms_q15(rows, cols, qmax=32767):
                     q[0, c] = T.int32(0) - q[0, c]
             T.reduce_max(q, amax, dim=1, clear=True)
             scale[0] = T.max((amax[0] + T.int32(qmax - 1)) // T.int32(qmax), T.int32(1))
+            row_qt[0] = (T.int32(DYN_SCALE_SHIFT) << T.int32(Q_MULTIPLIER_WIDTH)) | T.min(
+                (T.int32(DYN_SCALE_ONE) + (scale[0] >> T.int32(1))) // scale[0],
+                T.int32(MASK),
+            )
             for c in T.Parallel(cols):
-                q[0, c] = Y[r, c]
-                if q[0, c] < T.int32(0):
-                    q[0, c] = T.int32(0) - q[0, c]
-                q[0, c] = (q[0, c] + (scale[0] >> T.int32(1))) // scale[0]
-                if Y[r, c] < T.int32(0):
-                    q[0, c] = T.int32(0) - q[0, c]
-                q[0, c] = T.min(T.max(q[0, c], T.int32(0 - qmax - 1)), T.int32(qmax))
+                q[0, c] = T.fix.quant(Y[r, c], scale=row_qt[0], out_dtype="int16")
                 xx[0, c] = (q[0, c] * q[0, c]) >> T.int32(mean_shift)
             T.reduce_sum(xx, ss, dim=1, clear=True)
             ss[0] += T.int32(1)
@@ -94,7 +86,7 @@ def rms_q15(rows, cols, qmax=32767):
             if (wk[0] & T.int32(0xC)) != T.int32(0):
                 ns[0] += T.int32(2)
             inv[0] = T.fix.lut_10bit(ss[0], RLUT, scale=((ns[0] - T.int32(7)) << T.int32(Q_MULTIPLIER_WIDTH)) | T.int32(1), out_dtype="int32")
-            fold[0] = T.fix.quant(inv[0], scale=1024.0, out_dtype="int32")
+            fold[0] = T.fix.quant(inv[0], scale=SCALE_1024, out_dtype="int32")
             qt[0] = ((T.int32(6) + (ns[0] >> T.int32(1))) << T.int32(Q_MULTIPLIER_WIDTH)) | ((fold[0] >> T.int32(4)) & T.int32(MASK))
             for c in T.Parallel(cols):
                 norm[c] = T.fix.quant(q[0, c], scale=qt[0], out_dtype="int32")
@@ -127,7 +119,7 @@ def rope_sq8(seq_len, heads, dim, qmax=127):
         COS: T.Tensor((seq_len, dim // 2), "int32"),
         SIN: T.Tensor((seq_len, dim // 2), "int32"),
         R: T.Tensor((dim, dim), "int32"),
-        S: T.Tensor((heads,), "uint32"),
+        QT: T.Tensor((heads,), "uint32"),
         Y: T.Tensor((heads, seq_len, dim), "int8"),
     ):
         with T.Kernel(seq_len * heads, threads=threads) as r:
@@ -136,8 +128,8 @@ def rope_sq8(seq_len, heads, dim, qmax=127):
             h = r - t * heads
             local = T.alloc_local((thread_elem,), "int32")
             other_val = T.alloc_local((thread_elem,), "int32")
-            scale = T.alloc_local((1,), "int32")
-            scale[0] = T.max(T.cast(S[h], "int32"), T.int32(1))
+            qt = T.alloc_local((1,), "int32")
+            qt[0] = T.cast(QT[h], "int32")
             for i in T.serial(thread_elem):
                 d = tx * thread_elem + i
                 src_d = T.if_then_else(d < T.int32(dim // 2), d, d - T.int32(dim // 2))
@@ -162,15 +154,7 @@ def rope_sq8(seq_len, heads, dim, qmax=127):
             _warp_hadamard_i32(local, other_val, thread_elem, threads, warp_round)
             for i in T.serial(thread_elem):
                 v = local[i] * T.int32(22)
-                qv = T.alloc_local((1,), "int32")
-                qv[0] = v
-                if qv[0] < T.int32(0):
-                    qv[0] = T.int32(0) - qv[0]
-                qv[0] = (qv[0] + (scale[0] >> T.int32(1))) // scale[0]
-                if v < T.int32(0):
-                    qv[0] = T.int32(0) - qv[0]
-                qv[0] = T.min(T.max(qv[0], T.int32(0 - qmax - 1)), T.int32(qmax))
-                Y[h, t, tx * thread_elem + i] = T.cast(qv[0], "int8")
+                Y[h, t, tx * thread_elem + i] = T.fix.quant(v, scale=qt[0], out_dtype="int8")
 
     return main
 
@@ -184,7 +168,7 @@ def rms_sq8(rows, cols, qmax=127):
         B: T.Tensor((rows, cols), "int32"),
         W: T.Tensor((cols,), "int32"),
         RLUT: T.Tensor((1024,), "int16"),
-        QS: T.Tensor((1,), "uint32"),
+        QT: T.Tensor((1,), "uint32"),
         Y: T.Tensor((rows, cols), "int32"),
         Q: T.Tensor((rows, cols), "int8"),
         S: T.Tensor((rows,), "uint32"),
@@ -194,6 +178,7 @@ def rms_sq8(rows, cols, qmax=127):
             xx = T.alloc_fragment((1, cols), "int32")
             amax = T.alloc_fragment((1,), "int32")
             scale = T.alloc_fragment((1,), "int32")
+            row_qt = T.alloc_fragment((1,), "int32")
             ss = T.alloc_fragment((1,), "int32")
             ns = T.alloc_fragment((1,), "int32")
             wk = T.alloc_fragment((1,), "int32")
@@ -202,9 +187,9 @@ def rms_sq8(rows, cols, qmax=127):
             qt = T.alloc_fragment((1,), "int32")
             norm = T.alloc_fragment((cols,), "int32")
             post = T.alloc_fragment((1, cols), "int32")
-            post_scale = T.alloc_fragment((1,), "int32")
-            post_scale[0] = T.max(T.cast(QS[0], "int32"), T.int32(1))
-            S[r] = T.cast(post_scale[0], "uint32")
+            post_qt = T.alloc_fragment((1,), "int32")
+            post_qt[0] = T.cast(QT[0], "int32")
+            S[r] = QT[0]
             for c in T.Parallel(cols):
                 Y[r, c] = A[r, c] + B[r, c]
                 q[0, c] = Y[r, c]
@@ -212,14 +197,12 @@ def rms_sq8(rows, cols, qmax=127):
                     q[0, c] = T.int32(0) - q[0, c]
             T.reduce_max(q, amax, dim=1, clear=True)
             scale[0] = T.max((amax[0] + T.int32(32766)) // T.int32(32767), T.int32(1))
+            row_qt[0] = (T.int32(DYN_SCALE_SHIFT) << T.int32(Q_MULTIPLIER_WIDTH)) | T.min(
+                (T.int32(DYN_SCALE_ONE) + (scale[0] >> T.int32(1))) // scale[0],
+                T.int32(MASK),
+            )
             for c in T.Parallel(cols):
-                q[0, c] = Y[r, c]
-                if q[0, c] < T.int32(0):
-                    q[0, c] = T.int32(0) - q[0, c]
-                q[0, c] = (q[0, c] + (scale[0] >> T.int32(1))) // scale[0]
-                if Y[r, c] < T.int32(0):
-                    q[0, c] = T.int32(0) - q[0, c]
-                q[0, c] = T.min(T.max(q[0, c], T.int32(-32768)), T.int32(32767))
+                q[0, c] = T.fix.quant(Y[r, c], scale=row_qt[0], out_dtype="int16")
                 xx[0, c] = (q[0, c] * q[0, c]) >> T.int32(mean_shift)
             T.reduce_sum(xx, ss, dim=1, clear=True)
             ss[0] += T.int32(1)
@@ -237,19 +220,12 @@ def rms_sq8(rows, cols, qmax=127):
             if (wk[0] & T.int32(0xC)) != T.int32(0):
                 ns[0] += T.int32(2)
             inv[0] = T.fix.lut_10bit(ss[0], RLUT, scale=((ns[0] - T.int32(7)) << T.int32(Q_MULTIPLIER_WIDTH)) | T.int32(1), out_dtype="int32")
-            fold[0] = T.fix.quant(inv[0], scale=1024.0, out_dtype="int32")
+            fold[0] = T.fix.quant(inv[0], scale=SCALE_1024, out_dtype="int32")
             qt[0] = ((T.int32(6) + (ns[0] >> T.int32(1))) << T.int32(Q_MULTIPLIER_WIDTH)) | ((fold[0] >> T.int32(4)) & T.int32(MASK))
             for c in T.Parallel(cols):
                 norm[c] = T.fix.quant(q[0, c], scale=qt[0], out_dtype="int32")
                 post[0, c] = (norm[c] * (W[c] >> T.int32(8))) >> T.int32(2)
-                q[0, c] = post[0, c]
-                if q[0, c] < T.int32(0):
-                    q[0, c] = T.int32(0) - q[0, c]
-                q[0, c] = (q[0, c] + (post_scale[0] >> T.int32(1))) // post_scale[0]
-                if post[0, c] < T.int32(0):
-                    q[0, c] = T.int32(0) - q[0, c]
-                q[0, c] = T.min(T.max(q[0, c], T.int32(0 - qmax - 1)), T.int32(qmax))
-                Q[r, c] = T.cast(q[0, c], "int8")
+                Q[r, c] = T.fix.quant(post[0, c], scale=post_qt[0], out_dtype="int8")
 
     return main
 
@@ -260,26 +236,18 @@ def silu_i16(rows, cols):
         Gate: T.Tensor((rows, cols), "int32"),
         Up: T.Tensor((rows, cols), "int32"),
         LUT: T.Tensor((1024,), "int32"),
-        SCALE: T.Tensor((1,), "uint32"),
+        QT: T.Tensor((1,), "uint32"),
         Q: T.Tensor((rows, cols), "int16"),
         S: T.Tensor((rows,), "uint32"),
     ):
         with T.Kernel(rows, threads=128) as r:
             vals = T.alloc_fragment((1, cols), "int32")
-            abs_x = T.alloc_fragment((1, cols), "int32")
-            scale = T.alloc_fragment((1,), "int32")
-            scale[0] = T.max(T.cast(SCALE[0], "int32"), T.int32(1))
-            S[r] = T.cast(scale[0], "uint32")
+            qt = T.alloc_fragment((1,), "int32")
+            qt[0] = T.cast(QT[0], "int32")
+            S[r] = QT[0]
             for c in T.Parallel(cols):
-                vals[0, c] = (((Gate[r, c] >> T.int32(10)) * T.fix.lut_10bit(Gate[r, c], LUT, scale=1.0 / 1024.0, out_dtype="int32")) >> T.int32(8)) * (Up[r, c] >> T.int32(8))
-                abs_x[0, c] = vals[0, c]
-                if abs_x[0, c] < T.int32(0):
-                    abs_x[0, c] = T.int32(0) - abs_x[0, c]
-                abs_x[0, c] = (abs_x[0, c] + (scale[0] >> T.int32(1))) // scale[0]
-                if vals[0, c] < T.int32(0):
-                    abs_x[0, c] = T.int32(0) - abs_x[0, c]
-                abs_x[0, c] = T.min(T.max(abs_x[0, c], T.int32(-32768)), T.int32(32767))
-                Q[r, c] = T.cast(abs_x[0, c], "int16")
+                vals[0, c] = (((Gate[r, c] >> T.int32(10)) * T.fix.lut_10bit(Gate[r, c], LUT, scale=SCALE_INV_1024, out_dtype="int32")) >> T.int32(8)) * (Up[r, c] >> T.int32(8))
+                Q[r, c] = T.fix.quant(vals[0, c], scale=qt[0], out_dtype="int16")
 
     return main
 
@@ -350,7 +318,7 @@ def linear_i16(rows, in_features, out_features, block_m=16, block_n=32, block_k=
     return main
 
 
-def attention_i8(q_heads, kv_heads, seqlen, cache_len, dim, block_m=16, block_n=64, score_shift=26, lut_scale=0.125):
+def attention_i8(q_heads, kv_heads, seqlen, cache_len, dim, block_m=16, block_n=64, score_shift=26, lut_scale=SCALE_EXP_LUT):
     group = q_heads // kv_heads
     kv_len = cache_len + seqlen
     q_size = q_heads * dim
@@ -364,9 +332,8 @@ def attention_i8(q_heads, kv_heads, seqlen, cache_len, dim, block_m=16, block_n=
         V: T.Tensor((kv_heads, seqlen, dim), "int8"),
         QS: T.Tensor((q_heads,), "uint32"),
         KS: T.Tensor((kv_heads,), "uint32"),
-        VS: T.Tensor((kv_heads,), "uint32"),
         LUT: T.Tensor((1024,), "int16"),
-        OS: T.Tensor((1,), "uint32"),
+        OQT: T.Tensor((kv_heads,), "uint32"),
         O: T.Tensor((seqlen, q_size), "int8"),
     ):
         with T.Kernel(q_heads, T.ceildiv(seqlen, block_m), threads=128) as (h, bm):
@@ -387,15 +354,13 @@ def attention_i8(q_heads, kv_heads, seqlen, cache_len, dim, block_m=16, block_n=
             denom = T.alloc_fragment((block_m,), "int32")
             q_scale = T.alloc_fragment((1,), "int32")
             k_scale = T.alloc_fragment((block_n,), "int32")
-            v_scale = T.alloc_fragment((1,), "int32")
-            o_scale = T.alloc_fragment((1,), "int32")
+            out_qt = T.alloc_fragment((1,), "int32")
             out = T.alloc_fragment((block_m, dim), "int32")
             prob = T.alloc_fragment((block_m, block_n), "int32")
             pv = T.alloc_fragment((block_m, dim), "int32")
             acc = T.alloc_fragment((block_m, dim), "int32")
             q_scale[0] = T.cast(QS[h], "int32") >> T.int32(4)
-            v_scale[0] = T.max(T.cast(VS[kh], "int32"), T.int32(1))
-            o_scale[0] = T.max(T.cast(OS[0], "int32"), T.int32(1))
+            out_qt[0] = T.cast(OQT[kh], "int32")
             for m in T.Parallel(block_m):
                 score_max[m] = T.int32(I32_MIN)
                 denom[m] = T.int32(0)
@@ -450,16 +415,7 @@ def attention_i8(q_heads, kv_heads, seqlen, cache_len, dim, block_m=16, block_n=
                 for m, d in T.Parallel(block_m, dim):
                     acc[m, d] += pv[m, d] << T.int32(1)
             for m, d in T.Parallel(block_m, dim):
-                out[m, d] = acc[m, d]
-                if out[m, d] < T.int32(0):
-                    out[m, d] = T.int32(0) - out[m, d]
-                out[m, d] = T.cast(
-                    (T.cast(out[m, d], "int64") * T.cast(v_scale[0], "int64") + ((T.cast(o_scale[0], "int64") * T.int64(32767)) >> T.int32(1)))
-                    // (T.cast(o_scale[0], "int64") * T.int64(32767)),
-                    "int32",
-                )
-                if acc[m, d] < T.int32(0):
-                    out[m, d] = T.int32(0) - out[m, d]
+                out[m, d] = T.fix.quant(acc[m, d], scale=out_qt[0], out_dtype="int32")
                 out[m, d] = T.min(T.max(out[m, d], T.int32(-128)), T.int32(127))
                 O[row_base + m, h * dim + d] = T.cast(out[m, d], "int8")
 

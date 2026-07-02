@@ -3,7 +3,7 @@ import math
 import numpy as np
 import pytest
 
-from tilelang.language.fix import Q_MULTIPLIER_WIDTH, pack_scale
+from tilelang.language.fix import Q_MULTIPLIER_WIDTH, pack_scale, quantize_multiplier_like_xp5
 
 torch = pytest.importorskip("torch")
 
@@ -19,6 +19,10 @@ PROB_SHIFT = 11
 SOFTMAX_PROB_NUM = (1 << (15 + PROB_SHIFT)) - 1
 EXP_TO_Q7 = 1.0 / 8.0
 Q15_16 = 1 << 16
+SCALE_1024 = pack_scale(1024.0)
+SCALE_INV_1024 = pack_scale(1.0 / 1024.0)
+SCALE_ONE = pack_scale(1.0)
+SCALE_EXP_TO_Q7 = pack_scale(EXP_TO_Q7)
 
 
 def exp_lut():
@@ -44,10 +48,27 @@ def fake_quant(x, scale, dtype=torch.int16):
 
 
 def pack(scales):
-    return torch.tensor([pack_scale(float(s)) for s in scales], dtype=torch.uint32, device="cuda")
+    return torch.tensor([pack_scale(float(s)) & 0xFFFFFFFF for s in scales], dtype=torch.uint32, device="cuda")
+
+
+def xp5_quant_ref(x, scale, dtype):
+    if isinstance(scale, float):
+        mul, shift = quantize_multiplier_like_xp5(scale)
+    else:
+        scale = int(scale) & 0xFFFFFFFF
+        mul = scale & MASK
+        shift = (scale >> Q_MULTIPLIER_WIDTH) & 0x3F
+    prod = x.to(torch.int64) * mul
+    out = prod >> shift
+    if shift >= 1:
+        out = out + ((prod >> (shift - 1)) & 1)
+    info = torch.iinfo(dtype)
+    return out.clamp(info.min, info.max).to(dtype)
 
 
 def quant_kernel(n, scalar_scale):
+    scalar_scale = pack_scale(scalar_scale)
+
     @T.prim_func
     def main(
         X: T.Tensor((n,), "int32"),
@@ -62,6 +83,53 @@ def quant_kernel(n, scalar_scale):
                 A[i] = T.fix.quant(X[i], scale=scalar_scale, out_dtype="int16")
                 B[i] = T.fix.quant(X[i], scale=S0[0], out_dtype="int16")
                 C[i] = T.fix.quant(X[i], scale=SV[i], out_dtype="int16")
+
+    return main
+
+
+def quant_mul_shift_kernel(n):
+    @T.prim_func
+    def main(
+        X: T.Tensor((n,), "int32"),
+        Y16: T.Tensor((n,), "int16"),
+        Y8: T.Tensor((n,), "int8"),
+    ):
+        with T.Kernel(1, threads=128):
+            for i in T.Parallel(n):
+                Y16[i] = T.fix.quant(X[i], scale=(20 << Q_MULTIPLIER_WIDTH) | 2047, out_dtype="int16")
+                Y8[i] = T.fix.quant(X[i], scale=(22 << Q_MULTIPLIER_WIDTH) | 511, out_dtype="int8")
+
+    return main
+
+
+def quant_i32_kernel(n):
+    @T.prim_func
+    def main(
+        X: T.Tensor((n,), "int32"),
+        S: T.Tensor((1,), "uint32"),
+        Y: T.Tensor((n,), "int32"),
+        Z: T.Tensor((n,), "int32"),
+    ):
+        with T.Kernel(1, threads=128):
+            for i in T.Parallel(n):
+                Y[i] = T.fix.quant(X[i], scale=S[0], out_dtype="int32")
+                Z[i] = T.fix.quant_i32(X[i], scale=S[0])
+
+    return main
+
+
+def div_kernel(n):
+    @T.prim_func
+    def main(
+        X: T.Tensor((n,), "int32"),
+        S: T.Tensor((1,), "int32"),
+        Y8: T.Tensor((n,), "int8"),
+        Y16: T.Tensor((n,), "int16"),
+    ):
+        with T.Kernel(1, threads=128):
+            for i in T.Parallel(n):
+                Y8[i] = T.fix.div(X[i], scale=S[0], out_dtype="int8")
+                Y16[i] = T.fix.div(X[i], scale=S[0], out_dtype="int16")
 
     return main
 
@@ -142,7 +210,7 @@ def rms_q15_16_kernel(rows, cols):
             if (wk[0] & T.int32(0xC)) != T.int32(0):
                 ns[0] += T.int32(2)
             inv[0] = T.fix.lut_10bit(ss[0], LUT, scale=(ns[0] << T.int32(Q_MULTIPLIER_WIDTH)) | T.int32(128), out_dtype="int32")
-            fold[0] = T.fix.quant(inv[0], scale=1024.0, out_dtype="int32")
+            fold[0] = T.fix.quant(inv[0], scale=SCALE_1024, out_dtype="int32")
             qt[0] = ((T.int32(6) + (ns[0] >> T.int32(1))) << T.int32(Q_MULTIPLIER_WIDTH)) | ((fold[0] >> T.int32(4)) & T.int32(MASK))
             for c in T.Parallel(cols):
                 Y[r, c] = T.fix.quant(X[r, c] >> T.int32(8), scale=qt[0], out_dtype="int32") << T.int32(6)
@@ -156,7 +224,7 @@ def silu_q15_16_kernel(rows, cols):
         with T.Kernel(rows, threads=128) as r:
             sig = T.alloc_fragment((1, cols), "int32")
             for c in T.Parallel(cols):
-                sig[0, c] = T.fix.lut_10bit(X[r, c], LUT, scale=1.0 / 1024.0, out_dtype="int32")
+                sig[0, c] = T.fix.lut_10bit(X[r, c], LUT, scale=SCALE_INV_1024, out_dtype="int32")
                 Y[r, c] = (X[r, c] >> T.int32(10)) * sig[0, c]
 
     return main
@@ -216,7 +284,7 @@ def rms_kernel(rows, cols):
             if (wk[0] & T.int32(0xC)) != T.int32(0):
                 ns[0] += T.int32(2)
             inv[0] = T.fix.lut_10bit(ss[0], LUT, scale=(ns[0] << T.int32(Q_MULTIPLIER_WIDTH)) | T.int32(128), out_dtype="int32")
-            fold[0] = T.fix.quant(inv[0], scale=1024.0, out_dtype="int32")
+            fold[0] = T.fix.quant(inv[0], scale=SCALE_1024, out_dtype="int32")
             qt[0] = ((T.int32(6) + (ns[0] >> T.int32(1))) << T.int32(Q_MULTIPLIER_WIDTH)) | ((fold[0] >> T.int32(4)) & T.int32(MASK))
             for c in T.Parallel(cols):
                 Y[r, c] = T.fix.quant(T.cast(X[r, c], "int32"), scale=qt[0], out_dtype="int16")
@@ -264,11 +332,11 @@ def attn_kernel(batch, seqlen, dim, score_scale, block_n=32):
                 nm[0] = bm[0]
                 if mx[0] > nm[0]:
                     nm[0] = mx[0]
-                os[0] = T.fix.lut_10bit(mx[0] - nm[0], LUT, scale=1.0, out_dtype="int32")
-                os[0] = T.fix.quant(os[0], scale=EXP_TO_Q7, out_dtype="int32")
+                os[0] = T.fix.lut_10bit(mx[0] - nm[0], LUT, scale=SCALE_ONE, out_dtype="int32")
+                os[0] = T.fix.quant(os[0], scale=SCALE_EXP_TO_Q7, out_dtype="int32")
                 for j in T.Parallel(block_n):
-                    ex[0, j] = T.fix.lut_10bit(sc[0, j] - nm[0], LUT, scale=1.0, out_dtype="int32")
-                    ex[0, j] = T.fix.quant(ex[0, j], scale=EXP_TO_Q7, out_dtype="int32")
+                    ex[0, j] = T.fix.lut_10bit(sc[0, j] - nm[0], LUT, scale=SCALE_ONE, out_dtype="int32")
+                    ex[0, j] = T.fix.quant(ex[0, j], scale=SCALE_EXP_TO_Q7, out_dtype="int32")
                 T.reduce_sum(ex, bs, dim=1, clear=True)
                 sm[0] = T.fix.quant(sm[0], scale=(T.int32(7) << T.int32(Q_MULTIPLIER_WIDTH)) | os[0], out_dtype="int32") + bs[0]
                 for d, j in T.Parallel(dim, block_n):
@@ -277,7 +345,7 @@ def attn_kernel(batch, seqlen, dim, score_scale, block_n=32):
                 for d in T.Parallel(dim):
                     acc[d] = T.fix.quant(acc[d], scale=(T.int32(7) << T.int32(Q_MULTIPLIER_WIDTH)) | os[0], out_dtype="int32") + out[d]
                 mx[0] = nm[0]
-            qt[0] = (T.int32(16) << T.int32(Q_MULTIPLIER_WIDTH)) | ((T.int32(MASK) // sm[0]) & T.int32(MASK))
+            qt[0] = (T.int32(Q_MULTIPLIER_WIDTH) << T.int32(Q_MULTIPLIER_WIDTH)) | ((T.int32(MASK) // sm[0]) & T.int32(MASK))
             for d in T.Parallel(dim):
                 O[b, i, d] = T.fix.quant(acc[d], scale=qt[0], out_dtype="int16")
 
@@ -293,9 +361,59 @@ def test_fix_quant_qdq_cuda():
     vec = torch.tensor([0.5, 0.625, 0.75, 1.0, 1.25, 0.375, 0.875], device="cuda")
     a, b, c = tilelang.compile(quant_kernel(x.numel(), scalar), out_idx=[3, 4, 5], target="cuda")(qx, pack([scalar]), pack(vec))
     vec_out_scale = in_scale / vec
-    torch.testing.assert_close(a.float() * out_scale, x, rtol=0, atol=out_scale)
+    torch.testing.assert_close(a, xp5_quant_ref(qx, scalar, torch.int16), rtol=0, atol=0)
     torch.testing.assert_close(b.float() * out_scale, x, rtol=0, atol=out_scale)
     torch.testing.assert_close(c.float() * vec_out_scale, x, rtol=0, atol=float(vec_out_scale.max()))
+
+
+@tilelang.testing.requires_cuda
+def test_fix_quant_mul_shift_cuda():
+    x = torch.tensor([-(1 << 30), -1234567, -17, 0, 17, 1234567, (1 << 30)], device="cuda", dtype=torch.int32)
+    y16, y8 = tilelang.compile(quant_mul_shift_kernel(x.numel()), out_idx=[1, 2], target="cuda")(x)
+
+    def ref(mul, shift, dtype):
+        prod = x.to(torch.int64) * mul
+        out = prod >> shift
+        if shift >= 1:
+            out = out + ((prod >> (shift - 1)) & 1)
+        info = torch.iinfo(dtype)
+        return out.clamp(info.min, info.max).to(dtype)
+
+    torch.testing.assert_close(y16, ref(2047, 20, torch.int16), rtol=0, atol=0)
+    torch.testing.assert_close(y8, ref(511, 22, torch.int8), rtol=0, atol=0)
+
+
+@tilelang.testing.requires_cuda
+def test_fix_quant_i32_cuda():
+    x = torch.tensor([-(1 << 30), -1234567, -17, 0, 17, 1234567, (1 << 30)], device="cuda", dtype=torch.int32)
+    scale = pack([0.03125])
+    y, z = tilelang.compile(quant_i32_kernel(x.numel()), out_idx=[2, 3], target="cuda")(x, scale)
+    ref = xp5_quant_ref(x, int(scale[0].item()), torch.int32)
+    torch.testing.assert_close(y, ref, rtol=0, atol=0)
+    torch.testing.assert_close(z, ref, rtol=0, atol=0)
+
+
+def test_fix_quant_mul_shift_frontend_limits():
+    with pytest.raises(ValueError):
+        T.fix.quant(T.int32(1), scale=(1 << Q_MULTIPLIER_WIDTH), out_dtype="int16")
+    with pytest.raises(ValueError):
+        T.fix.quant(T.int32(1), scale=(64 << Q_MULTIPLIER_WIDTH) | 1, out_dtype="int16")
+    with pytest.raises(ValueError):
+        T.fix.quant(T.int32(1), scale=1 << 32, out_dtype="int16")
+    with pytest.raises(TypeError):
+        T.fix.quant(T.int32(1), scale=1.0, out_dtype="int16")
+    with pytest.raises(TypeError):
+        T.fix.quant(T.cast(T.int32(1), "int16"), scale=(1 << Q_MULTIPLIER_WIDTH) | 1, out_dtype="int8")
+
+
+@tilelang.testing.requires_cuda
+def test_fix_div_cuda():
+    x = torch.tensor([-100000, -1000, -129, -128, -17, 0, 17, 127, 128, 1000, 100000], device="cuda", dtype=torch.int32)
+    s = torch.tensor([37], device="cuda", dtype=torch.int32)
+    y8, y16 = tilelang.compile(div_kernel(x.numel()), out_idx=[2, 3], target="cuda")(x, s)
+    ref = torch.div(x, s[0], rounding_mode="trunc")
+    torch.testing.assert_close(y8, ref.clamp(-128, 127).to(torch.int8), rtol=0, atol=0)
+    torch.testing.assert_close(y16, ref.clamp(-32768, 32767).to(torch.int16), rtol=0, atol=0)
 
 
 @tilelang.testing.requires_cuda
@@ -353,7 +471,7 @@ def test_softmax_cuda():
     ))
     in_scale, out_scale = 1.0 / 64.0, 1.0 / 32768.0
     x = fake_quant(logits, in_scale)
-    y = tilelang.compile(softmax_kernel(*x.shape, in_scale * 64.0), out_idx=[2], target="cuda")(x, torch.from_numpy(exp_lut()).cuda())
+    y = tilelang.compile(softmax_kernel(*x.shape, pack_scale(in_scale * 64.0)), out_idx=[2], target="cuda")(x, torch.from_numpy(exp_lut()).cuda())
     torch.testing.assert_close(y.float() * out_scale, torch.softmax(logits, dim=-1), rtol=0, atol=0.025)
 
 
@@ -376,7 +494,7 @@ def test_flash_attention_cuda():
     v_scale = 1.0 / 512.0
     attn_scale = 1.0 / math.sqrt(8.0)
     qx, kx, vx = fake_quant(q, q_scale), fake_quant(k, k_scale), fake_quant(v, v_scale)
-    score_scale = q_scale * k_scale * attn_scale * 64.0
+    score_scale = pack_scale(q_scale * k_scale * attn_scale * 64.0)
     y = tilelang.compile(attn_kernel(1, 64, 8, score_scale, block_n=32), out_idx=[4], target="cuda")(
         qx, kx, vx, torch.from_numpy(exp_lut()).cuda()
     )
