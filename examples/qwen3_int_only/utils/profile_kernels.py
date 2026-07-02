@@ -8,7 +8,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from examples.qwen3_int_only.model_int_only import Q15_16, Qwen3IntOnlyBlock
 from examples.qwen3_int_only.model_hybrid import Qwen3HybridBlock
 from examples.qwen3_int_only.utils.ppl import iter_texts, quant_i8_static_q15_16
-from examples.qwen3_int_only.utils import ROTATE_SEED, Qwen3Config, fast_hadamard, load_packed_qwen3, q15_16, random_hadamard_rotation, rope_tables, rope_tables_q15_16
+from examples.qwen3_int_only.utils import Qwen3Config, fast_hadamard, load_packed_qwen3, q15_16, rope_tables, rope_tables_q15_16
 
 
 DEFAULT_MODEL_DIR = "/publicdata/huggingface.co/Qwen/Qwen3-0.6B"
@@ -18,6 +18,11 @@ def packed_flags(packed_dir):
     with safe_open(f"{packed_dir}/qwen3_int_only.safetensors", framework="pt", device="cpu") as f:
         metadata = f.metadata() or {}
     return metadata.get("use_r1") == "1", metadata.get("use_r2") == "1"
+
+
+def load_r2_matrices(packed_dir, layers, device="cuda"):
+    with safe_open(f"{packed_dir}/qwen3_int_only.safetensors", framework="pt", device="cpu") as f:
+        return [f.get_tensor(f"layers.{idx}.r2").to(device) for idx in range(layers)]
 
 
 def op_counts(seq_len, cfg, cache_len=0):
@@ -103,7 +108,7 @@ class Profiler:
 
 
 @torch.no_grad()
-def build_cache_kv(model_dir, tokenizer, cache_prompt, layer_weights, config, use_r2=True):
+def build_cache_kv(model_dir, tokenizer, cache_prompt, layer_weights, r2_mats, config, use_r2=True):
     hf_model = AutoModelForCausalLM.from_pretrained(model_dir, local_files_only=True, trust_remote_code=True, dtype=torch.bfloat16).to("cuda")
     cache_ids = torch.tensor(tokenizer(cache_prompt, add_special_tokens=False).input_ids, device="cuda", dtype=torch.long)
     past = hf_model(cache_ids[None, :], use_cache=True).past_key_values
@@ -111,12 +116,11 @@ def build_cache_kv(model_dir, tokenizer, cache_prompt, layer_weights, config, us
         past = [(layer.keys, layer.values) for layer in past.layers]
     elif hasattr(past, "to_legacy_cache"):
         past = past.to_legacy_cache()
-    r2 = random_hadamard_rotation(config.head_dim, ROTATE_SEED + 1, "cuda") if use_r2 else None
     cache_kv = []
-    for weights, (k, v) in zip(layer_weights, past[: len(layer_weights)]):
+    for weights, r2, (k, v) in zip(layer_weights, r2_mats, past[: len(layer_weights)]):
         k = fast_hadamard(k[0].float().contiguous())
         v = v[0].float().contiguous()
-        if r2 is not None:
+        if use_r2 and r2.numel():
             v = (v.to(torch.float64) @ r2.to(torch.float64)).to(torch.float32)
         kq = quant_i8_static_q15_16(k, weights.k_post_rope_i8_scale[:, None])
         vq = quant_i8_static_q15_16(v, weights.v_i8_scale[:, None])
@@ -213,7 +217,8 @@ def main():
     ids = torch.tensor(ids[:seq_len], device="cuda", dtype=torch.long)
     _packed_r1, packed_r2 = packed_flags(args.packed_dir)
     embed, _, _, weights = load_packed_qwen3(args.packed_dir, config)
-    cache_kv, cache_len = build_cache_kv(args.model_dir, tokenizer, args.cache_prompt, weights[: args.layers], config, packed_r2)
+    r2_mats = load_r2_matrices(args.packed_dir, args.layers)
+    cache_kv, cache_len = build_cache_kv(args.model_dir, tokenizer, args.cache_prompt, weights[: args.layers], r2_mats, config, packed_r2)
     block = Qwen3HybridBlock(seq_len, config, cache_len=cache_len) if args.backend == "hybrid" else Qwen3IntOnlyBlock(seq_len, config, cache_len=cache_len)
     cos, sin, _ = rope_tables(seq_len + cache_len, config.head_dim, config.rope_theta) if args.backend == "hybrid" else rope_tables_q15_16(seq_len + cache_len, config.head_dim, config.rope_theta)
     if args.backend == "hybrid":

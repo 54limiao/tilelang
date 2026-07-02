@@ -129,6 +129,7 @@ def write_timestamp(path, args, calib_tokens, calib_seq_len, metadata=None):
                 f"packed_layers={value('packed_layers', args.max_layers or 'all')}",
                 f"use_r1={value('use_r1', int(args.use_r1))}",
                 f"use_r2={value('use_r2', int(args.use_r2))}",
+                f"r2_impl={value('r2_impl', 'per_layer')}",
                 f"r3_impl={value('r3_impl', 'fwht')}",
                 f"weight_scale_dtype={value('weight_scale_dtype', 'fp32')}",
             )
@@ -147,6 +148,8 @@ def current_pack_metadata(path, args, config):
     if metadata.get("hidden_size") != str(config.hidden_size) or metadata.get("num_hidden_layers") != str(config.num_hidden_layers):
         return None
     if metadata.get("weight_scale_dtype") != "fp32":
+        return None
+    if metadata.get("r2_impl") != "per_layer":
         return None
     if metadata.get("r3_impl") != "fwht":
         return None
@@ -167,6 +170,9 @@ def current_pack_metadata(path, args, config):
             "layers.0.attn_i8.scale",
             "layers.0.post_mlp_i8.scale",
             "layers.0.gated_mlp_i8.scale",
+            "quarot.r1",
+            "quarot.r4",
+            "layers.0.r2",
         )
     )
     return metadata if ok else None
@@ -253,8 +259,12 @@ def main():
 
     tensors = {}
     r1 = random_hadamard_rotation(config.hidden_size, args.rotate_seed, args.device) if args.use_r1 else None
-    r2 = random_hadamard_rotation(config.head_dim, args.rotate_seed + 1, args.device) if args.use_r2 else None
     down_hadamard = hadamard_rotation(config.head_dim, args.device)
+    if args.use_r1:
+        tensors["quarot.r1"] = r1.cpu().contiguous()
+    else:
+        tensors["quarot.r1"] = torch.empty((0,), dtype=torch.float32)
+    tensors["quarot.r4"] = down_hadamard.cpu().contiguous()
     with SafeTensorReader(args.model_dir) as reader:
         def tensor(name, device=args.device, dtype=torch.float32):
             out = reader.get_tensor(name, device)
@@ -279,8 +289,10 @@ def main():
             calib_x = embed.to(args.device, torch.float32)[ids.reshape(-1, calib_seq_len)]
             cos, sin, _ = rope_tables(calib_seq_len, config.head_dim, config.rope_theta, args.device)
         for layer_idx in range(pack_layers):
+            r2 = random_hadamard_rotation(config.head_dim, args.rotate_seed + 1 + layer_idx, args.device) if args.use_r2 else None
             src = f"model.layers.{layer_idx}"
             dst = f"layers.{layer_idx}"
+            tensors[f"{dst}.r2"] = r2.cpu().contiguous() if args.use_r2 else torch.empty((0,), dtype=torch.float32)
             input_norm = tensor(f"{src}.input_layernorm.weight")
             post_norm = tensor(f"{src}.post_attention_layernorm.weight")
             layer_float = {}
@@ -338,6 +350,7 @@ def main():
         metadata={
             "use_r1": str(int(args.use_r1)),
             "use_r2": str(int(args.use_r2)),
+            "r2_impl": "per_layer",
             "r3_impl": "fwht",
             "model_dir": args.model_dir,
             "hidden_size": str(config.hidden_size),
