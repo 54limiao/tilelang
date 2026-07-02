@@ -167,7 +167,7 @@ def hf_logits(model, windows, cache_prompt, tokenizer):
 
 
 @torch.no_grad()
-def build_cache_kv(hf_model, tokenizer, cache_prompt, layers, use_r2, use_r3):
+def build_cache_kv(hf_model, tokenizer, cache_prompt, layers, use_r2):
     if not cache_prompt:
         return None, 0
     cache_ids = torch.tensor(tokenizer(cache_prompt, add_special_tokens=False).input_ids, device="cuda", dtype=torch.long)
@@ -178,13 +178,12 @@ def build_cache_kv(hf_model, tokenizer, cache_prompt, layers, use_r2, use_r3):
         past = past.to_legacy_cache()
     n_layers = QWEN3_0_6B.num_hidden_layers if layers is None else layers
     r2 = random_hadamard_rotation(QWEN3_0_6B.head_dim, ROTATE_SEED + 1, "cuda") if use_r2 else None
-    r3 = random_hadamard_rotation(QWEN3_0_6B.head_dim, ROTATE_SEED + 2, "cuda") if use_r3 else None
+    r3 = random_hadamard_rotation(QWEN3_0_6B.head_dim, ROTATE_SEED + 2, "cuda")
     cache_kv = []
     for k, v in past[:n_layers]:
         k = k[0].float().contiguous()
         v = v[0].float().contiguous()
-        if r3 is not None:
-            k = (k.to(torch.float64) @ r3.to(torch.float64)).to(torch.float32)
+        k = (k.to(torch.float64) @ r3.to(torch.float64)).to(torch.float32)
         if r2 is not None:
             v = (v.to(torch.float64) @ r2.to(torch.float64)).to(torch.float32)
         cache_kv.append((quant_i8_q15_16(k), quant_i8_q15_16(v)))
@@ -208,15 +207,13 @@ def prepare_eval(args):
     if args.backend == "int-only":
         _packed_r1, packed_r2 = packed_flags(args.packed_dir)
         cache_kv, cache_len = build_cache_kv(
-            hf_model, tokenizer, args.cache_prompt, max(layer_sweep), args.use_r2 or packed_r2, True
+            hf_model, tokenizer, args.cache_prompt, max(layer_sweep), args.use_r2 or packed_r2
         )
         int_model = Qwen3IntOnlyModel(
             seq_len,
             model_dir=args.model_dir,
             packed_dir=args.packed_dir,
             cache_len=cache_len,
-            use_r3=True,
-            fast_hadamard=True,
         )
     else:
         int_model = None
@@ -298,7 +295,6 @@ def main():
                 "use_r2": args.use_r2,
                 "use_r3": True,
                 "fused_static": True,
-                "fast_hadamard": True,
                 "static_mlp": True,
             }
             row = {

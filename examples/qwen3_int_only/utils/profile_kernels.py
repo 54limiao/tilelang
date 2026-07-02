@@ -71,7 +71,7 @@ class Profiler:
 
 
 @torch.no_grad()
-def build_cache_kv(model_dir, tokenizer, cache_prompt, layers, use_r2=True, use_r3=True):
+def build_cache_kv(model_dir, tokenizer, cache_prompt, layers, use_r2=True):
     hf_model = AutoModelForCausalLM.from_pretrained(model_dir, local_files_only=True, trust_remote_code=True, dtype=torch.bfloat16).to("cuda")
     cache_ids = torch.tensor(tokenizer(cache_prompt, add_special_tokens=False).input_ids, device="cuda", dtype=torch.long)
     past = hf_model(cache_ids[None, :], use_cache=True).past_key_values
@@ -80,13 +80,12 @@ def build_cache_kv(model_dir, tokenizer, cache_prompt, layers, use_r2=True, use_
     elif hasattr(past, "to_legacy_cache"):
         past = past.to_legacy_cache()
     r2 = random_hadamard_rotation(QWEN3_0_6B.head_dim, ROTATE_SEED + 1, "cuda") if use_r2 else None
-    r3 = random_hadamard_rotation(QWEN3_0_6B.head_dim, ROTATE_SEED + 2, "cuda") if use_r3 else None
+    r3 = random_hadamard_rotation(QWEN3_0_6B.head_dim, ROTATE_SEED + 2, "cuda")
     cache_kv = []
     for k, v in past[:layers]:
         k = k[0].float().contiguous()
         v = v[0].float().contiguous()
-        if r3 is not None:
-            k = (k.to(torch.float64) @ r3.to(torch.float64)).to(torch.float32)
+        k = (k.to(torch.float64) @ r3.to(torch.float64)).to(torch.float32)
         if r2 is not None:
             v = (v.to(torch.float64) @ r2.to(torch.float64)).to(torch.float32)
         cache_kv.append((quant_i8_q15_16(k), quant_i8_q15_16(v)))
@@ -142,9 +141,9 @@ def main():
     seq_len -= seq_len % 32
     ids = torch.tensor(ids[:seq_len], device="cuda", dtype=torch.long)
     _packed_r1, packed_r2 = packed_flags(args.packed_dir)
-    cache_kv, cache_len = build_cache_kv(args.model_dir, tokenizer, args.cache_prompt, args.layers, packed_r2, True)
+    cache_kv, cache_len = build_cache_kv(args.model_dir, tokenizer, args.cache_prompt, args.layers, packed_r2)
     embed, _, _, weights = load_packed_qwen3(args.packed_dir, QWEN3_0_6B)
-    block = Qwen3IntOnlyBlock(seq_len, QWEN3_0_6B, cache_len=cache_len, use_r3=True, fast_hadamard=True)
+    block = Qwen3IntOnlyBlock(seq_len, QWEN3_0_6B, cache_len=cache_len)
     cos, sin, _ = rope_tables_q15_16(seq_len + cache_len, QWEN3_0_6B.head_dim, QWEN3_0_6B.rope_theta)
     r3_q15 = q15_16(random_hadamard_rotation(QWEN3_0_6B.head_dim, ROTATE_SEED + 2))
 
@@ -188,7 +187,6 @@ def main():
             "static_mlp": True,
             "cache_len": cache_len,
             "fused_static": True,
-            "fast_hadamard": True,
             "counted_ops_top": counted_ops_top,
             "counted_ops_per_pass_top": counted_ops_top / args.repeat,
             "counted_tops": counted_ops_top / (summary["total_ms"] / 1000.0),

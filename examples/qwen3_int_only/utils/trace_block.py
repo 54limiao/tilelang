@@ -185,7 +185,7 @@ def main():
     ids = load_ids(tokenizer, args, args.max_tokens, "cuda")
     seq_len = ids.numel() - 1
     ids = ids[: seq_len + 1]
-    imodel = Qwen3IntOnlyModel(seq_len, model_dir=args.model_dir, packed_dir=args.packed_dir, use_r3=True, fast_hadamard=False)
+    imodel = Qwen3IntOnlyModel(seq_len, model_dir=args.model_dir, packed_dir=args.packed_dir)
     embed, _lm_head, _final_norm, fweights = load_packed_qwen3(args.packed_dir)
     for weights in fweights:
         attach_dequant_fp(weights)
