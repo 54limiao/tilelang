@@ -46,9 +46,9 @@ class Qwen3HybridBlock:
         self.r3 = q15_16(random_hadamard_rotation(config.head_dim, rotate_seed + 2, "cuda"))
         self.zero_hidden = torch.zeros((seq_len, h), device="cuda", dtype=torch.int32)
 
-    def rms_quant(self, x_q15, residual_q15, weight_q15, out_scale):
-        residual_q15 = self.zero_hidden if residual_q15 is None else residual_q15
-        return self.rms_quant_kernel(x_q15, residual_q15, weight_q15, out_scale)
+    def rms_quant(self, residual_f32, linear_q15, weight_q15, out_scale):
+        linear_q15 = self.zero_hidden if linear_q15 is None else linear_q15
+        return self.rms_quant_kernel(residual_f32, linear_q15, weight_q15, out_scale)
 
     def qk_norm_rope_quant(self, x_q15, weight_q15, cos, sin, heads, out_scale):
         kernel = self.rope_q if heads == self.config.num_attention_heads else self.rope_k
@@ -99,7 +99,7 @@ class Qwen3HybridModel:
     def hidden(self, input_ids, layers=None, cache_kv=None):
         mlp = None
         n_layers = self.config.num_hidden_layers if layers is None else layers
-        residual = q15_16(self.embed[input_ids])
+        residual = self.embed[input_ids].float().contiguous()
         x8 = None
         for layer_idx in range(n_layers):
             if layer_idx == 0:

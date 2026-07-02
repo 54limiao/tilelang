@@ -159,6 +159,103 @@ def rope_sq8(seq_len, heads, dim, qmax=127):
     return main
 
 
+def qk_norm_rope_i8(seq_len, heads, dim):
+    mean_shift = int(math.log2(dim))
+    thread_elem = 8
+    threads = 16
+    thread_round = 3
+    warp_round = 4
+    half_dim = dim // 2
+
+    @T.prim_func
+    def main(
+        X: T.Tensor((seq_len * heads, dim), "int32"),
+        W: T.Tensor((dim,), "int32"),
+        RLUT: T.Tensor((1024,), "int16"),
+        COS: T.Tensor((seq_len, dim // 2), "int32"),
+        SIN: T.Tensor((seq_len, dim // 2), "int32"),
+        R: T.Tensor((dim, dim), "int32"),
+        QT: T.Tensor((heads,), "uint32"),
+        Y: T.Tensor((heads, seq_len, dim), "int8"),
+    ):
+        with T.Kernel(seq_len * heads, threads=threads) as r:
+            tx = T.get_thread_binding(0)
+            t = r // heads
+            h = r - t * heads
+            x = T.alloc_fragment((1, dim), "int32")
+            q = T.alloc_fragment((1, dim), "int32")
+            xx = T.alloc_fragment((1, dim), "int32")
+            amax = T.alloc_fragment((1,), "int32")
+            scale = T.alloc_fragment((1,), "int32")
+            row_qt = T.alloc_fragment((1,), "int32")
+            ss = T.alloc_fragment((1,), "int32")
+            ns = T.alloc_fragment((1,), "int32")
+            wk = T.alloc_fragment((1,), "int32")
+            inv = T.alloc_fragment((1,), "int32")
+            fold = T.alloc_fragment((1,), "int32")
+            norm_qt = T.alloc_fragment((1,), "int32")
+            out_qt = T.alloc_local((1,), "int32")
+            local = T.alloc_local((thread_elem,), "int32")
+            other_val = T.alloc_local((thread_elem,), "int32")
+            out_qt[0] = T.cast(QT[h], "int32")
+            for d in T.Parallel(dim):
+                x[0, d] = X[r, d]
+                q[0, d] = T.if_then_else(x[0, d] < T.int32(0), T.int32(0) - x[0, d], x[0, d])
+            T.reduce_max(q, amax, dim=1, clear=True)
+            scale[0] = T.max((amax[0] + T.int32(32766)) // T.int32(32767), T.int32(1))
+            row_qt[0] = (T.int32(DYN_SCALE_SHIFT) << T.int32(Q_MULTIPLIER_WIDTH)) | T.min(
+                (T.int32(DYN_SCALE_ONE) + (scale[0] >> T.int32(1))) // scale[0],
+                T.int32(MASK),
+            )
+            for d in T.Parallel(dim):
+                q[0, d] = T.fix.quant(x[0, d], scale=row_qt[0], out_dtype="int16")
+                xx[0, d] = (q[0, d] * q[0, d]) >> T.int32(mean_shift)
+            T.reduce_sum(xx, ss, dim=1, clear=True)
+            ss[0] += T.int32(1)
+            ns[0] = T.int32(0)
+            wk[0] = ss[0]
+            if (wk[0] & T.int32(-65536)) != T.int32(0):
+                ns[0] += T.int32(16)
+                wk[0] = wk[0] >> T.int32(16)
+            if (wk[0] & T.int32(0xFF00)) != T.int32(0):
+                ns[0] += T.int32(8)
+                wk[0] = wk[0] >> T.int32(8)
+            if (wk[0] & T.int32(0xF0)) != T.int32(0):
+                ns[0] += T.int32(4)
+                wk[0] = wk[0] >> T.int32(4)
+            if (wk[0] & T.int32(0xC)) != T.int32(0):
+                ns[0] += T.int32(2)
+            inv[0] = T.fix.lut_10bit(ss[0], RLUT, scale=((ns[0] - T.int32(7)) << T.int32(Q_MULTIPLIER_WIDTH)) | T.int32(1), out_dtype="int32")
+            fold[0] = T.fix.quant(inv[0], scale=SCALE_1024, out_dtype="int32")
+            norm_qt[0] = ((T.int32(6) + (ns[0] >> T.int32(1))) << T.int32(Q_MULTIPLIER_WIDTH)) | ((fold[0] >> T.int32(4)) & T.int32(MASK))
+            for i in T.serial(thread_elem):
+                d = tx * thread_elem + i
+                src_d = T.if_then_else(d < T.int32(half_dim), d, d - T.int32(half_dim))
+                x0 = (T.fix.quant(q[0, src_d], scale=norm_qt[0], out_dtype="int32") * (W[src_d] >> T.int32(8))) >> T.int32(2)
+                x1 = (T.fix.quant(q[0, src_d + T.int32(half_dim)], scale=norm_qt[0], out_dtype="int32") * (W[src_d + T.int32(half_dim)] >> T.int32(8))) >> T.int32(2)
+                c = COS[t, src_d] >> T.int32(8)
+                s = SIN[t, src_d] >> T.int32(8)
+                lo = ((x0 >> T.int32(8)) * c) - ((x1 >> T.int32(8)) * s)
+                hi = ((x0 >> T.int32(8)) * s) + ((x1 >> T.int32(8)) * c)
+                local[i] = T.if_then_else(d < T.int32(half_dim), lo >> T.int32(8), hi >> T.int32(8))
+                local[i] = T.if_then_else(R[d, 0] >= T.int32(0), local[i], T.int32(0) - local[i])
+            for i in T.serial(thread_round):
+                chunksize = 1 << (i + 1)
+                chunknum = thread_elem // chunksize
+                for j in T.serial(chunknum):
+                    chunkbase = j * chunksize
+                    for k in T.serial(chunksize // 2):
+                        a = local[chunkbase + k]
+                        b = local[chunkbase + k + chunksize // 2]
+                        local[chunkbase + k] = a + b
+                        local[chunkbase + k + chunksize // 2] = a - b
+            _warp_hadamard_i32(local, other_val, thread_elem, threads, warp_round)
+            for i in T.serial(thread_elem):
+                Y[h, t, tx * thread_elem + i] = T.fix.quant(local[i] * T.int32(22), scale=out_qt[0], out_dtype="int8")
+
+    return main
+
+
 def rms_sq8(rows, cols, qmax=127):
     mean_shift = int(math.log2(cols))
 
@@ -344,9 +441,13 @@ def attention_i8(q_heads, kv_heads, seqlen, cache_len, dim, block_m=16, block_n=
             score_qt = T.alloc_fragment((1,), "uint32")
             out_qt = T.alloc_fragment((1,), "int32")
             out = T.alloc_fragment((block_m, dim), "int32")
-            prob = T.alloc_fragment((block_m, block_n), "int32")
             pv = T.alloc_fragment((block_m, dim), "int32")
             acc = T.alloc_fragment((block_m, dim), "int32")
+            acc_hi = T.alloc_fragment((block_m, dim), "int32")
+            acc_lo = T.alloc_fragment((block_m, dim), "int32")
+            norm_abs = T.alloc_fragment((block_m, dim), "int32")
+            norm_q = T.alloc_fragment((block_m, dim), "int32")
+            norm_rem = T.alloc_fragment((block_m, dim), "int32")
             score_qt[0] = SCORE_QT[h]
             out_qt[0] = T.cast(OQT[kh], "int32")
             for m in T.Parallel(block_m):
@@ -359,6 +460,7 @@ def attention_i8(q_heads, kv_heads, seqlen, cache_len, dim, block_m=16, block_n=
                 for j, d in T.Parallel(block_n, dim):
                     pos = nb * block_n + j
                     k_shared[j, d] = T.if_then_else(pos < cache_len, CACHE_K[kh, pos, d], T.if_then_else(pos < kv_len, K[kh, pos - cache_len, d], T.int8(0)))
+                    v_shared[j, d] = T.if_then_else(pos < cache_len, CACHE_V[kh, pos, d], T.if_then_else(pos < kv_len, V[kh, pos - cache_len, d], T.int8(0)))
                 T.clear(qk)
                 T.gemm(q_shared, k_shared, qk, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
                 for m, j in T.Parallel(block_m, block_n):
@@ -372,24 +474,13 @@ def attention_i8(q_heads, kv_heads, seqlen, cache_len, dim, block_m=16, block_n=
                 for m, j in T.Parallel(block_m, block_n):
                     pos = nb * block_n + j
                     score[m, j] = T.if_then_else(pos <= cache_len + row_base + m, T.fix.lut_10bit(score[m, j] - new_max[m], LUT, scale=lut_scale, out_dtype="int32"), T.int32(0))
+                    p_hi[m, j] = T.cast(score[m, j] >> T.int32(8), "int8")
+                    p_mid[m, j] = T.cast((score[m, j] - ((score[m, j] >> T.int32(8)) << T.int32(8))) >> T.int32(1), "int8")
                 T.reduce_sum(score, block_sum, dim=1, clear=True)
-                for m in T.Parallel(block_m):
-                    denom[m] = ((denom[m] * old_scale[m]) >> T.int32(10)) + block_sum[m]
-                    score_max[m] = new_max[m]
-            for nb in T.Pipelined((cache_len + row_base + block_m - 1) // block_n + 1):
-                for j, d in T.Parallel(block_n, dim):
-                    pos = nb * block_n + j
-                    k_shared[j, d] = T.if_then_else(pos < cache_len, CACHE_K[kh, pos, d], T.if_then_else(pos < kv_len, K[kh, pos - cache_len, d], T.int8(0)))
-                    v_shared[j, d] = T.if_then_else(pos < cache_len, CACHE_V[kh, pos, d], T.if_then_else(pos < kv_len, V[kh, pos - cache_len, d], T.int8(0)))
-                T.clear(qk)
-                T.gemm(q_shared, k_shared, qk, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
-                for m, j in T.Parallel(block_m, block_n):
-                    pos = nb * block_n + j
-                    score[m, j] = T.fix.quant(qk[m, j] >> T.int32(8), scale=score_qt[0], out_dtype="int32")
-                    score[m, j] = T.if_then_else(pos <= cache_len + row_base + m, T.fix.lut_10bit(score[m, j] - score_max[m], LUT, scale=lut_scale, out_dtype="int32"), T.int32(0))
-                    prob[m, j] = T.min(T.truncdiv((score[m, j] * T.int32(32767)) + (denom[m] >> T.int32(1)), denom[m]), T.int32(32767))
-                    p_hi[m, j] = T.cast(prob[m, j] >> T.int32(8), "int8")
-                    p_mid[m, j] = T.cast((prob[m, j] - ((prob[m, j] >> T.int32(8)) << T.int32(8))) >> T.int32(1), "int8")
+                for m, d in T.Parallel(block_m, dim):
+                    acc_hi[m, d] = (acc[m, d] + T.int32(32768)) >> T.int32(16)
+                    acc_lo[m, d] = acc[m, d] - (acc_hi[m, d] << T.int32(16))
+                    acc[m, d] = ((acc_hi[m, d] * old_scale[m]) << T.int32(6)) + ((acc_lo[m, d] * old_scale[m]) >> T.int32(10))
                 T.clear(pv)
                 T.gemm(p_hi, v_shared, pv, policy=T.GemmWarpPolicy.FullRow)
                 for m, d in T.Parallel(block_m, dim):
@@ -398,8 +489,20 @@ def attention_i8(q_heads, kv_heads, seqlen, cache_len, dim, block_m=16, block_n=
                 T.gemm(p_mid, v_shared, pv, policy=T.GemmWarpPolicy.FullRow)
                 for m, d in T.Parallel(block_m, dim):
                     acc[m, d] += pv[m, d] << T.int32(1)
+                for m in T.Parallel(block_m):
+                    denom[m] = ((denom[m] * old_scale[m]) >> T.int32(10)) + block_sum[m]
+                    score_max[m] = new_max[m]
             for m, d in T.Parallel(block_m, dim):
-                out[m, d] = T.fix.quant(acc[m, d], scale=out_qt[0], out_dtype="int32")
+                norm_abs[m, d] = T.if_then_else(acc[m, d] < T.int32(0), T.int32(0) - acc[m, d], acc[m, d])
+                norm_q[m, d] = T.truncdiv(norm_abs[m, d], denom[m])
+                norm_rem[m, d] = norm_abs[m, d] - norm_q[m, d] * denom[m]
+                acc_hi[m, d] = norm_rem[m, d] >> T.int32(6)
+                acc_lo[m, d] = norm_rem[m, d] - (acc_hi[m, d] << T.int32(6))
+                norm_abs[m, d] = norm_q[m, d] * T.int32(32767)
+                norm_abs[m, d] += T.truncdiv(acc_hi[m, d] * T.int32(32767) + (denom[m] >> T.int32(1)), denom[m]) << T.int32(6)
+                norm_abs[m, d] += T.truncdiv(acc_lo[m, d] * T.int32(32767) + (denom[m] >> T.int32(1)), denom[m])
+                out[m, d] = T.if_then_else(acc[m, d] < T.int32(0), T.int32(0) - norm_abs[m, d], norm_abs[m, d])
+                out[m, d] = T.fix.quant(out[m, d], scale=out_qt[0], out_dtype="int32")
                 out[m, d] = T.min(T.max(out[m, d], T.int32(-128)), T.int32(127))
                 O[row_base + m, h * dim + d] = T.cast(out[m, d], "int8")
 

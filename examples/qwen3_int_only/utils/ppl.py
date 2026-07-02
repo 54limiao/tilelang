@@ -10,7 +10,7 @@ import torch
 from safetensors import safe_open
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from examples.qwen3_int_only.model import Q15_16, Qwen3IntOnlyModel
+from examples.qwen3_int_only.model_int_only import Q15_16, Qwen3IntOnlyModel
 from examples.qwen3_int_only.model_hybrid import Qwen3HybridModel
 from examples.qwen3_int_only.utils import ROTATE_SEED, Qwen3Config, random_hadamard_rotation
 

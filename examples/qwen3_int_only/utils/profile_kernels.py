@@ -5,7 +5,7 @@ import torch
 from safetensors import safe_open
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from examples.qwen3_int_only.model import Q15_16, Qwen3IntOnlyBlock
+from examples.qwen3_int_only.model_int_only import Q15_16, Qwen3IntOnlyBlock
 from examples.qwen3_int_only.model_hybrid import Qwen3HybridBlock
 from examples.qwen3_int_only.utils.ppl import iter_texts, quant_i8_static_q15_16
 from examples.qwen3_int_only.utils import ROTATE_SEED, Qwen3Config, load_packed_qwen3, q15_16, random_hadamard_rotation, rope_tables, rope_tables_q15_16
@@ -34,12 +34,12 @@ def op_counts(seq_len, cfg, cache_len=0):
 
 def tc_op_counts(seq_len, cfg, cache_len=0, backend="int-only"):
     # math_ops is the model matmul work. tc_ops is the int8 tensorcore work we
-    # actually issue. int-only attention recomputes QK; hybrid attention uses
-    # single-pass online softmax and computes QK once.
+    # actually issue. Attention computes QK once, then PV as P int16 x V int8;
+    # the current lowering accounts that PV as two int8-equivalent GEMMs.
     ops = op_counts(seq_len, cfg, cache_len)
     qk_ops = 2 * cfg.num_attention_heads * seq_len * (seq_len + cache_len) * cfg.head_dim
     pv_ops = qk_ops
-    ops["attention_i8"] = (qk_ops if backend == "hybrid" else 2 * qk_ops) + 2 * pv_ops
+    ops["attention_i8"] = qk_ops + 2 * pv_ops
     return ops
 
 
@@ -137,12 +137,15 @@ def run_block(block, x, x8, xs8, weights, cos, sin, r3_q15, prof, cache_k=None, 
     q = qkv[:, : cfg.q_size].contiguous()
     k = qkv[:, cfg.q_size : cfg.q_size + cfg.kv_size].contiguous()
     v = qkv[:, cfg.q_size + cfg.kv_size :].contiguous()
-    v_heads = v.reshape(block.seq_len * cfg.num_key_value_heads, cfg.head_dim)
-    _q, q_heads = prof.time("rms_q15", lambda: block.rms_q(q.reshape(block.seq_len * cfg.num_attention_heads, cfg.head_dim).contiguous(), block.zero_q, weights.q_norm, block.lut_rsqrt))
-    _k, k_heads = prof.time("rms_q15", lambda: block.rms_k(k.reshape(block.seq_len * cfg.num_key_value_heads, cfg.head_dim).contiguous(), block.zero_k, weights.k_norm, block.lut_rsqrt))
-    q_attn = prof.time("rope_sq8", lambda: block.rope_q(q_heads, pos_cos, pos_sin, r3_q15, weights.q_post_rope_i8_qt))
-    k_attn = prof.time("rope_sq8", lambda: block.rope_k(k_heads, pos_cos, pos_sin, r3_q15, weights.k_post_rope_i8_qt))
-    v_attn = prof.time("quant_v_i8", lambda: block.quant_v(v_heads.reshape(block.seq_len, cfg.num_key_value_heads, cfg.head_dim), weights.v_i8_qt))
+    q_attn = prof.time(
+        "qk_norm_rope_i8",
+        lambda: block.qk_rope_q(q.reshape(block.seq_len * cfg.num_attention_heads, cfg.head_dim).contiguous(), weights.q_norm, block.lut_rsqrt, pos_cos, pos_sin, r3_q15, weights.q_post_rope_i8_qt),
+    )
+    k_attn = prof.time(
+        "qk_norm_rope_i8",
+        lambda: block.qk_rope_k(k.reshape(block.seq_len * cfg.num_key_value_heads, cfg.head_dim).contiguous(), weights.k_norm, block.lut_rsqrt, pos_cos, pos_sin, r3_q15, weights.k_post_rope_i8_qt),
+    )
+    v_attn = prof.time("quant_v_i8", lambda: block.quant_v(v.reshape(block.seq_len, cfg.num_key_value_heads, cfg.head_dim), weights.v_i8_qt))
     cache_k = block.empty_cache_k if cache_k is None else cache_k
     cache_v = block.empty_cache_v if cache_v is None else cache_v
     attn8 = prof.time("attention_i8", lambda: block.attn(q_attn, cache_k, cache_v, k_attn, v_attn, weights.attn_score_qt, block.lut_exp, weights.attn_out_qt), ops["attention_i8"], tc_ops["attention_i8"])
@@ -221,14 +224,15 @@ def main():
     r3_q15 = q15_16(random_hadamard_rotation(config.head_dim, ROTATE_SEED + 2))
 
     def run_layers(prof):
-        residual = q15_16(embed[ids])
         if args.backend == "hybrid":
+            residual = embed[ids].float().contiguous()
             _res, x8 = prof.time(
                 "rms_quant_hybrid",
                 lambda: block.rms_quant(residual, None, weights[0].input_layernorm, weights[0].input_qkv_i8_scale),
             )
             xs8 = None
         else:
+            residual = q15_16(embed[ids])
             _res, x8, xs8 = prof.time(
                 "rms_sq8",
                 lambda: block.rms_sq8(residual, block.zero_hidden, weights[0].input_layernorm, block.lut_rsqrt, weights[0].input_qkv_i8_qt),
