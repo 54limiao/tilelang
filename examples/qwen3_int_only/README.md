@@ -22,15 +22,7 @@ Current 2048-token FineWeb quality result against HF bf16:
 | HF bf16 | 2048 | 3.801437 | 44.765483 | - | - | - | - |
 | int-only | 2048 | 3.820530 | 45.628371 | HF bf16 logits | 0.99206903 | 1.83985954e-01 | 1.61278185e-02 |
 
-Kernel profile for the int-only LLM block path:
-
-| item | value |
-| --- | ---: |
-| sequence length | 2048 tokens |
-| layers | 28 |
-| prefix KV cache | enabled |
-| measured repeats | 3 |
-| time per 28-layer pass | 57.305 ms |
+Kernel profile for the int-only LLM block path: 2048 tokens, 28 layers, prefix KV cache enabled, 3 measured repeats.
 
 | kernel | avg ms | total ms | pct | TOPS |
 | --- | ---: | ---: | ---: | ---: |
@@ -48,6 +40,7 @@ Kernel profile for the int-only LLM block path:
 | sq8_v_attn_noscale | 0.039 | 3.246 | 1.89 | - |
 | residual_attn_rms_q15 | 0.038 | 3.196 | 1.86 | - |
 | sq8_hidden_static | 0.032 | 2.674 | 1.56 | - |
+| total | 57.305 | 171.915 | 100.00 | 72.34 |
 
 The first run writes `qwen3_int_only.safetensors` and `timestamp`; later runs skip packing when the pack matches the current static schema. Use `FORCE_PACK=1 examples/qwen3_int_only/test_static_path.sh` to rebuild.
 
