@@ -28,10 +28,10 @@ class Qwen3HybridBlock:
         h, hd, im = config.hidden_size, config.head_dim, config.intermediate_size
         qh, kvh = config.num_attention_heads, config.num_key_value_heads
         q_dim, kv_dim = config.q_size, config.kv_size
-        self.qkv_proj = tilelang.compile(linear_i8(seq_len, h, q_dim + 2 * kv_dim, 64, 128, 64), out_idx=[3], target="cuda")
-        self.o_proj = tilelang.compile(linear_i8(seq_len, q_dim, h, 64, 64, 64), out_idx=[3], target="cuda")
-        self.gate_up_proj = tilelang.compile(linear_i8(seq_len, h, 2 * im, 64, 128, 64), out_idx=[3], target="cuda")
-        self.down_proj = tilelang.compile(linear_i8(seq_len, im, h, 64, 64, 64), out_idx=[3], target="cuda")
+        self.qkv_proj = tilelang.compile(linear_i8(seq_len, h, q_dim + 2 * kv_dim), out_idx=[3], target="cuda")
+        self.o_proj = tilelang.compile(linear_i8(seq_len, q_dim, h), out_idx=[3], target="cuda")
+        self.gate_up_proj = tilelang.compile(linear_i8(seq_len, h, 2 * im), out_idx=[3], target="cuda")
+        self.down_proj = tilelang.compile(linear_i8(seq_len, im, h), out_idx=[3], target="cuda")
         self.quant_v = tilelang.compile(quant_v_i8(seq_len, kvh, hd), out_idx=[2], target="cuda")
         self.rms_quant_kernel = tilelang.compile(rms_quant_hybrid(seq_len, h), out_idx=[4, 5], target="cuda")
         self.rope_q = tilelang.compile(qk_norm_rope_quant_hybrid(seq_len, qh, hd), out_idx=[5], target="cuda")

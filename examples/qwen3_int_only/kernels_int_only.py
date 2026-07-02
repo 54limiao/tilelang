@@ -376,7 +376,7 @@ def silu_hadamard_i8(rows, cols, block_dim=128):
     return main
 
 
-def linear_i8(rows, in_features, out_features, block_m=16, block_n=32, block_k=64):
+def linear_i8(rows, in_features, out_features, block_m=64, block_n=128, block_k=128, num_stages=3, threads=128, enable_swizzle=True):
     @T.prim_func
     def main(
         X: T.Tensor((rows, in_features), "int8"),
@@ -384,13 +384,14 @@ def linear_i8(rows, in_features, out_features, block_m=16, block_n=32, block_k=6
         QT: T.Tensor((out_features,), "uint32"),
         Y: T.Tensor((rows, out_features), "int32"),
     ):
-        with T.Kernel(T.ceildiv(out_features, block_n), T.ceildiv(rows, block_m), threads=128) as (bo, br):
+        with T.Kernel(T.ceildiv(out_features, block_n), T.ceildiv(rows, block_m), threads=threads) as (bo, br):
             x_shared = T.alloc_shared((block_m, block_k), "int8")
             w_shared = T.alloc_shared((block_n, block_k), "int8")
             acc = T.alloc_fragment((block_m, block_n), "int32")
 
+            T.use_swizzle(panel_size=10, enable=enable_swizzle)
             T.clear(acc)
-            for ko in T.Pipelined(in_features // block_k, num_stages=2):
+            for ko in T.Pipelined(T.ceildiv(in_features, block_k), num_stages=num_stages):
                 T.copy(X[br * block_m, ko * block_k], x_shared)
                 T.copy(W[bo * block_n, ko * block_k], w_shared)
                 T.gemm(x_shared, w_shared, acc, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
