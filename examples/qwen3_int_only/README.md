@@ -98,31 +98,31 @@ Kernel numpy prototypes live under `utils/proto/` and can be checked with `pytho
 | HF bf16 | 2048 | 3.801437 | 44.765483 | - | - |
 | fake-quant | 2048 | 3.818876 | 45.552979 | 0.99498089 | 1.18436021e-01 |
 | hybrid | 2048 | 3.813385 | 45.303522 | 0.99503829 | 1.16245255e-01 |
-| int-only | 2048 | 3.810946 | 45.193192 | 0.99113492 | 2.01657777e-01 |
+| int-only | 2048 | 3.805970 | 44.968847 | 0.99117421 | 2.01085618e-01 |
 
 Kernel profile for the hybrid LLM block path: 2048 tokens, 28 layers, prefix KV cache enabled, 16 measured repeats.
 
 | kernel | total ms | math TOPS | tc TOPS | tc util | pct |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| attention_hybrid | 303.655 | 50.94 | 76.41 | 12.25% | 42.22% |
-| linear_i8 | 186.663 | 154.62 | 154.62 | 24.78% | 25.95% |
-| qk_norm_rope_quant_hybrid | 138.976 | - | - | - | 19.32% |
-| silu_hadamard_quant_hybrid | 41.861 | - | - | - | 5.82% |
-| rms_quant_hybrid | 32.467 | - | - | - | 4.51% |
-| quant_v_i8 | 15.653 | - | - | - | 2.18% |
-| total | 719.276 | 61.63 | 72.38 | 11.60% | 100.00% |
+| attention_hybrid | 306.169 | 50.52 | 75.78 | 12.14% | 45.13% |
+| linear_i8 | 149.406 | 193.18 | 193.18 | 30.96% | 22.02% |
+| qk_norm_rope_quant_hybrid | 139.517 | - | - | - | 20.56% |
+| silu_hadamard_quant_hybrid | 36.374 | - | - | - | 5.36% |
+| rms_quant_hybrid | 31.554 | - | - | - | 4.65% |
+| quant_v_i8 | 15.460 | - | - | - | 2.28% |
+| total | 678.480 | 65.33 | 76.75 | 12.30% | 100.00% |
 
 Kernel profile for the int-only LLM block path: 2048 tokens, 28 layers, prefix KV cache enabled, 16 measured repeats.
 
 | kernel | total ms | math TOPS | tc TOPS | tc util | pct |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| attention_i8 | 272.246 | 56.82 | 85.23 | 13.66% | 36.20% |
-| qk_norm_rope_i8 | 204.872 | - | - | - | 27.24% |
-| linear_i8 | 187.152 | 154.22 | 154.22 | 24.71% | 24.88% |
-| rms_sq8 | 37.184 | - | - | - | 4.94% |
-| silu_hadamard_i8 | 35.081 | - | - | - | 4.66% |
-| quant_v_i8 | 15.577 | - | - | - | 2.07% |
-| total | 752.113 | 58.94 | 69.22 | 11.09% | 100.00% |
+| attention_i8 | 248.985 | 62.13 | 93.19 | 14.93% | 36.41% |
+| qk_norm_rope_i8 | 202.130 | - | - | - | 29.56% |
+| linear_i8 | 148.222 | 194.72 | 194.72 | 31.21% | 21.68% |
+| rms_sq8 | 37.520 | - | - | - | 5.49% |
+| silu_hadamard_i8 | 31.480 | - | - | - | 4.60% |
+| quant_v_i8 | 15.464 | - | - | - | 2.26% |
+| total | 683.801 | 64.83 | 76.14 | 12.20% | 100.00% |
 
 ## Qwen3-14B
 
