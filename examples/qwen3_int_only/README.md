@@ -30,10 +30,7 @@ Kernel profile for the int-only LLM block path:
 | layers | 28 |
 | prefix KV cache | enabled |
 | measured repeats | 3 |
-| total measured kernel time | 171.915 ms |
 | time per 28-layer pass | 57.305 ms |
-| counted ops per 28-layer pass | 4.145 TOP |
-| counted throughput | 72.34 TOPS |
 
 | kernel | avg ms | total ms | pct | TOPS |
 | --- | ---: | ---: | ---: | ---: |
