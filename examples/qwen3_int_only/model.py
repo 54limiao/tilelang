@@ -6,6 +6,7 @@ import torch
 
 from examples.qwen3_int_only.kernels import (
     Q15_16,
+    add_rmsnorm_q15_16_weighted,
     add_rmsnorm_static_quant_q15_16_weighted,
     add_q15_16,
     attention_i8v8_q15_16_gqa_cache_fused_static_current,
@@ -86,16 +87,20 @@ class Qwen3IntOnlyBlock:
         self.lut_sigmoid = torch.from_numpy(sigmoid_lut()).cuda()
         self.lut_exp = torch.from_numpy(exp_lut_neg()).cuda()
 
-    def __call__(self, x_q15_16, weights: Qwen3BlockWeights, cos_q15_16, sin_q15_16, cache_k=None, cache_v=None, r3_q15=None):
-        return self.trace(x_q15_16, weights, cos_q15_16, sin_q15_16, cache_k, cache_v, r3_q15, collect=False)
+    def __call__(self, x_q15_16, weights: Qwen3BlockWeights, cos_q15_16, sin_q15_16, cache_k=None, cache_v=None, r3_q15=None, x8=None, xs8=None, return_parts=False):
+        return self.trace(x_q15_16, weights, cos_q15_16, sin_q15_16, cache_k, cache_v, r3_q15, collect=False, x8=x8, xs8=xs8, return_parts=return_parts)
 
-    def trace(self, x_q15_16, weights: Qwen3BlockWeights, cos_q15_16, sin_q15_16, cache_k=None, cache_v=None, r3_q15=None, collect=True):
-        if collect:
-            norm = self.rms_hidden_q15(x_q15_16, weights.input_layernorm, self.lut_rsqrt)
+    def trace(self, x_q15_16, weights: Qwen3BlockWeights, cos_q15_16, sin_q15_16, cache_k=None, cache_v=None, r3_q15=None, collect=True, x8=None, xs8=None, return_parts=False):
+        if x8 is None:
+            if collect:
+                norm = self.rms_hidden_q15(x_q15_16, weights.input_layernorm, self.lut_rsqrt)
+            else:
+                norm = None
             x8, xs8 = self.rms_sq8_hidden_fast(x_q15_16, weights.input_layernorm, self.lut_rsqrt, weights.input_qkv_i8_scale)
+        elif collect:
+            norm = self.rms_hidden_q15(x_q15_16, weights.input_layernorm, self.lut_rsqrt)
         else:
             norm = None
-            x8, xs8 = self.rms_sq8_hidden_fast(x_q15_16, weights.input_layernorm, self.lut_rsqrt, weights.input_qkv_i8_scale)
         q, k, v = self.qkv_proj_i8(
             x8, xs8, weights.q_proj.weight, weights.q_proj.scale, weights.k_proj.weight, weights.k_proj.scale, weights.v_proj.weight, weights.v_proj.scale
         )
@@ -160,6 +165,8 @@ class Qwen3IntOnlyBlock:
             gated = None
             mlp = None
             mlp_q15 = self.down_proj_static(gated8, gs8, weights.down_proj.weight, weights.down_proj.scale)
+            if return_parts:
+                return h, mlp_q15
             layer_out = self.add_hidden(h, mlp_q15)
         if not collect:
             return layer_out
@@ -209,6 +216,7 @@ class Qwen3IntOnlyModel:
         self.r3_q15 = q15_16(random_hadamard_rotation(config.head_dim, rotate_seed + 2)) if use_r3 else None
         self.block = Qwen3IntOnlyBlock(seq_len, config, cache_len=cache_len, use_r3=use_r3, fast_hadamard=fast_hadamard)
         self.final_norm_kernel = compile_kernel(rmsnorm_q15_16_weighted(seq_len, config.hidden_size), [3])
+        self.final_add_norm_kernel = compile_kernel(add_rmsnorm_q15_16_weighted(seq_len, config.hidden_size), [4, 5])
         self.lut_rsqrt = torch.from_numpy(rsqrt_lut()).cuda()
         self.cos, self.sin, _ = rope_tables_q15_16(seq_len + cache_len, config.head_dim, config.rope_theta)
         self.embed, self.lm_head, self.final_norm, self.layers = load_packed_qwen3(packed_dir, config)
@@ -217,19 +225,30 @@ class Qwen3IntOnlyModel:
         return q15_16(self.embed[input_ids])
 
     def hidden(self, input_ids, layers=None, verbose=False, cache_kv=None):
-        x = self.embed_input(input_ids)
+        residual = self.embed_input(input_ids)
         n_layers = self.config.num_hidden_layers if layers is None else layers
+        x8, xs8 = self.block.rms_sq8_hidden_fast(residual, self.layers[0].input_layernorm, self.lut_rsqrt, self.layers[0].input_qkv_i8_scale)
+        mlp = None
         for layer_idx in range(n_layers):
             t0 = time.time()
+            if layer_idx:
+                residual, x8, xs8 = self.block.add_rms_sq8_hidden(
+                    residual, mlp, self.layers[layer_idx].input_layernorm, self.lut_rsqrt, self.layers[layer_idx].input_qkv_i8_scale
+                )
             layer_cache = None if cache_kv is None else cache_kv[layer_idx]
             if layer_cache is None:
-                x = self.block(x, self.layers[layer_idx], self.cos, self.sin, r3_q15=self.r3_q15)
+                residual, mlp = self.block(residual, self.layers[layer_idx], self.cos, self.sin, r3_q15=self.r3_q15, x8=x8, xs8=xs8, return_parts=True)
             else:
-                x = self.block(x, self.layers[layer_idx], self.cos, self.sin, layer_cache[0], layer_cache[1], self.r3_q15)
+                residual, mlp = self.block(
+                    residual, self.layers[layer_idx], self.cos, self.sin, layer_cache[0], layer_cache[1], self.r3_q15, x8=x8, xs8=xs8, return_parts=True
+                )
             if verbose:
                 torch.cuda.synchronize()
                 print(f"int-only layer {layer_idx} done in {time.time() - t0:.3f}s", flush=True)
-        return self.final_norm_kernel(x, self.final_norm, self.lut_rsqrt)
+        if n_layers == 0:
+            return self.final_norm_kernel(residual, self.final_norm, self.lut_rsqrt)
+        _hidden, norm = self.final_add_norm_kernel(residual, mlp, self.final_norm, self.lut_rsqrt)
+        return norm
 
     def logits(self, input_ids, layers=None, verbose=False, cache_kv=None):
         h = self.hidden(input_ids, layers=layers, verbose=verbose, cache_kv=cache_kv).float() / Q15_16

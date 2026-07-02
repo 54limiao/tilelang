@@ -26,21 +26,20 @@ Kernel profile for the int-only LLM block path: 2048 tokens, 28 layers, prefix K
 
 | kernel | avg ms | total ms | pct | TOPS |
 | --- | ---: | ---: | ---: | ---: |
-| attention_cache_i8v8_fused_static | 0.992 | 83.319 | 50.22 | 34.81 |
-| down_proj_static | 0.186 | 15.625 | 9.42 | 69.27 |
-| qkv_proj_i8 | 0.141 | 11.805 | 7.11 | 122.25 |
-| gate_up_proj_static | 0.135 | 11.308 | 6.82 | 191.44 |
-| rope_sq8_q_attn_hadamard | 0.088 | 7.430 | 4.48 | - |
-| rms_q_q15 | 0.067 | 5.595 | 3.37 | - |
-| silu_mul_sq16_mid_fast | 0.063 | 5.290 | 3.19 | - |
-| o_proj_i8_static | 0.063 | 5.288 | 3.19 | 136.45 |
-| rope_sq8_k_attn_hadamard | 0.054 | 4.553 | 2.74 | - |
-| residual_attn_rms_sq8 | 0.043 | 3.610 | 2.18 | - |
-| rms_k_q15 | 0.043 | 3.593 | 2.17 | - |
-| rms_input_sq8_fast | 0.037 | 3.150 | 1.90 | - |
-| sq8_v_attn_noscale | 0.037 | 3.068 | 1.85 | - |
-| add_mlp_residual | 0.027 | 2.288 | 1.38 | - |
-| total | 1.975 | 165.921 | 100.00 | 50.10 |
+| attention_cache_i8v8_fused_static | 0.925 | 77.702 | 51.12 | 37.33 |
+| down_proj_static | 0.173 | 14.564 | 9.58 | 74.32 |
+| qkv_proj_i8 | 0.128 | 10.771 | 7.09 | 133.98 |
+| gate_up_proj_static | 0.124 | 10.408 | 6.85 | 207.99 |
+| rope_sq8_q_attn_hadamard | 0.082 | 6.908 | 4.54 | - |
+| residual_rms_sq8 | 0.038 | 6.278 | 4.13 | - |
+| rms_q_q15 | 0.062 | 5.209 | 3.43 | - |
+| silu_mul_sq16_mid_fast | 0.060 | 5.007 | 3.29 | - |
+| o_proj_i8_static | 0.057 | 4.809 | 3.16 | 150.04 |
+| rope_sq8_k_attn_hadamard | 0.049 | 4.124 | 2.71 | - |
+| rms_k_q15 | 0.040 | 3.394 | 2.23 | - |
+| sq8_v_attn_noscale | 0.033 | 2.736 | 1.80 | - |
+| rms_input_sq8_fast | 0.031 | 0.093 | 0.06 | - |
+| total | 1.810 | 152.004 | 100.00 | 54.68 |
 
 The first run writes `qwen3_int_only.safetensors` and `timestamp`; later runs skip packing when the pack matches the current static schema. Use `FORCE_PACK=1 examples/qwen3_int_only/test_static_path.sh` to rebuild.
 
@@ -49,7 +48,8 @@ Main quantization path:
 - weights: per-channel static int8 for all linear weights
 - activations: calibrated static scales from FineWeb, 32 batches x 2048 tokens, ignoring the first 512 prefix tokens
 - residual stream: Q15.16 int32
-- attention: input RMSNorm directly emits static int8 for QKV, Q/K RMSNorm stays Q15.16, q/k/v are static int8 with r2/r3 QuaRot head rotations, prefix KV cache, fused static int8 attention output feeds O projection
+- attention: the first input RMSNorm directly emits static int8 for QKV; later input RMSNorms use the same residual RMS kernel as post-attention RMSNorm
+- residual flow: follows the mini-sglang `RMSNormFused` layout; layer 0 starts with no residual, then residual RMS kernels update the Q15.16 residual stream and emit static int8 linear inputs
 - MLP: post-attention residual RMSNorm emits both Q15.16 residual and static int8 linear input, SiLU-gated activation is static int16, all compute kernels are int-only TileLang kernels
 - comparison: int-only logits are compared with HF bf16 logits using PPL, cosine, MSE, MAE, max_abs, and rel_mse
 
