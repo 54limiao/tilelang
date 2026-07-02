@@ -13,10 +13,12 @@ from examples.qwen3_int_only.utils import (
     QWEN3_0_6B,
     per_channel_i8_weight,
     q15_16,
+    hadamard_rotation,
     random_hadamard_rotation,
     rmsnorm_torch,
     rope_tables_q15_16,
     rope_torch,
+    rotate_block_input,
     rotate_head_input,
     rotate_head_output,
     rotate_input,
@@ -107,9 +109,16 @@ def current_pack_metadata(path):
             "layers.0.attn_i8.scale",
             "layers.0.post_mlp_i8.scale",
             "layers.0.gated_mlp_i16.scale",
+            "layers.0.gated_mlp_i8.scale",
         )
     )
     return metadata if ok else None
+
+
+def block_hadamard(x, rotation, block_dim=128):
+    shape = x.shape
+    y = x.to(torch.float64).reshape(*shape[:-1], shape[-1] // block_dim, block_dim)
+    return (y @ rotation.to(x.device, torch.float64)).reshape(shape).to(torch.float32)
 
 
 @torch.no_grad()
@@ -152,9 +161,11 @@ def run_calib_segment(x, w, norms, cos, sin, config, r3, prefix_tokens):
     gate = m @ w["gate_proj"].T
     up = m @ w["up_proj"].T
     gated = torch.nn.functional.silu(gate) * up
+    gated_h = block_hadamard(gated, w["down_hadamard"])
     stats["post_mlp_i8"] = q15_16(m[:, prefix_tokens:])
     stats["gated_mlp_i16"] = q15_16(gated[:, prefix_tokens:])
-    return x + gated @ w["down_proj"].T, stats
+    stats["gated_mlp_i8"] = q15_16(gated_h[:, prefix_tokens:])
+    return x + gated_h @ w["down_proj"].T, stats
 
 
 @torch.no_grad()
@@ -165,11 +176,12 @@ def calibrate_attention_scales(embed, layer_weights, norm_weights, ids, config, 
     scales = [None for _ in layer_weights]
     for layer_idx, (w, norms) in enumerate(zip(layer_weights, norm_weights)):
         x, stats = run_calib_segment(x, w, norms, cos, sin, config, r3, prefix_tokens)
-        scales[layer_idx] = {name: update_head_amax(None, value) for name, value in stats.items() if name not in ("input_qkv_i8", "post_mlp_i8", "gated_mlp_i16")}
+        scales[layer_idx] = {name: update_head_amax(None, value) for name, value in stats.items() if name not in ("input_qkv_i8", "post_mlp_i8", "gated_mlp_i16", "gated_mlp_i8")}
         scales[layer_idx]["input_qkv_i8"] = update_tensor_amax(None, stats["input_qkv_i8"])
         scales[layer_idx]["attn_i8"] = update_tensor_amax(None, stats["attn_i8"])
         scales[layer_idx]["post_mlp_i8"] = update_tensor_amax(None, stats["post_mlp_i8"])
         scales[layer_idx]["gated_mlp_i16"] = update_tensor_amax(None, stats["gated_mlp_i16"])
+        scales[layer_idx]["gated_mlp_i8"] = update_tensor_amax(None, stats["gated_mlp_i8"])
     return [
         {
             "q_pre_rope_i16": scale_from_amax(layer["q_pre_rope_i16"], 32767),
@@ -181,6 +193,7 @@ def calibrate_attention_scales(embed, layer_weights, norm_weights, ids, config, 
             "attn_i8": scale_from_amax(layer["attn_i8"], 127),
             "post_mlp_i8": scale_from_amax(layer["post_mlp_i8"], 127),
             "gated_mlp_i16": scale_from_amax(layer["gated_mlp_i16"], 32767),
+            "gated_mlp_i8": scale_from_amax(layer["gated_mlp_i8"], 127),
         }
         for layer in scales
     ]
@@ -226,6 +239,7 @@ def main():
     r1 = random_hadamard_rotation(QWEN3_0_6B.hidden_size, args.rotate_seed, args.device) if args.use_r1 else None
     r2 = random_hadamard_rotation(QWEN3_0_6B.head_dim, args.rotate_seed + 1, args.device) if args.use_r2 else None
     r3 = random_hadamard_rotation(QWEN3_0_6B.head_dim, args.rotate_seed + 2, args.device) if args.use_r3 else None
+    down_hadamard = hadamard_rotation(QWEN3_0_6B.head_dim, args.device)
     with safe_open(f"{args.model_dir}/model.safetensors", framework="pt", device="cpu") as f:
         def tensor(name, device=args.device):
             return f.get_tensor(name).to(torch.float32).to(device)
@@ -259,6 +273,8 @@ def main():
                     weight = rotate_head_input(weight, QWEN3_0_6B.head_dim, r2)
                 if args.use_r1 and name in ("o_proj", "down_proj"):
                     weight = rotate_output(weight, r1)
+                if name == "down_proj":
+                    weight = rotate_block_input(weight, QWEN3_0_6B.head_dim, down_hadamard)
                 layer_float[name] = weight
                 w, s = per_channel_i8_weight(weight)
                 tensors[f"{dst}.{name}.weight"] = w.cpu().contiguous()
@@ -279,6 +295,7 @@ def main():
             k_norm = tensor(f"{src}.self_attn.k_norm.weight")
             tensors[f"{dst}.q_norm"] = q15_16(q_norm).cpu()
             tensors[f"{dst}.k_norm"] = q15_16(k_norm).cpu()
+            layer_float["down_hadamard"] = down_hadamard
             calib_weights.append(layer_float)
             calib_norms.append((input_norm, post_norm, q_norm, k_norm))
 

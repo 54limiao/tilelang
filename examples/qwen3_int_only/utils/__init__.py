@@ -9,6 +9,8 @@ from safetensors.torch import load_file
 from examples.qwen3_int_only.utils.quarot import (
     ROTATE_SEED,
     random_hadamard_rotation,
+    hadamard_rotation,
+    rotate_block_input,
     rotate_head_input,
     rotate_head_output,
     rotate_input,
@@ -71,6 +73,11 @@ def reciprocal_qt(scale):
     return ratio_qt(torch.ones_like(scale), scale)
 
 
+def reciprocal_sqrt_qt(scale, dim):
+    denom = torch.clamp(torch.round(scale.float() * (dim**0.5)).to(torch.int64), min=1)
+    return ratio_qt(torch.ones_like(denom), denom)
+
+
 def per_channel_i8_weight(w):
     scale = w.abs().amax(dim=1).clamp(min=1e-6) / 127.0
     return torch.round(w / scale[:, None]).clamp(-128, 127).to(torch.int8), q15_16(scale).to(torch.uint32)
@@ -128,6 +135,8 @@ class Qwen3BlockWeights:
     post_mlp_i8_qt: torch.Tensor | None = None
     gated_mlp_i16_scale: torch.Tensor | None = None
     gated_mlp_i16_qt: torch.Tensor | None = None
+    gated_mlp_i8_scale: torch.Tensor | None = None
+    gated_mlp_i8_qt: torch.Tensor | None = None
 
 
 # Used by small standalone tests and by prepack-compatible float loading.
@@ -174,6 +183,12 @@ def load_packed_qwen3(packed_dir, config=QWEN3_0_6B, device="cuda"):
     def linear_i16_qt(xs_name, linear_weight):
         return ratio_qt(optional(xs_name).to(torch.int64) * linear_weight.scale.to(torch.int64), torch.full_like(linear_weight.scale.to(torch.int64), 256))
 
+    def down_qt(linear_weight):
+        scale = optional(f"{p}.gated_mlp_i8.scale")
+        if scale is None:
+            return linear_i16_qt(f"{p}.gated_mlp_i16.scale", linear_weight)
+        return linear_i8_qt(f"{p}.gated_mlp_i8.scale", linear_weight)
+
     for layer_idx in range(config.num_hidden_layers):
         p = f"layers.{layer_idx}"
         qkv_proj = cat_linear(f"{p}.qkv_proj", (f"{p}.q_proj", f"{p}.k_proj", f"{p}.v_proj"))
@@ -209,7 +224,9 @@ def load_packed_qwen3(packed_dir, config=QWEN3_0_6B, device="cuda"):
                 qkv_out_qt=linear_i8_qt(f"{p}.input_qkv_i8.scale", qkv_proj),
                 o_out_qt=linear_i8_qt(f"{p}.attn_i8.scale", o_proj),
                 gate_up_out_qt=linear_i8_qt(f"{p}.post_mlp_i8.scale", gate_up_proj),
-                down_out_qt=linear_i16_qt(f"{p}.gated_mlp_i16.scale", down_proj),
+                down_out_qt=down_qt(down_proj),
+                gated_mlp_i8_scale=optional(f"{p}.gated_mlp_i8.scale"),
+                gated_mlp_i8_qt=None if optional(f"{p}.gated_mlp_i8.scale") is None else reciprocal_sqrt_qt(optional(f"{p}.gated_mlp_i8.scale"), config.head_dim),
                 post_mlp_i8_scale=optional(f"{p}.post_mlp_i8.scale"),
                 post_mlp_i8_qt=optional_qt(f"{p}.post_mlp_i8.scale"),
                 gated_mlp_i16_scale=optional(f"{p}.gated_mlp_i16.scale"),

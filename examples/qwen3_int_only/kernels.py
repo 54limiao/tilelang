@@ -252,6 +252,50 @@ def silu_i16(rows, cols):
     return main
 
 
+def silu_hadamard_i8(rows, cols, block_dim=128):
+    thread_elem = 8
+    threads = 16
+    thread_round = 3
+    warp_round = 4
+    groups = cols // block_dim
+
+    @T.prim_func
+    def main(
+        Gate: T.Tensor((rows, cols), "int32"),
+        Up: T.Tensor((rows, cols), "int32"),
+        LUT: T.Tensor((1024,), "int32"),
+        QT: T.Tensor((1,), "uint32"),
+        Q: T.Tensor((rows, cols), "int8"),
+        S: T.Tensor((rows,), "uint32"),
+    ):
+        with T.Kernel(rows, groups, threads=threads) as (r, g):
+            tx = T.get_thread_binding(0)
+            local = T.alloc_local((thread_elem,), "int32")
+            other = T.alloc_local((thread_elem,), "int32")
+            qt = T.alloc_local((1,), "uint32")
+            qt[0] = QT[0]
+            S[r] = QT[0]
+            for i in T.serial(thread_elem):
+                c = g * T.int32(block_dim) + tx * T.int32(thread_elem) + i
+                sig = T.fix.lut_10bit(Gate[r, c], LUT, scale=SCALE_INV_1024, out_dtype="int32")
+                local[i] = ((((Gate[r, c] >> T.int32(10)) * sig) >> T.int32(8)) * (Up[r, c] >> T.int32(8)))
+            for i in T.serial(thread_round):
+                chunksize = 1 << (i + 1)
+                chunknum = thread_elem // chunksize
+                for j in T.serial(chunknum):
+                    chunkbase = j * chunksize
+                    for k in T.serial(chunksize // 2):
+                        a = local[chunkbase + k]
+                        b = local[chunkbase + k + chunksize // 2]
+                        local[chunkbase + k] = a + b
+                        local[chunkbase + k + chunksize // 2] = a - b
+            _warp_hadamard_i32(local, other, thread_elem, threads, warp_round)
+            for i in T.serial(thread_elem):
+                Q[r, g * T.int32(block_dim) + tx * T.int32(thread_elem) + i] = T.fix.quant(local[i], scale=qt[0], out_dtype="int8")
+
+    return main
+
+
 def linear_i8(rows, in_features, out_features, block_m=16, block_n=32, block_k=64):
     @T.prim_func
     def main(

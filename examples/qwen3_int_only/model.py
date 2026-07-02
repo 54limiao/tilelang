@@ -8,9 +8,8 @@ from examples.qwen3_int_only.kernels import (
     rms_sq8,
     attention_i8,
     linear_i8,
-    linear_i16,
     rope_sq8,
-    silu_i16,
+    silu_hadamard_i8,
     quant_v_i8,
 )
 from examples.qwen3_int_only.utils import ROTATE_SEED, QWEN3_0_6B, Qwen3BlockWeights, load_packed_qwen3, q15_16, random_hadamard_rotation, rope_tables_q15_16
@@ -42,8 +41,8 @@ class Qwen3IntOnlyBlock:
         self.qkv_proj = tilelang.compile(linear_i8(seq_len, h, q_dim + 2 * kv_dim, 64, 128, 64), out_idx=[3], target="cuda")
         self.o_proj = tilelang.compile(linear_i8(seq_len, q_dim, h, 64, 64, 64), out_idx=[3], target="cuda")
         self.gate_up_proj = tilelang.compile(linear_i8(seq_len, h, 2 * im, 64, 128, 64), out_idx=[3], target="cuda")
-        self.silu_mul = tilelang.compile(silu_i16(seq_len, im), out_idx=[4, 5], target="cuda")
-        self.down_proj = tilelang.compile(linear_i16(seq_len, im, h, 64, 64, 64), out_idx=[3], target="cuda")
+        self.silu_hadamard = tilelang.compile(silu_hadamard_i8(seq_len, im), out_idx=[4, 5], target="cuda")
+        self.down_proj = tilelang.compile(linear_i8(seq_len, im, h, 64, 64, 64), out_idx=[3], target="cuda")
         self.attn = tilelang.compile(attention_i8(qh, kvh, seq_len, cache_len, hd), out_idx=[9], target="cuda")
         self.lut_rsqrt = torch.from_numpy(rsqrt_lut()).cuda()
         self.lut_sigmoid = torch.from_numpy(sigmoid_lut()).cuda()
@@ -84,7 +83,7 @@ class Qwen3IntOnlyBlock:
         gate_up = self.gate_up_proj(h8, weights.gate_up_proj.weight, weights.gate_up_out_qt)
         gate = gate_up[:, : cfg.intermediate_size].contiguous()
         up = gate_up[:, cfg.intermediate_size :].contiguous()
-        gated, _ = self.silu_mul(gate, up, self.lut_sigmoid, weights.gated_mlp_i16_qt)
+        gated, _ = self.silu_hadamard(gate, up, self.lut_sigmoid, weights.gated_mlp_i8_qt)
         mlp = self.down_proj(gated, weights.down_proj.weight, weights.down_out_qt)
         return residual, mlp
 

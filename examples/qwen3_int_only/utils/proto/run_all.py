@@ -2,7 +2,7 @@ import argparse
 
 import numpy as np
 
-from examples.qwen3_int_only.utils.proto import attention_i8, linear_i16, linear_i8, quant_v_i8, rms_q15, rms_sq8, rope_sq8, silu_i16
+from examples.qwen3_int_only.utils.proto import attention_i8, linear_i16, linear_i8, quant_v_i8, rms_q15, rms_sq8, rope_sq8, silu_hadamard_i8, silu_i16
 
 
 def main():
@@ -15,6 +15,7 @@ def main():
     rms_sq8.check(rng)
     rope_sq8.check(rng)
     silu_i16.check(rng)
+    silu_hadamard_i8.check(rng)
     linear_i8.check(rng)
     linear_i16.check(rng)
     attention_i8.check(rng)

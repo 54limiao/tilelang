@@ -26,20 +26,18 @@ def op_counts(seq_len, cfg, cache_len=0):
         "linear_i8_qkv": 2 * seq_len * cfg.hidden_size * (cfg.q_size + 2 * cfg.kv_size),
         "linear_i8_o": 2 * seq_len * cfg.q_size * cfg.hidden_size,
         "linear_i8_gate_up": 2 * seq_len * cfg.hidden_size * (2 * cfg.intermediate_size),
-        "linear_i16_down": 2 * seq_len * cfg.intermediate_size * cfg.hidden_size,
+        "linear_i8_down": 2 * seq_len * cfg.intermediate_size * cfg.hidden_size,
         "attention_i8": qk_ops + pv_ops,
     }
 
 
 def tc_op_counts(seq_len, cfg, cache_len=0):
     # math_ops is the model matmul work. tc_ops is the int8 tensorcore work we
-    # actually issue: attention recomputes QK and splits P16@V8 into two int8
-    # GEMMs, and int16@int8 is implemented as two int8@int8 GEMMs.
+    # actually issue: attention recomputes QK and splits P16@V8 into two int8 GEMMs.
     ops = op_counts(seq_len, cfg, cache_len)
     qk_ops = 2 * cfg.num_attention_heads * seq_len * (seq_len + cache_len) * cfg.head_dim
     pv_ops = qk_ops
     ops["attention_i8"] = 2 * qk_ops + 2 * pv_ops
-    ops["linear_i16_down"] *= 2
     return ops
 
 
@@ -151,8 +149,8 @@ def run_block(block, x, x8, xs8, weights, cos, sin, r3_q15, prof, cache_k=None, 
     gate_up = prof.time("linear_i8", lambda: block.gate_up_proj(h8, weights.gate_up_proj.weight, weights.gate_up_out_qt), ops["linear_i8_gate_up"], tc_ops["linear_i8_gate_up"])
     gate = gate_up[:, : cfg.intermediate_size].contiguous()
     up = gate_up[:, cfg.intermediate_size :].contiguous()
-    gated, _gs = prof.time("silu_i16", lambda: block.silu_mul(gate, up, block.lut_sigmoid, weights.gated_mlp_i16_qt))
-    mlp = prof.time("linear_i16", lambda: block.down_proj(gated, weights.down_proj.weight, weights.down_out_qt), ops["linear_i16_down"], tc_ops["linear_i16_down"])
+    gated, _gs = prof.time("silu_hadamard_i8", lambda: block.silu_hadamard(gate, up, block.lut_sigmoid, weights.gated_mlp_i8_qt))
+    mlp = prof.time("linear_i8", lambda: block.down_proj(gated, weights.down_proj.weight, weights.down_out_qt), ops["linear_i8_down"], tc_ops["linear_i8_down"])
     return h, mlp
 
 

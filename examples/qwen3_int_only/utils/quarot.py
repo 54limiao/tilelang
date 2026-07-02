@@ -16,6 +16,13 @@ def random_hadamard_rotation(dim, seed=ROTATE_SEED, device="cuda"):
     return (signs.reshape(-1, 1) * h).contiguous()
 
 
+def hadamard_rotation(dim, device="cuda"):
+    h = torch.ones(1, 1, dtype=torch.float32, device=device)
+    while h.size(0) < dim:
+        h = torch.cat((torch.cat((h, h), dim=1), torch.cat((h, -h), dim=1)), dim=0)
+    return (h / math.sqrt(dim)).contiguous()
+
+
 def rotate_input(weight, rotation):
     return (weight.to(torch.float64) @ rotation.to(weight.device, torch.float64)).to(torch.float32)
 
@@ -39,4 +46,10 @@ def rotate_head_output(weight, head_dim, rotation):
 def rotate_head_input(weight, head_dim, rotation):
     shape = weight.shape
     w = weight.to(torch.float64).reshape(-1, shape[-1] // head_dim, head_dim)
+    return (w @ rotation.to(weight.device, torch.float64)).reshape(shape).to(torch.float32)
+
+
+def rotate_block_input(weight, block_dim, rotation):
+    shape = weight.shape
+    w = weight.to(torch.float64).reshape(-1, shape[-1] // block_dim, block_dim)
     return (w @ rotation.to(weight.device, torch.float64)).reshape(shape).to(torch.float32)
