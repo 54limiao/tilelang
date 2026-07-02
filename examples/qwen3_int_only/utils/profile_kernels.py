@@ -31,10 +31,28 @@ def op_counts(seq_len, cfg, cache_len=0):
     }
 
 
+def actual_op_counts(seq_len, cfg, cache_len=0):
+    ops = op_counts(seq_len, cfg, cache_len)
+    qk_ops = 2 * cfg.num_attention_heads * seq_len * (seq_len + cache_len) * cfg.head_dim
+    pv_ops = qk_ops
+    ops["attention_cache_i8v8_fused_static"] = 2 * qk_ops + 3 * pv_ops
+    ops["down_proj_static"] *= 2
+    return ops
+
+
+def default_int8_peak_tops():
+    name = torch.cuda.get_device_name().lower()
+    if "a100" in name:
+        return 624.0
+    return 0.0
+
+
 class Profiler:
-    def __init__(self, ops):
+    def __init__(self, ops, peak_tops=0.0, actual_ops=None):
         self.rows = []
         self.ops = ops
+        self.actual_ops = actual_ops or ops
+        self.peak_tops = peak_tops
 
     def time(self, name, fn):
         torch.cuda.synchronize()
@@ -60,9 +78,22 @@ class Profiler:
             if name in self.ops:
                 row["gops"] = self.ops[name] * counts[name] / 1.0e9
                 row["tops"] = row["gops"] / ms
+                if self.peak_tops:
+                    row["util_pct"] = row["tops"] / self.peak_tops * 100.0
+                if self.actual_ops.get(name, self.ops[name]) != self.ops[name]:
+                    row["actual_gops"] = self.actual_ops[name] * counts[name] / 1.0e9
+                    row["actual_tops"] = row["actual_gops"] / ms
+                    if self.peak_tops:
+                        row["actual_util_pct"] = row["actual_tops"] / self.peak_tops * 100.0
             items.append(row)
             if print_rows:
-                perf = f" {row['tops']:7.2f} TOPS" if "tops" in row else ""
+                perf = ""
+                if "tops" in row:
+                    util = f" util={row['util_pct']:5.2f}%" if "util_pct" in row else ""
+                    perf = f" {row['tops']:7.2f} TOPS{util}"
+                    if "actual_tops" in row:
+                        actual_util = f" util={row['actual_util_pct']:5.2f}%" if "actual_util_pct" in row else ""
+                        perf += f" actual={row['actual_tops']:7.2f} TOPS{actual_util}"
                 print(f"{name:28s} avg={row['avg_ms']:8.3f} ms total={ms:9.3f} ms {row['pct']:6.2f}%{perf}")
         if print_rows:
             print(f"{'total':28s} {total:9.3f} ms")
@@ -129,6 +160,7 @@ def main():
     parser.add_argument("--layers", type=int, default=28)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeat", type=int, default=3)
+    parser.add_argument("--peak-tops", type=float, default=0.0)
     parser.add_argument("--cache-prompt", default="你是一个有用而无害的聊天助手。")
     parser.add_argument("--jsonl-out", default="")
     args = parser.parse_args()
@@ -168,17 +200,26 @@ def main():
         return residual, mlp
 
     ops = op_counts(seq_len, QWEN3_0_6B, cache_len)
+    actual_ops = actual_op_counts(seq_len, QWEN3_0_6B, cache_len)
+    peak_tops = args.peak_tops or default_int8_peak_tops()
     for _ in range(args.warmup):
-        run_layers(Profiler(ops))
-    prof = Profiler(ops)
+        run_layers(Profiler(ops, peak_tops, actual_ops))
+    prof = Profiler(ops, peak_tops, actual_ops)
     for _ in range(args.repeat):
         run_layers(prof)
     summary = prof.summary(print_rows=True)
     counted_ops_top = sum(row.get("gops", 0.0) for row in summary["kernels"]) / 1000.0
+    actual_counted_ops_top = sum(row.get("actual_gops", row.get("gops", 0.0)) for row in summary["kernels"]) / 1000.0
+    counted_tops = counted_ops_top / (summary["total_ms"] / 1000.0)
+    actual_counted_tops = actual_counted_ops_top / (summary["total_ms"] / 1000.0)
+    util = counted_tops / peak_tops * 100.0 if peak_tops else 0.0
+    actual_util = actual_counted_tops / peak_tops * 100.0 if peak_tops else 0.0
     print(
         f"profile seq_len={seq_len} tokens layers={args.layers} repeats={args.repeat} "
         f"total_ms={summary['total_ms']:.3f} per_pass_ms={summary['total_ms'] / args.repeat:.3f} "
-        f"counted_ops_per_pass={counted_ops_top / args.repeat:.3f} TOP counted_tops={counted_ops_top / (summary['total_ms'] / 1000.0):.2f}"
+        f"counted_ops_per_pass={counted_ops_top / args.repeat:.3f} TOP counted_tops={counted_tops:.2f} "
+        f"actual_ops_per_pass={actual_counted_ops_top / args.repeat:.3f} TOP actual_tops={actual_counted_tops:.2f} "
+        f"peak_tops={peak_tops:.2f} util={util:.2f}% actual_util={actual_util:.2f}%"
     )
     if args.jsonl_out:
         row = {
@@ -192,7 +233,13 @@ def main():
             "fused_static": True,
             "counted_ops_top": counted_ops_top,
             "counted_ops_per_pass_top": counted_ops_top / args.repeat,
-            "counted_tops": counted_ops_top / (summary["total_ms"] / 1000.0),
+            "actual_counted_ops_top": actual_counted_ops_top,
+            "actual_counted_ops_per_pass_top": actual_counted_ops_top / args.repeat,
+            "counted_tops": counted_tops,
+            "actual_counted_tops": actual_counted_tops,
+            "peak_tops": peak_tops,
+            "util_pct": util,
+            "actual_util_pct": actual_util,
             **summary,
         }
         with open(args.jsonl_out, "a", encoding="utf-8") as f:
