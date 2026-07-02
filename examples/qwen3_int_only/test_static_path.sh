@@ -21,6 +21,7 @@ CALIB_SEQ_LEN="${CALIB_SEQ_LEN:-2048}"
 CALIB_BATCHES="${CALIB_BATCHES:-32}"
 CALIB_PREFIX_TOKENS="${CALIB_PREFIX_TOKENS:-512}"
 FORCE_PACK="${FORCE_PACK:-0}"
+START_TS="$(date +%s)"
 
 PREPACK_ARGS=(
   examples/qwen3_int_only/utils/prepack.py
@@ -65,7 +66,13 @@ if [[ -n "${EVAL_PARQUET}" ]]; then
 fi
 
 echo "[1/2] pack static int-only weights and calibration"
+PACK_START_TS="$(date +%s)"
 "${PYTHON}" "${PREPACK_ARGS[@]}"
+PACK_END_TS="$(date +%s)"
 
 echo "[2/2] evaluate int-only against float/HF: ppl cos mse, tokens=${EVAL_TOKENS}"
+EVAL_START_TS="$(date +%s)"
 "${PYTHON}" "${PPL_ARGS[@]}"
+END_TS="$(date +%s)"
+
+echo "time pack=$((PACK_END_TS - PACK_START_TS))s eval=$((END_TS - EVAL_START_TS))s total=$((END_TS - START_TS))s"
