@@ -22,6 +22,8 @@ from examples.qwen3_int_only.kernels import (
     linear_dynamic_int8_qkv_q15_16,
     linear_dynamic_int8_residual_q15_16,
     linear_dynamic_int8_q15_16,
+    linear_static_int8_pair_q15_16,
+    linear_static_int16_residual_q15_16,
     rope_rotate_q15_16_heads,
     rope_rotate_static_quant_q15_16_attn,
     rope_rotate_static_quant_q15_16_attn_hadamard_approx,
@@ -32,9 +34,12 @@ from examples.qwen3_int_only.kernels import (
     rmsnorm_q15_16_weighted,
     rsqrt_lut,
     sigmoid_lut,
+    static_quant_q15_16,
     silu_mul_dynamic_quant_q15_16,
     silu_mul_dynamic_quant_q15_16_fast,
     silu_mul_dynamic_quant_q15_16_i16_fast,
+    silu_mul_static_quant_q15_16_fast,
+    silu_mul_static_quant_q15_16_i16_fast,
     static_quant_q15_16_per_head_attn,
     static_quant_q15_16_per_head_attn_noscale,
 )
@@ -98,6 +103,17 @@ def test_dynamic_quant_i16():
     ref_s = ceil_scale(xq, 32767, 1)
     ref_y = quantize_with_scale(xq, ref_s, 32767).to(torch.int16)
     torch.testing.assert_close(s, ref_s, rtol=0, atol=0)
+    torch.testing.assert_close(y, ref_y, rtol=0, atol=0)
+
+
+@tilelang.testing.requires_cuda
+def test_static_quant_i8():
+    rows, cols = 5, 64
+    xq = torch.randint(-180000, 180001, (rows, cols), device="cuda", dtype=torch.int32)
+    scale = torch.tensor([777], device="cuda", dtype=torch.uint32)
+    y, s = compile_kernel(static_quant_q15_16(rows, cols, "int8"), [2, 3])(xq, scale)
+    ref_y = quantize_with_scale(xq, scale, 127).to(torch.int8)
+    torch.testing.assert_close(s, scale.expand(rows), rtol=0, atol=0)
     torch.testing.assert_close(y, ref_y, rtol=0, atol=0)
 
 
@@ -251,6 +267,34 @@ def test_linear_i8_qkv_matches_unfused():
     torch.testing.assert_close(q, ref_q, rtol=0, atol=0)
     torch.testing.assert_close(k, ref_k, rtol=0, atol=0)
     torch.testing.assert_close(v, ref_v, rtol=0, atol=0)
+
+
+@tilelang.testing.requires_cuda
+def test_linear_static_mlp_kernels_match_torch_ref():
+    torch.manual_seed(0)
+    rows, in_features, out_features = 16, 64, 32
+    x = torch.randint(-128, 127, (rows, in_features), device="cuda", dtype=torch.int8)
+    mid = torch.randint(-32768, 32767, (rows, in_features), device="cuda", dtype=torch.int16)
+    w0 = torch.randint(-128, 127, (out_features, in_features), device="cuda", dtype=torch.int8)
+    w1 = torch.randint(-128, 127, (out_features, in_features), device="cuda", dtype=torch.int8)
+    xs = torch.tensor([321], device="cuda", dtype=torch.uint32)
+    mids = torch.tensor([17], device="cuda", dtype=torch.uint32)
+    ws0 = torch.randint(1, 512, (out_features,), device="cuda", dtype=torch.uint32)
+    ws1 = torch.randint(1, 512, (out_features,), device="cuda", dtype=torch.uint32)
+    residual = torch.randint(-100000, 100001, (rows, out_features), device="cuda", dtype=torch.int32)
+    y0, y1 = compile_kernel(linear_static_int8_pair_q15_16(rows, in_features, out_features), [6, 7])(x, xs, w0, ws0, w1, ws1)
+    y = compile_kernel(linear_static_int16_residual_q15_16(rows, in_features, out_features), [5])(mid, mids, w0, ws0, residual)
+    acc0 = (x.float() @ w0.float().T).int()
+    acc1 = (x.float() @ w1.float().T).int()
+    ref0 = (acc0 >> 8) * ((xs[0].int() * ws0[None, :].int()) >> 8)
+    ref1 = (acc1 >> 8) * ((xs[0].int() * ws1[None, :].int()) >> 8)
+    mid_i32 = mid.int()
+    acc_hi = ((mid_i32 >> 8).float() @ w0.float().T).int()
+    acc_mid = (((mid_i32 - ((mid_i32 >> 8) << 8)) >> 1).float() @ w0.float().T).int()
+    ref_y = residual + (((acc_hi + (acc_mid >> 7)).to(torch.int64) * mids[0].to(torch.int64) * ws0[None, :].to(torch.int64)) >> 8).to(torch.int32)
+    torch.testing.assert_close(y0.to(torch.int64), ref0.to(torch.int64), rtol=0, atol=0)
+    torch.testing.assert_close(y1.to(torch.int64), ref1.to(torch.int64), rtol=0, atol=0)
+    torch.testing.assert_close(y.to(torch.int64), ref_y.to(torch.int64), rtol=0, atol=0)
 
 
 @tilelang.testing.requires_cuda
@@ -474,3 +518,33 @@ def test_silu_mul_dynamic_quant_i16_fast_matches_dynamic_i16():
     q, s = compile_kernel(silu_mul_dynamic_quant_q15_16_i16_fast(rows, cols), [3, 4])(gate, up, lut)
     torch.testing.assert_close(q, ref_q, rtol=0, atol=0)
     torch.testing.assert_close(s, ref_s, rtol=0, atol=0)
+
+
+@tilelang.testing.requires_cuda
+def test_silu_mul_static_quant_matches_static_quant():
+    torch.manual_seed(0)
+    rows, cols = 3, 64
+    gate = torch.randint(-300000, 300001, (rows, cols), device="cuda", dtype=torch.int32)
+    up = torch.randint(-300000, 300001, (rows, cols), device="cuda", dtype=torch.int32)
+    scale = torch.tensor([100000], device="cuda", dtype=torch.uint32)
+    lut = torch.from_numpy(sigmoid_lut()).cuda()
+    q, s = compile_kernel(silu_mul_static_quant_q15_16_fast(rows, cols), [4, 5])(gate, up, lut, scale)
+    y = ((((gate >> 10) * fix_lut_10bit(gate, lut, 1.0 / 1024.0)) >> 8) * (up >> 8)).to(torch.int32)
+    ref_q = quantize_with_scale(y, scale, 127).to(torch.int8)
+    torch.testing.assert_close(s, scale.expand(rows), rtol=0, atol=0)
+    torch.testing.assert_close(q, ref_q, rtol=0, atol=0)
+
+
+@tilelang.testing.requires_cuda
+def test_silu_mul_static_quant_i16_matches_static_quant():
+    torch.manual_seed(0)
+    rows, cols = 3, 64
+    gate = torch.randint(-300000, 300001, (rows, cols), device="cuda", dtype=torch.int32)
+    up = torch.randint(-300000, 300001, (rows, cols), device="cuda", dtype=torch.int32)
+    scale = torch.tensor([800], device="cuda", dtype=torch.uint32)
+    lut = torch.from_numpy(sigmoid_lut()).cuda()
+    q, s = compile_kernel(silu_mul_static_quant_q15_16_i16_fast(rows, cols), [4, 5])(gate, up, lut, scale)
+    y = ((((gate >> 10) * fix_lut_10bit(gate, lut, 1.0 / 1024.0)) >> 8) * (up >> 8)).to(torch.int32)
+    ref_q = quantize_with_scale(y, scale, 32767).to(torch.int16)
+    torch.testing.assert_close(s, scale.expand(rows), rtol=0, atol=0)
+    torch.testing.assert_close(q, ref_q, rtol=0, atol=0)

@@ -22,6 +22,8 @@ from examples.qwen3_int_only.kernels import (
     linear_dynamic_int8_residual_q15_16,
     linear_dynamic_int8_q15_16,
     linear_dynamic_int16_residual_q15_16,
+    linear_static_int8_pair_q15_16,
+    linear_static_int16_residual_q15_16,
     rmsnorm_q15_16_grouped_weighted_rowwise,
     rmsnorm_dynamic_quant_q15_16_weighted_fast,
     rmsnorm_q15_16_weighted,
@@ -32,11 +34,13 @@ from examples.qwen3_int_only.kernels import (
     rope_q15_16_heads,
     rsqrt_lut,
     sigmoid_lut,
+    static_quant_q15_16,
     static_quant_q15_16_per_head_attn,
     static_quant_q15_16_per_head_attn_noscale,
     silu_mul_dynamic_quant_q15_16,
     silu_mul_dynamic_quant_q15_16_fast,
     silu_mul_dynamic_quant_q15_16_i16_fast,
+    silu_mul_static_quant_q15_16_i16_fast,
 )
 from examples.qwen3_int_only.quarot import ROTATE_SEED, random_hadamard_rotation
 
@@ -110,6 +114,8 @@ class Qwen3BlockWeights:
     q_post_rope_i8_scale: torch.Tensor | None = None
     k_post_rope_i8_scale: torch.Tensor | None = None
     v_i8_scale: torch.Tensor | None = None
+    post_mlp_i8_scale: torch.Tensor | None = None
+    gated_mlp_i16_scale: torch.Tensor | None = None
     q_proj_fp: torch.Tensor | None = None
     k_proj_fp: torch.Tensor | None = None
     v_proj_fp: torch.Tensor | None = None
@@ -155,6 +161,8 @@ class Qwen3BlockWeights:
             q15_16(post_attention_layernorm),
             q15_16(q_norm),
             q15_16(k_norm),
+            None,
+            None,
             None,
             None,
             None,
@@ -238,6 +246,8 @@ def load_packed_qwen3(packed_dir, config=QWEN3_0_6B, device="cuda"):
                 optional(f"{p}.q_post_rope_i8.scale"),
                 optional(f"{p}.k_post_rope_i8.scale"),
                 optional(f"{p}.v_i8.scale"),
+                optional(f"{p}.post_mlp_i8.scale"),
+                optional(f"{p}.gated_mlp_i16.scale"),
             )
         )
     return tensors["model.embed_tokens.weight"], tensors["lm_head.weight"], tensors["model.norm.weight"], blocks
@@ -326,13 +336,14 @@ def parse_layer_set(value):
 
 
 class Qwen3IntOnlyBlock:
-    def __init__(self, seq_len, config=QWEN3_0_6B, cache_len=0, use_r3=True, fast_hadamard=True, mlp_i16=False):
+    def __init__(self, seq_len, config=QWEN3_0_6B, cache_len=0, use_r3=True, fast_hadamard=True, mlp_i16=False, static_mlp=False):
         self.seq_len = seq_len
         self.cache_len = cache_len
         self.config = config
         self.use_r3 = use_r3
         self.fast_hadamard = fast_hadamard
         self.mlp_i16 = mlp_i16
+        self.static_mlp = static_mlp
         h, hd, im = config.hidden_size, config.head_dim, config.intermediate_size
         qh, kvh = config.num_attention_heads, config.num_key_value_heads
         q_dim, kv_dim = config.q_size, config.kv_size
@@ -359,6 +370,10 @@ class Qwen3IntOnlyBlock:
         self.down_proj_i8 = compile_kernel(linear_dynamic_int8_q15_16(seq_len, im, h, 64, 64, 64), [4])
         self.down_residual_i8 = compile_kernel(linear_dynamic_int8_residual_q15_16(seq_len, im, h, 64, 64, 64), [5])
         self.down_residual_i16 = compile_kernel(linear_dynamic_int16_residual_q15_16(seq_len, im, h, 64, 64, 64), [5]) if mlp_i16 else None
+        self.sq8_hidden = compile_kernel(static_quant_q15_16(seq_len, h, "int8"), [2, 3]) if static_mlp else None
+        self.gate_up_proj_static = compile_kernel(linear_static_int8_pair_q15_16(seq_len, h, im, 64, 128, 64), [6, 7]) if static_mlp else None
+        self.silu_mul_sq16_mid_fast = compile_kernel(silu_mul_static_quant_q15_16_i16_fast(seq_len, im), [4, 5]) if static_mlp else None
+        self.down_residual_static = compile_kernel(linear_static_int16_residual_q15_16(seq_len, im, h, 64, 64, 64), [5]) if static_mlp else None
         self.rope_q = compile_kernel(rope_rotate_q15_16_heads(seq_len, qh, hd), [4]) if use_r3 else compile_kernel(rope_q15_16_heads(seq_len, qh, hd), [3])
         self.rope_k = compile_kernel(rope_rotate_q15_16_heads(seq_len, kvh, hd), [4]) if use_r3 else compile_kernel(rope_q15_16_heads(seq_len, kvh, hd), [3])
         self.silu_mul_dq8_mid = compile_kernel(silu_mul_dynamic_quant_q15_16(seq_len, im), [3, 4, 5])
@@ -437,10 +452,22 @@ class Qwen3IntOnlyBlock:
             h8, hs8 = self.dq8_hidden(post)
         else:
             post = None
-            h, h8, hs8 = self.add_rms_dq8_hidden_fast(x_q15_16, attn_out, weights.post_attention_layernorm, self.lut_rsqrt)
-        gate, up = self.gate_up_proj_i8(h8, hs8, weights.gate_proj.weight, weights.gate_proj.scale, weights.up_proj.weight, weights.up_proj.scale)
+            if self.static_mlp:
+                h, post = self.add_rms_hidden_q15(x_q15_16, attn_out, weights.post_attention_layernorm, self.lut_rsqrt)
+                h8, _hs8 = self.sq8_hidden(post, weights.post_mlp_i8_scale)
+                hs8 = weights.post_mlp_i8_scale
+            else:
+                h, h8, hs8 = self.add_rms_dq8_hidden_fast(x_q15_16, attn_out, weights.post_attention_layernorm, self.lut_rsqrt)
+        if self.static_mlp and not collect:
+            gate, up = self.gate_up_proj_static(h8, hs8, weights.gate_proj.weight, weights.gate_proj.scale, weights.up_proj.weight, weights.up_proj.scale)
+        else:
+            gate, up = self.gate_up_proj_i8(h8, hs8, weights.gate_proj.weight, weights.gate_proj.scale, weights.up_proj.weight, weights.up_proj.scale)
         if collect:
             gated, gated8, gs8 = self.silu_mul_dq8_mid(gate, up, self.lut_sigmoid)
+        elif self.static_mlp:
+            gated = None
+            gated8, _gs8 = self.silu_mul_sq16_mid_fast(gate, up, self.lut_sigmoid, weights.gated_mlp_i16_scale)
+            gs8 = weights.gated_mlp_i16_scale
         elif use_mlp_i16:
             gated = None
             gated8, gs8 = self.silu_mul_dq16_mid_fast(gate, up, self.lut_sigmoid)
@@ -450,6 +477,9 @@ class Qwen3IntOnlyBlock:
         if collect:
             mlp = self.down_proj_i8(gated8, gs8, weights.down_proj.weight, weights.down_proj.scale)
             layer_out = self.add_hidden(h, mlp)
+        elif self.static_mlp:
+            mlp = None
+            layer_out = self.down_residual_static(gated8, gs8, weights.down_proj.weight, weights.down_proj.scale, h)
         elif use_mlp_i16:
             mlp = None
             layer_out = self.down_residual_i16(gated8, gs8, weights.down_proj.weight, weights.down_proj.scale, h)
@@ -497,14 +527,15 @@ class Qwen3IntOnlyBlock:
 
 
 class Qwen3IntOnlyModel:
-    def __init__(self, seq_len, model_dir="/code/Qwen3-0.6B", packed_dir="/tmp/Qwen3-0.6B-static-calib-32x2048", config=QWEN3_0_6B, cache_len=0, use_r3=True, fast_hadamard=True, mlp_i16=False, mlp_i16_layers=None, rotate_seed=ROTATE_SEED):
+    def __init__(self, seq_len, model_dir="/code/Qwen3-0.6B", packed_dir="/tmp/Qwen3-0.6B-static-calib-32x2048", config=QWEN3_0_6B, cache_len=0, use_r3=True, fast_hadamard=True, mlp_i16=False, mlp_i16_layers=None, static_mlp=False, rotate_seed=ROTATE_SEED):
         self.seq_len = seq_len
         self.cache_len = cache_len
         self.config = config
         self.mlp_i16 = mlp_i16
+        self.static_mlp = static_mlp
         self.mlp_i16_layers = set() if mlp_i16_layers is None else set(mlp_i16_layers)
         self.r3_q15 = q15_16(random_hadamard_rotation(config.head_dim, rotate_seed + 2)) if use_r3 else None
-        self.block = Qwen3IntOnlyBlock(seq_len, config, cache_len=cache_len, use_r3=use_r3, fast_hadamard=fast_hadamard, mlp_i16=mlp_i16 or bool(self.mlp_i16_layers))
+        self.block = Qwen3IntOnlyBlock(seq_len, config, cache_len=cache_len, use_r3=use_r3, fast_hadamard=fast_hadamard, mlp_i16=mlp_i16 or bool(self.mlp_i16_layers), static_mlp=static_mlp)
         self.final_norm_kernel = compile_kernel(rmsnorm_q15_16_weighted(seq_len, config.hidden_size), [3])
         self.lut_rsqrt = torch.from_numpy(rsqrt_lut()).cuda()
         self.cos, self.sin, _ = rope_tables_q15_16(seq_len + cache_len, config.head_dim, config.rope_theta)

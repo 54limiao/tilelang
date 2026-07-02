@@ -63,6 +63,36 @@ def dynamic_quant_q15_16(rows, cols, out_dtype="int8", qmax_override=None):
     return main
 
 
+def static_quant_q15_16(rows, cols, out_dtype="int8", qmax_override=None):
+    qmax = 127 if out_dtype == "int8" else 32767
+    if qmax_override is not None:
+        qmax = qmax_override
+
+    @T.prim_func
+    def main(
+        X: T.Tensor((rows, cols), "int32"),
+        SCALE: T.Tensor((1,), "uint32"),
+        Y: T.Tensor((rows, cols), out_dtype),
+        S: T.Tensor((rows,), "uint32"),
+    ):
+        with T.Kernel(rows, threads=128) as r:
+            scale = T.alloc_fragment((1,), "int32")
+            vals = T.alloc_fragment((cols,), "int32")
+            scale[0] = T.max(T.cast(SCALE[0], "int32"), T.int32(1))
+            S[r] = T.cast(scale[0], "uint32")
+            for c in T.Parallel(cols):
+                vals[c] = X[r, c]
+                if vals[c] < T.int32(0):
+                    vals[c] = T.int32(0) - vals[c]
+                vals[c] = (vals[c] + (scale[0] >> T.int32(1))) // scale[0]
+                if X[r, c] < T.int32(0):
+                    vals[c] = T.int32(0) - vals[c]
+                vals[c] = T.min(T.max(vals[c], T.int32(0 - qmax - 1)), T.int32(qmax))
+                Y[r, c] = T.cast(vals[c], out_dtype)
+
+    return main
+
+
 def static_quant_q15_16_per_head_attn(tokens, heads, head_dim, out_dtype="int8", qmax_override=None):
     qmax = 127 if out_dtype == "int8" else 32767
     if qmax_override is not None:
@@ -799,6 +829,66 @@ def silu_mul_dynamic_quant_q15_16_i16_fast(rows, cols):
     return main
 
 
+def silu_mul_static_quant_q15_16_fast(rows, cols):
+    @T.prim_func
+    def main(
+        Gate: T.Tensor((rows, cols), "int32"),
+        Up: T.Tensor((rows, cols), "int32"),
+        LUT: T.Tensor((1024,), "int32"),
+        SCALE: T.Tensor((1,), "uint32"),
+        Q: T.Tensor((rows, cols), "int8"),
+        S: T.Tensor((rows,), "uint32"),
+    ):
+        with T.Kernel(rows, threads=128) as r:
+            vals = T.alloc_fragment((1, cols), "int32")
+            abs_x = T.alloc_fragment((1, cols), "int32")
+            scale = T.alloc_fragment((1,), "int32")
+            scale[0] = T.max(T.cast(SCALE[0], "int32"), T.int32(1))
+            S[r] = T.cast(scale[0], "uint32")
+            for c in T.Parallel(cols):
+                vals[0, c] = (((Gate[r, c] >> T.int32(10)) * T.fix.lut_10bit(Gate[r, c], LUT, scale=1.0 / 1024.0, out_dtype="int32")) >> T.int32(8)) * (Up[r, c] >> T.int32(8))
+                abs_x[0, c] = vals[0, c]
+                if abs_x[0, c] < T.int32(0):
+                    abs_x[0, c] = T.int32(0) - abs_x[0, c]
+                abs_x[0, c] = (abs_x[0, c] + (scale[0] >> T.int32(1))) // scale[0]
+                if vals[0, c] < T.int32(0):
+                    abs_x[0, c] = T.int32(0) - abs_x[0, c]
+                abs_x[0, c] = T.min(T.max(abs_x[0, c], T.int32(-128)), T.int32(127))
+                Q[r, c] = T.cast(abs_x[0, c], "int8")
+
+    return main
+
+
+def silu_mul_static_quant_q15_16_i16_fast(rows, cols):
+    @T.prim_func
+    def main(
+        Gate: T.Tensor((rows, cols), "int32"),
+        Up: T.Tensor((rows, cols), "int32"),
+        LUT: T.Tensor((1024,), "int32"),
+        SCALE: T.Tensor((1,), "uint32"),
+        Q: T.Tensor((rows, cols), "int16"),
+        S: T.Tensor((rows,), "uint32"),
+    ):
+        with T.Kernel(rows, threads=128) as r:
+            vals = T.alloc_fragment((1, cols), "int32")
+            abs_x = T.alloc_fragment((1, cols), "int32")
+            scale = T.alloc_fragment((1,), "int32")
+            scale[0] = T.max(T.cast(SCALE[0], "int32"), T.int32(1))
+            S[r] = T.cast(scale[0], "uint32")
+            for c in T.Parallel(cols):
+                vals[0, c] = (((Gate[r, c] >> T.int32(10)) * T.fix.lut_10bit(Gate[r, c], LUT, scale=1.0 / 1024.0, out_dtype="int32")) >> T.int32(8)) * (Up[r, c] >> T.int32(8))
+                abs_x[0, c] = vals[0, c]
+                if abs_x[0, c] < T.int32(0):
+                    abs_x[0, c] = T.int32(0) - abs_x[0, c]
+                abs_x[0, c] = (abs_x[0, c] + (scale[0] >> T.int32(1))) // scale[0]
+                if vals[0, c] < T.int32(0):
+                    abs_x[0, c] = T.int32(0) - abs_x[0, c]
+                abs_x[0, c] = T.min(T.max(abs_x[0, c], T.int32(-32768)), T.int32(32767))
+                Q[r, c] = T.cast(abs_x[0, c], "int16")
+
+    return main
+
+
 def add_q15_16(rows, cols):
     @T.prim_func
     def main(A: T.Tensor((rows, cols), "int32"), B: T.Tensor((rows, cols), "int32"), Y: T.Tensor((rows, cols), "int32")):
@@ -866,6 +956,35 @@ def linear_dynamic_int8_residual_q15_16(rows, in_features, out_features, block_m
     return main
 
 
+def linear_static_int8_residual_q15_16(rows, in_features, out_features, block_m=16, block_n=32, block_k=64):
+    @T.prim_func
+    def main(
+        X: T.Tensor((rows, in_features), "int8"),
+        XS: T.Tensor((1,), "uint32"),
+        W: T.Tensor((out_features, in_features), "int8"),
+        WS: T.Tensor((out_features,), "uint32"),
+        RES: T.Tensor((rows, out_features), "int32"),
+        Y: T.Tensor((rows, out_features), "int32"),
+    ):
+        with T.Kernel(T.ceildiv(out_features, block_n), T.ceildiv(rows, block_m), threads=128) as (bo, br):
+            x_shared = T.alloc_shared((block_m, block_k), "int8")
+            w_shared = T.alloc_shared((block_n, block_k), "int8")
+            acc = T.alloc_fragment((block_m, block_n), "int32")
+
+            T.clear(acc)
+            for ko in T.Pipelined(in_features // block_k, num_stages=2):
+                T.copy(X[br * block_m, ko * block_k], x_shared)
+                T.copy(W[bo * block_n, ko * block_k], w_shared)
+                T.gemm(x_shared, w_shared, acc, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+
+            for m, n in T.Parallel(block_m, block_n):
+                Y[br * block_m + m, bo * block_n + n] = RES[br * block_m + m, bo * block_n + n] + (
+                    (acc[m, n] >> T.int32(8)) * T.cast((XS[0] * WS[bo * block_n + n]) >> T.int32(8), "int32")
+                )
+
+    return main
+
+
 def linear_dynamic_int16_residual_q15_16(rows, in_features, out_features, block_m=16, block_n=32, block_k=64):
     @T.prim_func
     def main(
@@ -899,6 +1018,47 @@ def linear_dynamic_int16_residual_q15_16(rows, in_features, out_features, block_
                 Y[br * block_m + m, bo * block_n + n] = RES[br * block_m + m, bo * block_n + n] + (
                     T.cast(
                         (T.cast(acc_hi[m, n] + (acc_mid[m, n] >> T.int32(7)), "int64") * T.cast(XS[br * block_m + m], "int64") * T.cast(WS[bo * block_n + n], "int64"))
+                        >> T.int32(8),
+                        "int32",
+                    )
+                )
+
+    return main
+
+
+def linear_static_int16_residual_q15_16(rows, in_features, out_features, block_m=16, block_n=32, block_k=64):
+    @T.prim_func
+    def main(
+        X: T.Tensor((rows, in_features), "int16"),
+        XS: T.Tensor((1,), "uint32"),
+        W: T.Tensor((out_features, in_features), "int8"),
+        WS: T.Tensor((out_features,), "uint32"),
+        RES: T.Tensor((rows, out_features), "int32"),
+        Y: T.Tensor((rows, out_features), "int32"),
+    ):
+        with T.Kernel(T.ceildiv(out_features, block_n), T.ceildiv(rows, block_m), threads=128) as (bo, br):
+            x_hi = T.alloc_shared((block_m, block_k), "int8")
+            x_mid = T.alloc_shared((block_m, block_k), "int8")
+            w_shared = T.alloc_shared((block_n, block_k), "int8")
+            acc_hi = T.alloc_fragment((block_m, block_n), "int32")
+            acc_mid = T.alloc_fragment((block_m, block_n), "int32")
+            x_val = T.alloc_fragment((block_m, block_k), "int32")
+
+            T.clear(acc_hi)
+            T.clear(acc_mid)
+            for ko in T.Pipelined(in_features // block_k, num_stages=2):
+                for m, k in T.Parallel(block_m, block_k):
+                    x_val[m, k] = T.cast(X[br * block_m + m, ko * block_k + k], "int32")
+                    x_hi[m, k] = T.cast(x_val[m, k] >> T.int32(8), "int8")
+                    x_mid[m, k] = T.cast((x_val[m, k] - ((x_val[m, k] >> T.int32(8)) << T.int32(8))) >> T.int32(1), "int8")
+                T.copy(W[bo * block_n, ko * block_k], w_shared)
+                T.gemm(x_hi, w_shared, acc_hi, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+                T.gemm(x_mid, w_shared, acc_mid, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+
+            for m, n in T.Parallel(block_m, block_n):
+                Y[br * block_m + m, bo * block_n + n] = RES[br * block_m + m, bo * block_n + n] + (
+                    T.cast(
+                        (T.cast(acc_hi[m, n] + (acc_mid[m, n] >> T.int32(7)), "int64") * T.cast(XS[0], "int64") * T.cast(WS[bo * block_n + n], "int64"))
                         >> T.int32(8),
                         "int32",
                     )
@@ -941,6 +1101,44 @@ def linear_dynamic_int8_pair_q15_16(rows, in_features, out_features, block_m=16,
                 )
                 Y1[br * block_m + m, bo * block_n + n] = (
                     (acc1[m, n] >> T.int32(8)) * T.cast((XS[br * block_m + m] * WS1[bo * block_n + n]) >> T.int32(8), "int32")
+                )
+
+    return main
+
+
+def linear_static_int8_pair_q15_16(rows, in_features, out_features, block_m=16, block_n=32, block_k=64):
+    @T.prim_func
+    def main(
+        X: T.Tensor((rows, in_features), "int8"),
+        XS: T.Tensor((1,), "uint32"),
+        W0: T.Tensor((out_features, in_features), "int8"),
+        WS0: T.Tensor((out_features,), "uint32"),
+        W1: T.Tensor((out_features, in_features), "int8"),
+        WS1: T.Tensor((out_features,), "uint32"),
+        Y0: T.Tensor((rows, out_features), "int32"),
+        Y1: T.Tensor((rows, out_features), "int32"),
+    ):
+        with T.Kernel(T.ceildiv(out_features, block_n), T.ceildiv(rows, block_m), threads=128) as (bo, br):
+            x_shared = T.alloc_shared((block_m, block_k), "int8")
+            w0_shared = T.alloc_shared((block_n, block_k), "int8")
+            w1_shared = T.alloc_shared((block_n, block_k), "int8")
+            acc0 = T.alloc_fragment((block_m, block_n), "int32")
+            acc1 = T.alloc_fragment((block_m, block_n), "int32")
+            T.clear(acc0)
+            T.clear(acc1)
+            for ko in T.Pipelined(in_features // block_k, num_stages=2):
+                T.copy(X[br * block_m, ko * block_k], x_shared)
+                T.copy(W0[bo * block_n, ko * block_k], w0_shared)
+                T.copy(W1[bo * block_n, ko * block_k], w1_shared)
+                T.gemm(x_shared, w0_shared, acc0, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+                T.gemm(x_shared, w1_shared, acc1, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+
+            for m, n in T.Parallel(block_m, block_n):
+                Y0[br * block_m + m, bo * block_n + n] = (
+                    (acc0[m, n] >> T.int32(8)) * T.cast((XS[0] * WS0[bo * block_n + n]) >> T.int32(8), "int32")
+                )
+                Y1[br * block_m + m, bo * block_n + n] = (
+                    (acc1[m, n] >> T.int32(8)) * T.cast((XS[0] * WS1[bo * block_n + n]) >> T.int32(8), "int32")
                 )
 
     return main

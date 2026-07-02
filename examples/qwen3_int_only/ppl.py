@@ -221,6 +221,7 @@ def prepare_eval(args):
             fast_hadamard=True,
             mlp_i16=args.mlp_i16,
             mlp_i16_layers=parse_layer_set(args.mlp_i16_layers),
+            static_mlp=args.static_mlp,
         )
     else:
         int_model = None
@@ -279,6 +280,7 @@ def main():
     parser.add_argument("--use-r2", action="store_true")
     parser.add_argument("--mlp-i16", action="store_true")
     parser.add_argument("--mlp-i16-layers", default="")
+    parser.add_argument("--static-mlp", action="store_true")
     parser.add_argument("--jsonl-out", default="")
     parser.add_argument("--jsonl-windows", action="store_true")
     args = parser.parse_args()
@@ -307,6 +309,7 @@ def main():
                 "fast_hadamard": True,
                 "mlp_i16": args.mlp_i16,
                 "mlp_i16_layers": args.mlp_i16_layers,
+                "static_mlp": args.static_mlp,
             }
             row = {
                 "kind": "summary",

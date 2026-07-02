@@ -27,6 +27,11 @@ def update_head_amax(acc, x):
     return cur if acc is None else torch.maximum(acc, cur)
 
 
+def update_tensor_amax(acc, x):
+    cur = x.abs().amax().reshape(1).to(torch.int64)
+    return cur if acc is None else torch.maximum(acc, cur)
+
+
 def scale_from_amax(amax, qmax):
     return torch.div(amax + qmax - 1, qmax, rounding_mode="floor").clamp(min=1).to(torch.uint32)
 
@@ -77,7 +82,12 @@ def run_calib_segment(x, w, norms, cos, sin, config, r3, prefix_tokens):
     attn = attn.permute(0, 2, 1, 3).reshape(batch, seq_len, config.q_size)
     x = x + attn @ w["o_proj"].T
     m = rmsnorm_torch(x, post_norm)
-    return x + (torch.nn.functional.silu(m @ w["gate_proj"].T) * (m @ w["up_proj"].T)) @ w["down_proj"].T, stats
+    gate = m @ w["gate_proj"].T
+    up = m @ w["up_proj"].T
+    gated = torch.nn.functional.silu(gate) * up
+    stats["post_mlp_i8"] = q15_16(m[:, prefix_tokens:])
+    stats["gated_mlp_i16"] = q15_16(gated[:, prefix_tokens:])
+    return x + gated @ w["down_proj"].T, stats
 
 
 @torch.no_grad()
@@ -88,7 +98,9 @@ def calibrate_attention_scales(embed, layer_weights, norm_weights, ids, config, 
     scales = [None for _ in layer_weights]
     for layer_idx, (w, norms) in enumerate(zip(layer_weights, norm_weights)):
         x, stats = run_calib_segment(x, w, norms, cos, sin, config, r3, prefix_tokens)
-        scales[layer_idx] = {name: update_head_amax(None, value) for name, value in stats.items()}
+        scales[layer_idx] = {name: update_head_amax(None, value) for name, value in stats.items() if name not in ("post_mlp_i8", "gated_mlp_i16")}
+        scales[layer_idx]["post_mlp_i8"] = update_tensor_amax(None, stats["post_mlp_i8"])
+        scales[layer_idx]["gated_mlp_i16"] = update_tensor_amax(None, stats["gated_mlp_i16"])
     return [
         {
             "q_pre_rope_i16": scale_from_amax(layer["q_pre_rope_i16"], 32767),
@@ -96,6 +108,8 @@ def calibrate_attention_scales(embed, layer_weights, norm_weights, ids, config, 
             "q_post_rope_i8": scale_from_amax(layer["q_post_rope_i8"], 127),
             "k_post_rope_i8": scale_from_amax(layer["k_post_rope_i8"], 127),
             "v_i8": scale_from_amax(layer["v_i8"], 127),
+            "post_mlp_i8": scale_from_amax(layer["post_mlp_i8"], 127),
+            "gated_mlp_i16": scale_from_amax(layer["gated_mlp_i16"], 32767),
         }
         for layer in scales
     ]
