@@ -827,6 +827,34 @@ def linear_dynamic_int8_q15_16(rows, in_features, out_features, block_m=16, bloc
     return main
 
 
+def linear_static_int8_q15_16(rows, in_features, out_features, block_m=16, block_n=32, block_k=64):
+    @T.prim_func
+    def main(
+        X: T.Tensor((rows, in_features), "int8"),
+        XS: T.Tensor((1,), "uint32"),
+        W: T.Tensor((out_features, in_features), "int8"),
+        WS: T.Tensor((out_features,), "uint32"),
+        Y: T.Tensor((rows, out_features), "int32"),
+    ):
+        with T.Kernel(T.ceildiv(out_features, block_n), T.ceildiv(rows, block_m), threads=128) as (bo, br):
+            x_shared = T.alloc_shared((block_m, block_k), "int8")
+            w_shared = T.alloc_shared((block_n, block_k), "int8")
+            acc = T.alloc_fragment((block_m, block_n), "int32")
+
+            T.clear(acc)
+            for ko in T.Pipelined(in_features // block_k, num_stages=2):
+                T.copy(X[br * block_m, ko * block_k], x_shared)
+                T.copy(W[bo * block_n, ko * block_k], w_shared)
+                T.gemm(x_shared, w_shared, acc, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+
+            for m, n in T.Parallel(block_m, block_n):
+                Y[br * block_m + m, bo * block_n + n] = (
+                    (acc[m, n] >> T.int32(8)) * T.cast((XS[0] * WS[bo * block_n + n]) >> T.int32(8), "int32")
+                )
+
+    return main
+
+
 def linear_static_int16_residual_q15_16(rows, in_features, out_features, block_m=16, block_n=32, block_k=64):
     @T.prim_func
     def main(
@@ -971,7 +999,8 @@ def attention_i8v8_q15_16_gqa_fused_static(q_heads, kv_heads, seqlen, dim, block
         KS: T.Tensor((kv_heads,), "uint32"),
         VS: T.Tensor((kv_heads,), "uint32"),
         LUT: T.Tensor((1024,), "int16"),
-        O: T.Tensor((seqlen, q_size), "int32"),
+        OS: T.Tensor((1,), "uint32"),
+        O: T.Tensor((seqlen, q_size), "int8"),
     ):
         with T.Kernel(q_heads, T.ceildiv(seqlen, block_m), threads=128) as (h, bm):
             kh = h // group
@@ -993,7 +1022,9 @@ def attention_i8v8_q15_16_gqa_fused_static(q_heads, kv_heads, seqlen, dim, block
             q_scale = T.alloc_fragment((1,), "int32")
             k_scale = T.alloc_fragment((1,), "int32")
             v_scale = T.alloc_fragment((1,), "int32")
+            o_scale = T.alloc_fragment((1,), "int32")
             score_scale = T.alloc_fragment((1,), "int32")
+            out = T.alloc_fragment((block_m, dim), "int32")
             prob = T.alloc_fragment((block_m, block_n), "int32")
             scaled = T.alloc_fragment((block_m, block_n), "int32")
             pv = T.alloc_fragment((block_m, dim), "int32")
@@ -1001,6 +1032,7 @@ def attention_i8v8_q15_16_gqa_fused_static(q_heads, kv_heads, seqlen, dim, block
             q_scale[0] = T.cast(QS[h], "int32") >> T.int32(4)
             k_scale[0] = T.cast(KS[kh], "int32") >> T.int32(4)
             v_scale[0] = T.cast(VS[kh], "int32")
+            o_scale[0] = T.max(T.cast(OS[0], "int32"), T.int32(1))
             score_scale[0] = ((q_scale[0] * k_scale[0]) >> T.int32(8)) * T.int32(5793)
             for m in T.Parallel(block_m):
                 score_max[m] = T.int32(I32_MIN)
@@ -1053,7 +1085,14 @@ def attention_i8v8_q15_16_gqa_fused_static(q_heads, kv_heads, seqlen, dim, block
                 for m, d in T.Parallel(block_m, dim):
                     acc[m, d] += pv[m, d]
             for m, d in T.Parallel(block_m, dim):
-                O[row_base + m, h * dim + d] = acc[m, d]
+                out[m, d] = acc[m, d]
+                if out[m, d] < T.int32(0):
+                    out[m, d] = T.int32(0) - out[m, d]
+                out[m, d] = (out[m, d] + (o_scale[0] >> T.int32(1))) // o_scale[0]
+                if acc[m, d] < T.int32(0):
+                    out[m, d] = T.int32(0) - out[m, d]
+                out[m, d] = T.min(T.max(out[m, d], T.int32(-128)), T.int32(127))
+                O[row_base + m, h * dim + d] = T.cast(out[m, d], "int8")
 
     return main
 
@@ -1076,7 +1115,8 @@ def attention_i8v8_q15_16_gqa_cache_fused_static_current(q_heads, kv_heads, seql
         KS: T.Tensor((kv_heads,), "uint32"),
         VS: T.Tensor((kv_heads,), "uint32"),
         LUT: T.Tensor((1024,), "int16"),
-        O: T.Tensor((seqlen, q_size), "int32"),
+        OS: T.Tensor((1,), "uint32"),
+        O: T.Tensor((seqlen, q_size), "int8"),
     ):
         with T.Kernel(q_heads, T.ceildiv(seqlen, block_m), threads=128) as (h, bm):
             kh = h // group
@@ -1098,11 +1138,14 @@ def attention_i8v8_q15_16_gqa_cache_fused_static_current(q_heads, kv_heads, seql
             q_scale = T.alloc_fragment((1,), "int32")
             k_scale = T.alloc_fragment((block_n,), "int32")
             v_scale = T.alloc_fragment((block_n,), "int32")
+            o_scale = T.alloc_fragment((1,), "int32")
+            out = T.alloc_fragment((block_m, dim), "int32")
             prob = T.alloc_fragment((block_m, block_n), "int32")
             scaled = T.alloc_fragment((block_m, block_n), "int32")
             pv = T.alloc_fragment((block_m, dim), "int32")
             acc = T.alloc_fragment((block_m, dim), "int32")
             q_scale[0] = T.cast(QS[h], "int32") >> T.int32(4)
+            o_scale[0] = T.max(T.cast(OS[0], "int32"), T.int32(1))
             for m in T.Parallel(block_m):
                 score_max[m] = T.int32(I32_MIN)
                 denom[m] = T.int32(0)
@@ -1166,7 +1209,14 @@ def attention_i8v8_q15_16_gqa_cache_fused_static_current(q_heads, kv_heads, seql
                 for m, d in T.Parallel(block_m, dim):
                     acc[m, d] += pv[m, d]
             for m, d in T.Parallel(block_m, dim):
-                O[row_base + m, h * dim + d] = acc[m, d]
+                out[m, d] = acc[m, d]
+                if out[m, d] < T.int32(0):
+                    out[m, d] = T.int32(0) - out[m, d]
+                out[m, d] = (out[m, d] + (o_scale[0] >> T.int32(1))) // o_scale[0]
+                if acc[m, d] < T.int32(0):
+                    out[m, d] = T.int32(0) - out[m, d]
+                out[m, d] = T.min(T.max(out[m, d], T.int32(-128)), T.int32(127))
+                O[row_base + m, h * dim + d] = T.cast(out[m, d], "int8")
 
     return main
 

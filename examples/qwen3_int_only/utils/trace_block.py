@@ -64,6 +64,10 @@ def dequant_rows(q, scale):
     return q.float() * scale.float()[:, None] / Q15_16
 
 
+def dequant_static(q, scale):
+    return q.float() * scale.float()[0] / Q15_16
+
+
 def linear_ref(x, weights, name):
     packed = getattr(weights, name)
     w = packed.weight.float() * (packed.scale.float() / Q15_16)[:, None]
@@ -130,15 +134,16 @@ def print_trace(layer_idx, seq_len, x_int, xf, itrace, ftrace, layer):
         base = name[:1]
         add_row(rows, layer_idx, seq_len, name, "metric", print_metric(name, value, ftrace[base]))
         add_row(rows, layer_idx, seq_len, name + "_loss", "metric", print_metric(name + "_loss", value, itrace[base]))
+    attn_qdq = dequant_static(itrace["attn8"], itrace["attn_s8"])
+    add_row(rows, layer_idx, seq_len, "attn_qdq", "metric", print_metric("attn_qdq", attn_qdq, ftrace["attn"]))
+    add_row(rows, layer_idx, seq_len, "attn_qdq_loss", "metric", print_metric("attn_qdq_loss", attn_qdq, itrace["attn"]))
     for name, q_name, s_name, base in (
-        ("attn_qdq", "attn8", "attn_s8", "attn"),
         ("post_qdq", "post8", "post_s8", "post_rms"),
         ("gated_qdq", "gated8", "gated_s8", "gated"),
     ):
         value = dequant_rows(itrace[q_name], itrace[s_name])
         add_row(rows, layer_idx, seq_len, name, "metric", print_metric(name, value, ftrace[base]))
         add_row(rows, layer_idx, seq_len, name + "_loss", "metric", print_metric(name + "_loss", value, itrace[base]))
-    attn_qdq = dequant_rows(itrace["attn8"], itrace["attn_s8"])
     post_qdq = dequant_rows(itrace["post8"], itrace["post_s8"])
     gated_qdq = dequant_rows(itrace["gated8"], itrace["gated_s8"])
     o_qdq_ref = linear_ref(attn_qdq, layer, "o_proj")

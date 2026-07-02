@@ -87,6 +87,7 @@ class Qwen3BlockWeights:
     q_post_rope_i8_scale: torch.Tensor | None = None
     k_post_rope_i8_scale: torch.Tensor | None = None
     v_i8_scale: torch.Tensor | None = None
+    attn_i8_scale: torch.Tensor | None = None
     post_mlp_i8_scale: torch.Tensor | None = None
     gated_mlp_i16_scale: torch.Tensor | None = None
     q_proj_fp: torch.Tensor | None = None
@@ -141,6 +142,7 @@ class Qwen3BlockWeights:
             None,
             None,
             None,
+            None,
             q_proj,
             k_proj,
             v_proj,
@@ -178,6 +180,7 @@ def load_packed_qwen3(packed_dir, config=QWEN3_0_6B, device="cuda"):
                 optional(f"{p}.q_post_rope_i8.scale"),
                 optional(f"{p}.k_post_rope_i8.scale"),
                 optional(f"{p}.v_i8.scale"),
+                optional(f"{p}.attn_i8.scale"),
                 optional(f"{p}.post_mlp_i8.scale"),
                 optional(f"{p}.gated_mlp_i16.scale"),
             )

@@ -18,30 +18,29 @@ prefix:  你是一个有用而无害的聊天助手。
 Current 2048-token FineWeb result against HF bf16:
 
 ```text
-backend=int-only tokens=2048 loss=3.821411 ppl=45.668586 compare=hf cos=0.99346597 mse=1.50167644e-01 mae=2.89471441e-01 max_abs=1.05577879e+01 rel_mse=1.31633772e-02
+backend=int-only tokens=2048 loss=3.820530 ppl=45.628371 compare=hf cos=0.99206903 mse=1.83985954e-01 mae=3.27370056e-01 max_abs=8.14555550e+00 rel_mse=1.61278185e-02
 ```
 
 Kernel profile for the int-only LLM block path. This is 2048 sequence length, 28 layers, prefix KV cache enabled, 1 warmup + 3 measured repeats:
 
 ```text
-total block kernels: 166.520 ms / 3 repeats = 55.507 ms per 28-layer pass
+total block kernels: 171.915 ms / 3 repeats = 57.305 ms per 28-layer pass
 
 kernel                           avg ms   total ms    pct     TOPS
-attention_cache_i8v8_fused_static 0.951    79.899   47.98    72.60
-down_residual_static              0.185    15.523    9.32   139.45
-qkv_proj_i8                       0.140    11.758    7.06   122.74
-gate_up_proj_static               0.134    11.264    6.76   192.18
-rope_sq8_q_attn_hadamard          0.089     7.474    4.49    12.07
-rms_q_q15                         0.068     5.738    3.45
-silu_mul_sq16_mid_fast            0.067     5.601    3.36
-o_proj_i8                         0.059     4.947    2.97   145.84
-rope_sq8_k_attn_hadamard          0.056     4.705    2.83     9.59
-rms_k_q15                         0.045     3.778    2.27
-rms_input_dq8_fast                0.040     3.394    2.04
-residual_attn_rms_q15             0.040     3.332    2.00
-sq8_v_attn_noscale                0.039     3.254    1.95
-sq8_hidden_static                 0.035     2.979    1.79
-dq8_attn                          0.034     2.873    1.73
+attention_cache_i8v8_fused_static 1.021    85.775   49.89    67.63
+down_residual_static              0.196    16.465    9.58   131.47
+qkv_proj_i8                       0.146    12.265    7.13   117.66
+gate_up_proj_static               0.139    11.702    6.81   184.99
+rope_sq8_q_attn_hadamard          0.092     7.770    4.52    11.61
+rms_q_q15                         0.070     5.852    3.40
+o_proj_i8_static                  0.066     5.571    3.24   129.51
+silu_mul_sq16_mid_fast            0.065     5.420    3.15
+rope_sq8_k_attn_hadamard          0.057     4.751    2.76     9.49
+rms_k_q15                         0.045     3.795    2.21
+rms_input_dq8_fast                0.041     3.434    2.00
+sq8_v_attn_noscale                0.039     3.246    1.89
+residual_attn_rms_q15             0.038     3.196    1.86
+sq8_hidden_static                 0.032     2.674    1.56
 ```
 
 The first run writes `qwen3_int_only.safetensors` and `timestamp`; later runs skip packing when the pack matches the current static schema. Use `FORCE_PACK=1 examples/qwen3_int_only/test_static_path.sh` to rebuild.
@@ -51,7 +50,7 @@ Main quantization path:
 - weights: per-channel static int8 for all linear weights
 - activations: calibrated static scales from FineWeb, 32 batches x 2048 tokens, ignoring the first 512 prefix tokens
 - residual stream: Q15.16 int32
-- attention: q/k/v int8, r2/r3 QuaRot head rotations, prefix KV cache, fused static int8 attention path
+- attention: q/k/v int8, r2/r3 QuaRot head rotations, prefix KV cache, fused static int8 attention path with static pertensor int8 output into O projection
 - MLP: static int8 input, static int16 gated activation, int-only TileLang kernels
 - comparison: int-only logits are compared with HF bf16 logits using PPL, cosine, MSE, MAE, max_abs, and rel_mse
 

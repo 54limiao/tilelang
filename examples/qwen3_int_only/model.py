@@ -14,7 +14,7 @@ from examples.qwen3_int_only.kernels import (
     dynamic_quant_q15_16,
     exp_lut_neg,
     linear_dynamic_int8_qkv_q15_16,
-    linear_dynamic_int8_q15_16,
+    linear_static_int8_q15_16,
     linear_static_int8_pair_q15_16,
     linear_static_int16_residual_q15_16,
     rmsnorm_dynamic_quant_q15_16_weighted_fast,
@@ -75,7 +75,7 @@ class Qwen3IntOnlyBlock:
         self.rope_sq8_k_attn_hadamard = compile_kernel(rope_rotate_static_quant_q15_16_attn_hadamard_approx(seq_len, kvh, hd), [5]) if use_r3 and fast_hadamard else None
         self.dq8_q = compile_kernel(dynamic_quant_q15_16(seq_len, q_dim, "int8"), [1, 2])
         self.qkv_proj_i8 = compile_kernel(linear_dynamic_int8_qkv_q15_16(seq_len, h, q_dim, kv_dim, 64, 128, 64), [8, 9, 10])
-        self.o_proj = compile_kernel(linear_dynamic_int8_q15_16(seq_len, q_dim, h, 64, 64, 64), [4])
+        self.o_proj = compile_kernel(linear_static_int8_q15_16(seq_len, q_dim, h, 64, 64, 64), [4])
         self.sq8_hidden = compile_kernel(static_quant_q15_16(seq_len, h, "int8"), [2, 3])
         self.gate_up_proj_static = compile_kernel(linear_static_int8_pair_q15_16(seq_len, h, im, 64, 128, 64), [6, 7])
         self.silu_mul_sq16_mid_fast = compile_kernel(silu_mul_static_quant_q15_16_i16_fast(seq_len, im), [4, 5])
@@ -83,10 +83,10 @@ class Qwen3IntOnlyBlock:
         self.rope_q = compile_kernel(rope_rotate_q15_16_heads(seq_len, qh, hd), [4]) if use_r3 else compile_kernel(rope_q15_16_heads(seq_len, qh, hd), [3])
         self.rope_k = compile_kernel(rope_rotate_q15_16_heads(seq_len, kvh, hd), [4]) if use_r3 else compile_kernel(rope_q15_16_heads(seq_len, kvh, hd), [3])
         self.add_hidden = compile_kernel(add_q15_16(seq_len, h), [2])
-        self.attn_i8v8_fused_static = compile_kernel(attention_i8v8_q15_16_gqa_fused_static(qh, kvh, seq_len, hd), [7])
+        self.attn_i8v8_fused_static = compile_kernel(attention_i8v8_q15_16_gqa_fused_static(qh, kvh, seq_len, hd), [8])
         self.attn_i8v8_fused_cache_static = None
         if cache_len:
-            self.attn_i8v8_fused_cache_static = compile_kernel(attention_i8v8_q15_16_gqa_cache_fused_static_current(qh, kvh, seq_len, cache_len, hd), [11])
+            self.attn_i8v8_fused_cache_static = compile_kernel(attention_i8v8_q15_16_gqa_cache_fused_static_current(qh, kvh, seq_len, cache_len, hd), [12])
         self.lut_rsqrt = torch.from_numpy(rsqrt_lut()).cuda()
         self.lut_sigmoid = torch.from_numpy(sigmoid_lut()).cuda()
         self.lut_exp = torch.from_numpy(exp_lut_neg()).cuda()
@@ -131,10 +131,10 @@ class Qwen3IntOnlyBlock:
             v_attn = self.sq8_kv_attn_noscale(v_heads.reshape(self.seq_len, self.config.num_key_value_heads, self.config.head_dim), weights.v_i8_scale)
         if cache_k is None:
             prob_i16 = None
-            attn = self.attn_i8v8_fused_static(q_attn, k_attn, v_attn, weights.q_post_rope_i8_scale, weights.k_post_rope_i8_scale, weights.v_i8_scale, self.lut_exp)
+            attn8 = self.attn_i8v8_fused_static(q_attn, k_attn, v_attn, weights.q_post_rope_i8_scale, weights.k_post_rope_i8_scale, weights.v_i8_scale, self.lut_exp, weights.attn_i8_scale)
         else:
             prob_i16 = None
-            attn = self.attn_i8v8_fused_cache_static(
+            attn8 = self.attn_i8v8_fused_cache_static(
                 q_attn,
                 cache_k[0],
                 cache_v[0],
@@ -146,8 +146,10 @@ class Qwen3IntOnlyBlock:
                 weights.k_post_rope_i8_scale,
                 weights.v_i8_scale,
                 self.lut_exp,
+                weights.attn_i8_scale,
             )
-        attn8, attn_s8 = self.dq8_q(attn)
+        attn_s8 = weights.attn_i8_scale
+        attn = attn8.float() * attn_s8.float()[0] if collect else None
         attn_out = self.o_proj(attn8, attn_s8, weights.o_proj.weight, weights.o_proj.scale)
         h, post = self.add_rms_hidden_q15(x_q15_16, attn_out, weights.post_attention_layernorm, self.lut_rsqrt)
         h8, _hs8 = self.sq8_hidden(post, weights.post_mlp_i8_scale)
@@ -179,7 +181,7 @@ class Qwen3IntOnlyBlock:
             "q": q_trace.float() / Q15_16,
             "k": k_trace.float() / Q15_16,
             "v": v_trace.float() / Q15_16,
-            "attn": attn.float() / Q15_16,
+            "attn": attn / Q15_16,
             "prob_i16": prob_i16,
             "q8": q_attn,
             "k8": k_attn,

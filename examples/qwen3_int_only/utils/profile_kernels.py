@@ -24,7 +24,7 @@ def op_counts(seq_len, cfg, cache_len=0):
     pv_ops = 2 * qk_ops
     return {
         "qkv_proj_i8": 2 * seq_len * cfg.hidden_size * (cfg.q_size + 2 * cfg.kv_size),
-        "o_proj_i8": 2 * seq_len * cfg.q_size * cfg.hidden_size,
+        "o_proj_i8_static": 2 * seq_len * cfg.q_size * cfg.hidden_size,
         "gate_up_proj_static": 2 * seq_len * cfg.hidden_size * (2 * cfg.intermediate_size),
         "down_residual_static": 2 * 2 * seq_len * cfg.intermediate_size * cfg.hidden_size,
         "attention_i8v8_fused_static": qk_ops * 2 + pv_ops,
@@ -109,11 +109,10 @@ def run_block(block, x, weights, cos, sin, r3_q15, prof, cache_k=None, cache_v=N
     k_attn = prof.time("rope_sq8_k_attn_hadamard", lambda: block.rope_sq8_k_attn_hadamard(k_heads, pos_cos, pos_sin, r3_q15, weights.k_post_rope_i8_scale))
     v_attn = prof.time("sq8_v_attn_noscale", lambda: block.sq8_kv_attn_noscale(v_heads.reshape(block.seq_len, cfg.num_key_value_heads, cfg.head_dim), weights.v_i8_scale))
     if cache_k is None:
-        attn = prof.time("attention_i8v8_fused_static", lambda: block.attn_i8v8_fused_static(q_attn, k_attn, v_attn, weights.q_post_rope_i8_scale, weights.k_post_rope_i8_scale, weights.v_i8_scale, block.lut_exp))
+        attn8 = prof.time("attention_i8v8_fused_static", lambda: block.attn_i8v8_fused_static(q_attn, k_attn, v_attn, weights.q_post_rope_i8_scale, weights.k_post_rope_i8_scale, weights.v_i8_scale, block.lut_exp, weights.attn_i8_scale))
     else:
-        attn = prof.time("attention_cache_i8v8_fused_static", lambda: block.attn_i8v8_fused_cache_static(q_attn, cache_k[0], cache_v[0], k_attn, v_attn, weights.q_post_rope_i8_scale, cache_k[1], cache_v[1], weights.k_post_rope_i8_scale, weights.v_i8_scale, block.lut_exp))
-    attn8, attn_s8 = prof.time("dq8_attn", lambda: block.dq8_q(attn))
-    attn_out = prof.time("o_proj_i8", lambda: block.o_proj(attn8, attn_s8, weights.o_proj.weight, weights.o_proj.scale))
+        attn8 = prof.time("attention_cache_i8v8_fused_static", lambda: block.attn_i8v8_fused_cache_static(q_attn, cache_k[0], cache_v[0], k_attn, v_attn, weights.q_post_rope_i8_scale, cache_k[1], cache_v[1], weights.k_post_rope_i8_scale, weights.v_i8_scale, block.lut_exp, weights.attn_i8_scale))
+    attn_out = prof.time("o_proj_i8_static", lambda: block.o_proj(attn8, weights.attn_i8_scale, weights.o_proj.weight, weights.o_proj.scale))
     h, post = prof.time("residual_attn_rms_q15", lambda: block.add_rms_hidden_q15(x, attn_out, weights.post_attention_layernorm, block.lut_rsqrt))
     h8, _hs8 = prof.time("sq8_hidden_static", lambda: block.sq8_hidden(post, weights.post_mlp_i8_scale))
     hs8 = weights.post_mlp_i8_scale
