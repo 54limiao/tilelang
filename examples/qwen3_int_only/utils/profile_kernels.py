@@ -1,5 +1,7 @@
 import argparse
+import hashlib
 import json
+import os
 
 import torch
 from safetensors import safe_open
@@ -128,6 +130,35 @@ def build_cache_kv(model_dir, tokenizer, cache_prompt, layer_weights, r2_mats, c
     return cache_kv, int(cache_ids.numel())
 
 
+def cache_file_name(packed_dir, model_dir, cache_prompt, tokenizer, layers, use_r2):
+    ids = tokenizer(cache_prompt, add_special_tokens=False).input_ids
+    key = json.dumps(
+        {
+            "model": os.path.abspath(model_dir),
+            "prompt_ids": ids,
+            "layers": layers,
+            "use_r2": bool(use_r2),
+        },
+        sort_keys=True,
+    ).encode("utf-8")
+    digest = hashlib.sha1(key).hexdigest()[:16]
+    return os.path.join(packed_dir, f"profile_cache_kv_{digest}.pt")
+
+
+def load_cached_kv(path, device="cuda"):
+    data = torch.load(path, map_location="cpu", weights_only=True)
+    cache_kv = [(k.to(device, non_blocking=True), v.to(device, non_blocking=True)) for k, v in data["cache_kv"]]
+    return cache_kv, int(data["cache_len"])
+
+
+def save_cached_kv(path, cache_kv, cache_len):
+    data = {
+        "cache_len": int(cache_len),
+        "cache_kv": [(k.cpu(), v.cpu()) for k, v in cache_kv],
+    }
+    torch.save(data, path)
+
+
 @torch.no_grad()
 def run_block(block, x, x8, xs8, weights, cos, sin, prof, cache_k=None, cache_v=None):
     cfg = block.config
@@ -199,6 +230,7 @@ def main():
     parser.add_argument("--repeat", type=int, default=3)
     parser.add_argument("--peak-tops", type=float, default=0.0)
     parser.add_argument("--cache-prompt", default="你是一个有用而无害的聊天助手。")
+    parser.add_argument("--no-cache-kv-file", action="store_true")
     parser.add_argument("--jsonl-out", default="")
     args = parser.parse_args()
 
@@ -218,7 +250,15 @@ def main():
     _packed_r1, packed_r2 = packed_flags(args.packed_dir)
     embed, _, _, weights = load_packed_qwen3(args.packed_dir, config)
     r2_mats = load_r2_matrices(args.packed_dir, args.layers)
-    cache_kv, cache_len = build_cache_kv(args.model_dir, tokenizer, args.cache_prompt, weights[: args.layers], r2_mats, config, packed_r2)
+    cache_path = cache_file_name(args.packed_dir, args.model_dir, args.cache_prompt, tokenizer, args.layers, packed_r2)
+    if (not args.no_cache_kv_file) and os.path.exists(cache_path):
+        print(f"reuse profile cache kv: {cache_path}")
+        cache_kv, cache_len = load_cached_kv(cache_path)
+    else:
+        cache_kv, cache_len = build_cache_kv(args.model_dir, tokenizer, args.cache_prompt, weights[: args.layers], r2_mats, config, packed_r2)
+        if not args.no_cache_kv_file:
+            save_cached_kv(cache_path, cache_kv, cache_len)
+            print(f"wrote profile cache kv: {cache_path}")
     block = Qwen3HybridBlock(seq_len, config, cache_len=cache_len) if args.backend == "hybrid" else Qwen3IntOnlyBlock(seq_len, config, cache_len=cache_len)
     cos, sin, _ = rope_tables(seq_len + cache_len, config.head_dim, config.rope_theta) if args.backend == "hybrid" else rope_tables_q15_16(seq_len + cache_len, config.head_dim, config.rope_theta)
     if args.backend == "hybrid":

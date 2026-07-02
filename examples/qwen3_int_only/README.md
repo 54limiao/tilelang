@@ -163,4 +163,4 @@ On 0.6B, attention is a large share because the MLP/linear matrices are small. O
 
 Utilization uses the A100 int8 tensorcore peak, 624 TOPS. `math TOPS` is the model matmul work, counted as `2MNK / time`. `tc TOPS` is the int8 tensorcore-equivalent work issued by the current kernels. Attention computes QK once with online softmax, then computes PV as `P int16 x V int8`; the current tensorcore lowering counts this PV as two int8-equivalent GEMMs.
 
-The first run writes `qwen3_int_only.safetensors` and `timestamp`; later script runs reuse the pack when `timestamp` exists and print that timestamp. Use `FORCE_PACK=1 examples/qwen3_int_only/test_static_path.sh` to rebuild.
+The first run writes `qwen3_int_only.safetensors` and `timestamp`; later script runs reuse the pack when `timestamp` exists and print that timestamp. Kernel profiling also caches the quantized prefix KV tensors under the packed directory, so repeated 14B profile runs do not need to reload the HF model just to rebuild the same prefix cache. Use `FORCE_PACK=1 examples/qwen3_int_only/test_static_path.sh` to rebuild.
