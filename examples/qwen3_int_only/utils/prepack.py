@@ -5,6 +5,7 @@ from pathlib import Path
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from transformers import AutoTokenizer
 
 from examples.qwen3_int_only.utils.ppl import iter_texts
@@ -29,6 +30,23 @@ from examples.qwen3_int_only.utils import (
 
 
 DEFAULT_MODEL_DIR = "/publicdata/huggingface.co/Qwen/Qwen3-0.6B"
+FLEX_BLOCK = 128
+FLEX_ATTENTION = torch.compile(flex_attention, dynamic=False)
+FLEX_MASKS = {}
+
+
+def causal_mask(b, h, q_idx, kv_idx):
+    return q_idx >= kv_idx
+
+
+def fused_causal_attention(q, k, v):
+    seq_len = q.shape[-2]
+    if seq_len < FLEX_BLOCK or seq_len % FLEX_BLOCK:
+        return torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+    key = (q.device, q.shape[0], q.shape[1], seq_len)
+    if key not in FLEX_MASKS:
+        FLEX_MASKS[key] = create_block_mask(causal_mask, q.shape[0], q.shape[1], seq_len, seq_len, device=q.device, BLOCK_SIZE=FLEX_BLOCK)
+    return FLEX_ATTENTION(q, k, v, block_mask=FLEX_MASKS[key], enable_gqa=True)
 
 
 def update_head_amax(acc, x):
@@ -41,8 +59,33 @@ def update_tensor_amax(acc, x):
     return cur if acc is None else torch.maximum(acc, cur)
 
 
+def update_stats_amax(acc, stats):
+    out = {} if acc is None else acc
+    for name, value in stats.items():
+        if name in ("input_qkv_i8", "attn_i8", "post_mlp_i8", "gated_mlp_i16", "gated_mlp_i8"):
+            out[name] = update_tensor_amax(out.get(name), value)
+        else:
+            out[name] = update_head_amax(out.get(name), value)
+    return out
+
+
 def scale_from_amax(amax, qmax):
     return torch.div(amax + qmax - 1, qmax, rounding_mode="floor").clamp(min=1).to(torch.uint32)
+
+
+def scales_from_amax(layer):
+    return {
+        "q_pre_rope_i16": scale_from_amax(layer["q_pre_rope_i16"], 32767),
+        "k_pre_rope_i16": scale_from_amax(layer["k_pre_rope_i16"], 32767),
+        "input_qkv_i8": scale_from_amax(layer["input_qkv_i8"], 127),
+        "q_post_rope_i8": scale_from_amax(layer["q_post_rope_i8"], 127),
+        "k_post_rope_i8": scale_from_amax(layer["k_post_rope_i8"], 127),
+        "v_i8": scale_from_amax(layer["v_i8"], 127),
+        "attn_i8": scale_from_amax(layer["attn_i8"], 127),
+        "post_mlp_i8": scale_from_amax(layer["post_mlp_i8"], 127),
+        "gated_mlp_i16": scale_from_amax(layer["gated_mlp_i16"], 32767),
+        "gated_mlp_i8": scale_from_amax(layer["gated_mlp_i8"], 127),
+    }
 
 
 def load_calib_ids(model_dir, calib_text, calib_dataset, calib_parquet, calib_column, tokens, device, cache_prompt=""):
@@ -156,13 +199,10 @@ def run_calib_segment(x, w, norms, cos, sin, config, r3, prefix_tokens):
         "k_post_rope_i8": q15_16(k_rope).reshape(-1, config.num_key_value_heads, config.head_dim),
         "v_i8": q15_16(v).reshape(-1, config.num_key_value_heads, config.head_dim),
     }
-    group = config.num_attention_heads // config.num_key_value_heads
     q_attn = q_rope.permute(0, 2, 1, 3)
-    k_attn = k_rope.repeat_interleave(group, dim=2).permute(0, 2, 1, 3)
-    v_attn = v.repeat_interleave(group, dim=2).permute(0, 2, 1, 3)
-    score = q_attn @ k_attn.transpose(-1, -2) / (config.head_dim**0.5)
-    mask = torch.ones(score.shape[-2:], device=score.device, dtype=torch.bool).tril()
-    attn = torch.softmax(score.masked_fill(~mask, torch.finfo(score.dtype).min), dim=-1) @ v_attn
+    k_attn = k_rope.permute(0, 2, 1, 3)
+    v_attn = v.permute(0, 2, 1, 3)
+    attn = fused_causal_attention(q_attn, k_attn, v_attn)
     attn = attn.permute(0, 2, 1, 3).reshape(batch, seq_len, config.q_size)
     stats["attn_i8"] = q15_16(attn[:, prefix_tokens:])
     x = x + attn @ w["o_proj"].T
@@ -175,37 +215,6 @@ def run_calib_segment(x, w, norms, cos, sin, config, r3, prefix_tokens):
     stats["gated_mlp_i16"] = q15_16(gated[:, prefix_tokens:])
     stats["gated_mlp_i8"] = q15_16(gated_h[:, prefix_tokens:])
     return x + gated_h @ w["down_proj"].T, stats
-
-
-@torch.no_grad()
-def calibrate_attention_scales(embed, layer_weights, norm_weights, ids, config, r3=None, prefix_tokens=0, seq_len=2048):
-    cos_q15, sin_q15, _ = rope_tables_q15_16(seq_len, config.head_dim, config.rope_theta, ids.device)
-    cos, sin = cos_q15.float() / 65536.0, sin_q15.float() / 65536.0
-    x = embed[ids.reshape(-1, seq_len)]
-    scales = [None for _ in layer_weights]
-    for layer_idx, (w, norms) in enumerate(zip(layer_weights, norm_weights)):
-        x, stats = run_calib_segment(x, w, norms, cos, sin, config, r3, prefix_tokens)
-        scales[layer_idx] = {name: update_head_amax(None, value) for name, value in stats.items() if name not in ("input_qkv_i8", "post_mlp_i8", "gated_mlp_i16", "gated_mlp_i8")}
-        scales[layer_idx]["input_qkv_i8"] = update_tensor_amax(None, stats["input_qkv_i8"])
-        scales[layer_idx]["attn_i8"] = update_tensor_amax(None, stats["attn_i8"])
-        scales[layer_idx]["post_mlp_i8"] = update_tensor_amax(None, stats["post_mlp_i8"])
-        scales[layer_idx]["gated_mlp_i16"] = update_tensor_amax(None, stats["gated_mlp_i16"])
-        scales[layer_idx]["gated_mlp_i8"] = update_tensor_amax(None, stats["gated_mlp_i8"])
-    return [
-        {
-            "q_pre_rope_i16": scale_from_amax(layer["q_pre_rope_i16"], 32767),
-            "k_pre_rope_i16": scale_from_amax(layer["k_pre_rope_i16"], 32767),
-            "input_qkv_i8": scale_from_amax(layer["input_qkv_i8"], 127),
-            "q_post_rope_i8": scale_from_amax(layer["q_post_rope_i8"], 127),
-            "k_post_rope_i8": scale_from_amax(layer["k_post_rope_i8"], 127),
-            "v_i8": scale_from_amax(layer["v_i8"], 127),
-            "attn_i8": scale_from_amax(layer["attn_i8"], 127),
-            "post_mlp_i8": scale_from_amax(layer["post_mlp_i8"], 127),
-            "gated_mlp_i16": scale_from_amax(layer["gated_mlp_i16"], 32767),
-            "gated_mlp_i8": scale_from_amax(layer["gated_mlp_i8"], 127),
-        }
-        for layer in scales
-    ]
 
 
 def main():
@@ -224,6 +233,7 @@ def main():
     parser.add_argument("--calib-tokens", type=int, default=0)
     parser.add_argument("--calib-seq-len", type=int, default=0)
     parser.add_argument("--calib-batches", type=int, default=0)
+    parser.add_argument("--calib-micro-batch", type=int, default=1)
     parser.add_argument("--calib-prefix-tokens", type=int, default=0)
     parser.add_argument("--cache-prompt", default="")
     parser.add_argument("--max-layers", type=int, default=0)
@@ -246,8 +256,6 @@ def main():
         return
 
     tensors = {}
-    calib_weights = []
-    calib_norms = []
     r1 = random_hadamard_rotation(config.hidden_size, args.rotate_seed, args.device) if args.use_r1 else None
     r2 = random_hadamard_rotation(config.head_dim, args.rotate_seed + 1, args.device) if args.use_r2 else None
     r3 = random_hadamard_rotation(config.head_dim, args.rotate_seed + 2, args.device) if args.use_r3 else None
@@ -269,6 +277,13 @@ def main():
         tensors["model.embed_tokens.weight"] = embed.cpu().contiguous()
         tensors["lm_head.weight"] = lm_head.cpu().contiguous()
         tensors["model.norm.weight"] = q15_16(final_norm).cpu()
+        calib_x = None
+        cos = sin = None
+        if calib_tokens:
+            ids = load_calib_ids(args.model_dir, args.calib_text, args.calib_dataset, args.calib_parquet, args.calib_column, calib_tokens, args.device, args.cache_prompt)
+            calib_x = embed.to(args.device, torch.float32)[ids.reshape(-1, calib_seq_len)]
+            cos_q15, sin_q15, _ = rope_tables_q15_16(calib_seq_len, config.head_dim, config.rope_theta, args.device)
+            cos, sin = cos_q15.float() / 65536.0, sin_q15.float() / 65536.0
         for layer_idx in range(pack_layers):
             src = f"model.layers.{layer_idx}"
             dst = f"layers.{layer_idx}"
@@ -311,16 +326,17 @@ def main():
             tensors[f"{dst}.q_norm"] = q15_16(q_norm).cpu()
             tensors[f"{dst}.k_norm"] = q15_16(k_norm).cpu()
             layer_float["down_hadamard"] = down_hadamard
-            calib_weights.append(layer_float)
-            calib_norms.append((input_norm, post_norm, q_norm, k_norm))
-
-    if calib_tokens:
-        ids = load_calib_ids(args.model_dir, args.calib_text, args.calib_dataset, args.calib_parquet, args.calib_column, calib_tokens, args.device, args.cache_prompt)
-        all_scales = calibrate_attention_scales(embed, calib_weights, calib_norms, ids, config, r3, args.calib_prefix_tokens, calib_seq_len)
-        for layer_idx, scales in enumerate(all_scales):
-            dst = f"layers.{layer_idx}"
-            for name, scale in scales.items():
-                tensors[f"{dst}.{name}.scale"] = scale.cpu().contiguous()
+            if calib_x is not None:
+                next_x = torch.empty_like(calib_x)
+                stats_amax = None
+                micro = max(args.calib_micro_batch, 1)
+                for start in range(0, calib_x.shape[0], micro):
+                    end = min(start + micro, calib_x.shape[0])
+                    next_x[start:end], stats = run_calib_segment(calib_x[start:end], layer_float, (input_norm, post_norm, q_norm, k_norm), cos, sin, config, r3, args.calib_prefix_tokens)
+                    stats_amax = update_stats_amax(stats_amax, stats)
+                calib_x = next_x
+                for name, scale in scales_from_amax(stats_amax).items():
+                    tensors[f"{dst}.{name}.scale"] = scale.cpu().contiguous()
 
     save_file(
         tensors,
