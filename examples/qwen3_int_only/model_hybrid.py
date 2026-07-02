@@ -12,19 +12,16 @@ from examples.qwen3_int_only.kernels_hybrid import (
     silu_hadamard_quant_hybrid,
 )
 from examples.qwen3_int_only.utils import (
-    ROTATE_SEED,
     Q15_16,
     QWEN3_0_6B,
     Qwen3Config,
     load_packed_qwen3,
-    q15_16,
-    random_hadamard_rotation,
     rope_tables,
 )
 
 
 class Qwen3HybridBlock:
-    def __init__(self, seq_len, config=QWEN3_0_6B, cache_len=0, rotate_seed=ROTATE_SEED):
+    def __init__(self, seq_len, config=QWEN3_0_6B, cache_len=0):
         self.seq_len = seq_len
         self.cache_len = cache_len
         self.config = config
@@ -37,13 +34,12 @@ class Qwen3HybridBlock:
         self.down_proj = tilelang.compile(linear_i8(seq_len, im, h, 64, 64, 64), out_idx=[3], target="cuda")
         self.quant_v = tilelang.compile(quant_v_i8(seq_len, kvh, hd), out_idx=[2], target="cuda")
         self.rms_quant_kernel = tilelang.compile(rms_quant_hybrid(seq_len, h), out_idx=[4, 5], target="cuda")
-        self.rope_q = tilelang.compile(qk_norm_rope_quant_hybrid(seq_len, qh, hd), out_idx=[6], target="cuda")
-        self.rope_k = tilelang.compile(qk_norm_rope_quant_hybrid(seq_len, kvh, hd), out_idx=[6], target="cuda")
+        self.rope_q = tilelang.compile(qk_norm_rope_quant_hybrid(seq_len, qh, hd), out_idx=[5], target="cuda")
+        self.rope_k = tilelang.compile(qk_norm_rope_quant_hybrid(seq_len, kvh, hd), out_idx=[5], target="cuda")
         self.silu_kernel = tilelang.compile(silu_hadamard_quant_hybrid(seq_len, im), out_idx=[3], target="cuda")
         self.attn = tilelang.compile(attention_hybrid(qh, kvh, seq_len, cache_len, hd), out_idx=[8], target="cuda")
         self.empty_cache_k = torch.empty((kvh, cache_len, hd), device="cuda", dtype=torch.int8)
         self.empty_cache_v = torch.empty((kvh, cache_len, hd), device="cuda", dtype=torch.int8)
-        self.r3 = q15_16(random_hadamard_rotation(config.head_dim, rotate_seed + 2, "cuda"))
         self.zero_hidden = torch.zeros((seq_len, h), device="cuda", dtype=torch.int32)
 
     def rms_quant(self, residual_f32, linear_q15, weight_q15, out_scale):
@@ -52,7 +48,7 @@ class Qwen3HybridBlock:
 
     def qk_norm_rope_quant(self, x_q15, weight_q15, cos, sin, heads, out_scale):
         kernel = self.rope_q if heads == self.config.num_attention_heads else self.rope_k
-        return kernel(x_q15.reshape(self.seq_len * heads, self.config.head_dim).contiguous(), weight_q15, cos, sin, self.r3, out_scale)
+        return kernel(x_q15.reshape(self.seq_len * heads, self.config.head_dim).contiguous(), weight_q15, cos, sin, out_scale)
 
     def attention_hybrid(self, q8, k8, v8, cache_k, cache_v, weights):
         return self.attn(q8, cache_k, cache_v, k8, v8, weights.attn_score_scale, weights.v_i8_scale, weights.attn_i8_scale)
@@ -85,12 +81,12 @@ class Qwen3HybridBlock:
 
 
 class Qwen3HybridModel:
-    def __init__(self, seq_len, model_dir="/publicdata/huggingface.co/Qwen/Qwen3-0.6B", packed_dir="/tmp/Qwen3-0.6B-static-calib-32x2048", config=None, cache_len=0, rotate_seed=ROTATE_SEED, layers=None):
+    def __init__(self, seq_len, model_dir="/publicdata/huggingface.co/Qwen/Qwen3-0.6B", packed_dir="/tmp/Qwen3-0.6B-static-calib-32x2048", config=None, cache_len=0, layers=None):
         config = Qwen3Config.from_model_dir(model_dir) if config is None else config
         self.seq_len = seq_len
         self.cache_len = cache_len
         self.config = config
-        self.block = Qwen3HybridBlock(seq_len, config, cache_len=cache_len, rotate_seed=rotate_seed)
+        self.block = Qwen3HybridBlock(seq_len, config, cache_len=cache_len)
         self.final_norm = tilelang.compile(rms_hybrid(seq_len, config.hidden_size), out_idx=[3, 4], target="cuda")
         self.zero_hidden = torch.zeros((seq_len, config.hidden_size), device="cuda", dtype=torch.int32)
         self.cos, self.sin, _ = rope_tables(seq_len + cache_len, config.head_dim, config.rope_theta)

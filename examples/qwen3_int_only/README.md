@@ -25,36 +25,36 @@ data:    /publicdata/huggingface.co/datasets/HuggingFaceFW/fineweb/sample/10BT/0
 | --- | ---: | ---: | ---: | ---: | ---: |
 | HF bf16 | 2048 | 3.801437 | 44.765483 | - | - |
 | fake-quant | 2048 | 3.819883 | 45.598856 | 0.99490349 | 1.16091984e-01 |
-| hybrid | 2048 | 3.820036 | 45.605858 | 0.99496313 | 1.14890359e-01 |
-| int-only | 2048 | 3.821986 | 45.694888 | 0.99019253 | 2.23586611e-01 |
+| hybrid | 2048 | 3.805733 | 44.958180 | 0.99515811 | 1.10790174e-01 |
+| int-only | 2048 | 3.817301 | 45.481290 | 0.99059490 | 2.13982513e-01 |
 
 Kernel profile for the int-only LLM block path: 2048 tokens, 28 layers, prefix KV cache enabled, 16 measured repeats.
 
 | kernel | total ms | math TOPS | tc TOPS | tc util | pct |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| attention_i8 | 268.401 | 57.63 | 86.45 | 13.85% | 35.84% |
-| qk_norm_rope_i8 | 207.934 | - | - | - | 27.76% |
-| linear_i8 | 184.789 | 156.19 | 156.19 | 25.03% | 24.67% |
-| rms_sq8 | 37.004 | - | - | - | 4.94% |
-| silu_hadamard_i8 | 35.045 | - | - | - | 4.68% |
-| quant_v_i8 | 15.790 | - | - | - | 2.11% |
-| total | 748.964 | 59.19 | 69.52 | 11.14% | 100.00% |
+| attention_i8 | 278.512 | 55.54 | 83.31 | 13.35% | 36.49% |
+| qk_norm_rope_i8 | 209.455 | - | - | - | 27.44% |
+| linear_i8 | 188.653 | 152.99 | 152.99 | 24.52% | 24.72% |
+| rms_sq8 | 36.423 | - | - | - | 4.77% |
+| silu_hadamard_i8 | 35.078 | - | - | - | 4.60% |
+| quant_v_i8 | 15.114 | - | - | - | 1.98% |
+| total | 763.235 | 58.08 | 68.22 | 10.93% | 100.00% |
 
 Kernel profile for the hybrid LLM block path: 2048 tokens, 28 layers, prefix KV cache enabled, 16 measured repeats.
 
 | kernel | total ms | math TOPS | tc TOPS | tc util | pct |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| attention_hybrid | 310.577 | 49.81 | 74.71 | 11.97% | 40.62% |
-| linear_i8 | 186.699 | 154.59 | 154.59 | 24.77% | 24.42% |
-| qk_norm_rope_quant_hybrid | 180.198 | - | - | - | 23.57% |
-| silu_hadamard_quant_hybrid | 41.278 | - | - | - | 5.40% |
-| rms_quant_hybrid | 30.810 | - | - | - | 4.03% |
-| quant_v_i8 | 15.025 | - | - | - | 1.97% |
-| total | 764.588 | 57.98 | 68.10 | 10.91% | 100.00% |
+| attention_hybrid | 307.847 | 50.25 | 75.37 | 12.08% | 41.66% |
+| linear_i8 | 190.497 | 151.51 | 151.51 | 24.28% | 25.78% |
+| qk_norm_rope_quant_hybrid | 145.766 | - | - | - | 19.73% |
+| silu_hadamard_quant_hybrid | 42.877 | - | - | - | 5.80% |
+| rms_quant_hybrid | 35.123 | - | - | - | 4.75% |
+| quant_v_i8 | 16.776 | - | - | - | 2.27% |
+| total | 738.886 | 60.00 | 70.46 | 11.29% | 100.00% |
 
 ## Qwen3-14B
 
-2048-token FineWeb quality result against HF bf16:
+Previous 2048-token FineWeb quality result against HF bf16. Regenerate 14B with the FWHT R3 pack before comparing current 14B accuracy or performance.
 
 | backend | tokens | loss | ppl | cos | mse |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -103,7 +103,7 @@ The int-only backend stores the residual stream as Q15.16 `int32`. The hybrid ba
 
 Calibration is data driven. The default script uses FineWeb from `/publicdata/huggingface.co/datasets`, 32 batches of 2048 tokens, and the same Chinese cache prompt used at evaluation time. QKV activation scales use the full calibrated sequence because prefix outliers matter for KV cache quality; non-QKV activation scales ignore the first 512 prefix tokens to avoid over-scaling MLP residual outliers that do not represent normal generated tokens.
 
-QuaRot is applied during packing. R1 smooths residual-channel activation ranges through weight rotation, R2 rotates the V/O path, R3 rotates the Q/K head dimension, and R4 is the MLP Hadamard rotation used before down_proj. R2 and R3 affect KV-cache semantics, so the cache builder uses the same packed rotation flags when it quantizes HF-generated prefix KV tensors.
+QuaRot is applied during packing. R1 smooths residual-channel activation ranges through weight rotation, R2 rotates the V/O path, R3 is a fixed exact fast Hadamard on the Q/K head dimension, and R4 is the exact Hadamard rotation used before down_proj. R2 and R3 affect KV-cache semantics, so the cache builder applies the same R2 setting and the fixed R3 transform when it quantizes HF-generated prefix KV tensors.
 
 Linear kernels consume `int8` activations and per-channel `int8` weights. Activation-scale x weight-scale factors are precomputed into packed XP5 quant parameters, so each linear kernel ends with one `T.fix.quant` from the `int32` accumulator back to Q15.16. The packed QKV and gate/up matrices are concatenated offline to avoid runtime packing kernels.
 

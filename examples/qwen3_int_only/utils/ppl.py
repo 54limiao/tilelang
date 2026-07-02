@@ -12,7 +12,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from examples.qwen3_int_only.model_int_only import Q15_16, Qwen3IntOnlyModel
 from examples.qwen3_int_only.model_hybrid import Qwen3HybridModel
-from examples.qwen3_int_only.utils import ROTATE_SEED, Qwen3Config, random_hadamard_rotation
+from examples.qwen3_int_only.utils import ROTATE_SEED, Qwen3Config, fast_hadamard, random_hadamard_rotation
 
 
 DEFAULT_MODEL_DIR = "/publicdata/huggingface.co/Qwen/Qwen3-0.6B"
@@ -169,10 +169,9 @@ def build_cache_kv(hf_model, tokenizer, cache_prompt, cache_scales, use_r2, conf
     elif hasattr(past, "to_legacy_cache"):
         past = past.to_legacy_cache()
     r2 = random_hadamard_rotation(config.head_dim, ROTATE_SEED + 1, "cuda") if use_r2 else None
-    r3 = random_hadamard_rotation(config.head_dim, ROTATE_SEED + 2, "cuda")
     cache_kv = []
     for (k_scale, v_scale), (k, v) in zip(cache_scales, past[: len(cache_scales)]):
-        k = (k[0].float().contiguous().to(torch.float64) @ r3.to(torch.float64)).to(torch.float32)
+        k = fast_hadamard(k[0].float().contiguous())
         v = v[0].float().contiguous()
         if r2 is not None:
             v = (v.to(torch.float64) @ r2.to(torch.float64)).to(torch.float32)
@@ -224,7 +223,6 @@ def main():
     else:
         golden = None
     use_r2 = args.use_r2 or packed_flag(args.packed_dir, "use_r2")
-    use_r3 = packed_flag(args.packed_dir, "use_r3")
     cache_scales = load_cache_scales(args.packed_dir, args.layers)
     print("building cache kv", file=sys.stderr, flush=True)
     cache_kv, cache_len = build_cache_kv(hf_model, tokenizer, args.cache_prompt, cache_scales, use_r2, config)
@@ -234,7 +232,7 @@ def main():
     if args.backend == "hybrid":
         int_model = Qwen3HybridModel(windows.shape[1] - 1, model_dir=args.model_dir, packed_dir=args.packed_dir, config=config, cache_len=cache_len, layers=args.layers)
     else:
-        int_model = Qwen3IntOnlyModel(windows.shape[1] - 1, model_dir=args.model_dir, packed_dir=args.packed_dir, config=config, cache_len=cache_len, layers=args.layers, use_r3=use_r3)
+        int_model = Qwen3IntOnlyModel(windows.shape[1] - 1, model_dir=args.model_dir, packed_dir=args.packed_dir, config=config, cache_len=cache_len, layers=args.layers)
     print(f"running {args.backend} logits", file=sys.stderr, flush=True)
     acc = new_acc()
     for idx, row in enumerate(windows):

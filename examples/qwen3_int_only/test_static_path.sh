@@ -30,7 +30,6 @@ CALIB_PREFIX_TOKENS="${CALIB_PREFIX_TOKENS:-512}"
 FORCE_PACK="${FORCE_PACK:-0}"
 USE_R1="${USE_R1:-1}"
 USE_R2="${USE_R2:-1}"
-USE_R3="${USE_R3:-1}"
 LOG_DIR="${LOG_DIR:-/tmp/qwen3_int_only_logs}"
 mkdir -p "${LOG_DIR}"
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-${MODEL_NAME}-${BACKEND}"
@@ -62,10 +61,6 @@ fi
 
 if [[ "${USE_R2}" == "1" ]]; then
   PREPACK_ARGS+=(--use-r2)
-fi
-
-if [[ "${USE_R3}" == "1" ]]; then
-  PREPACK_ARGS+=(--use-r3)
 fi
 
 if [[ -n "${CALIB_PARQUET}" ]]; then

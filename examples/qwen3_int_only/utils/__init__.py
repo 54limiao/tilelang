@@ -11,6 +11,7 @@ from examples.qwen3_int_only.utils.quarot import (
     ROTATE_SEED,
     random_hadamard_rotation,
     hadamard_rotation,
+    fast_hadamard,
     rotate_block_input,
     rotate_head_input,
     rotate_head_output,

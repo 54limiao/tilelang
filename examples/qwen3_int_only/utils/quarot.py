@@ -21,6 +21,22 @@ def hadamard_rotation(dim, device="cuda"):
     return (h / math.sqrt(dim)).contiguous()
 
 
+def fast_hadamard(x, block_dim=None):
+    shape = x.shape
+    n = shape[-1] if block_dim is None else block_dim
+    y = x.reshape(-1, n).to(torch.float32)
+    step = 1
+    while step < n:
+        y = y.reshape(-1, n // (step * 2), step * 2)
+        a = y[..., :step].clone()
+        b = y[..., step:]
+        y[..., :step] = a + b
+        y[..., step:] = a - b
+        y = y.reshape(-1, n)
+        step *= 2
+    return (y * (1.0 / math.sqrt(n))).reshape(shape).contiguous()
+
+
 def _rotate_input(weight, rotation):
     if weight.shape[-1] == rotation.shape[0]:
         return weight.to(torch.float64) @ rotation.to(weight.device, torch.float64)

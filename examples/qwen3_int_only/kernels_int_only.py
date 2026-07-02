@@ -102,7 +102,7 @@ def _warp_hadamard_i32(local, buf, thread_elem, warp_size, rounds):
         stride = 1 << i
         other = tx ^ stride
         sign = (tx >> i) & 1
-        for j in T.serial(thread_elem):
+        for j in T.Pipelined(thread_elem, num_stages=1):
             buf[j] = T.tvm_warp_shuffle(0xFFFFFFFF, local[j], other % warp_size, warp_size, warp_size)
             local[j] = T.if_then_else(sign == 0, local[j] + buf[j], buf[j] - local[j])
 
@@ -118,7 +118,6 @@ def rope_sq8(seq_len, heads, dim, qmax=127):
         X: T.Tensor((seq_len * heads, dim), "int32"),
         COS: T.Tensor((seq_len, dim // 2), "int32"),
         SIN: T.Tensor((seq_len, dim // 2), "int32"),
-        R: T.Tensor((dim, dim), "int32"),
         QT: T.Tensor((heads,), "uint32"),
         Y: T.Tensor((heads, seq_len, dim), "int8"),
     ):
@@ -139,8 +138,7 @@ def rope_sq8(seq_len, heads, dim, qmax=127):
                 s = SIN[t, src_d] >> T.int32(8)
                 lo = ((x0 >> T.int32(8)) * c) - ((x1 >> T.int32(8)) * s)
                 hi = ((x0 >> T.int32(8)) * s) + ((x1 >> T.int32(8)) * c)
-                v0 = T.if_then_else(d < T.int32(dim // 2), lo >> T.int32(8), hi >> T.int32(8))
-                local[i] = T.if_then_else(R[d, 0] >= T.int32(0), v0, T.int32(0) - v0)
+                local[i] = T.if_then_else(d < T.int32(dim // 2), lo >> T.int32(8), hi >> T.int32(8))
             for i in T.serial(thread_round):
                 chunksize = 1 << (i + 1)
                 chunknum = thread_elem // chunksize
@@ -150,7 +148,7 @@ def rope_sq8(seq_len, heads, dim, qmax=127):
                         a = local[chunkbase + k]
                         b = local[chunkbase + k + chunksize // 2]
                         local[chunkbase + k] = a + b
-                        local[chunkbase + k + chunksize // 2] = a - b
+                        local[chunkbase + k + chunksize // 2] = local[chunkbase + k] - T.int32(2) * b
             _warp_hadamard_i32(local, other_val, thread_elem, threads, warp_round)
             for i in T.serial(thread_elem):
                 v = local[i] * T.int32(22)
@@ -174,7 +172,6 @@ def qk_norm_rope_i8(seq_len, heads, dim):
         RLUT: T.Tensor((1024,), "int16"),
         COS: T.Tensor((seq_len, dim // 2), "int32"),
         SIN: T.Tensor((seq_len, dim // 2), "int32"),
-        R: T.Tensor((dim, dim), "int32"),
         QT: T.Tensor((heads,), "uint32"),
         Y: T.Tensor((heads, seq_len, dim), "int8"),
     ):
@@ -238,7 +235,6 @@ def qk_norm_rope_i8(seq_len, heads, dim):
                 lo = ((x0 >> T.int32(8)) * c) - ((x1 >> T.int32(8)) * s)
                 hi = ((x0 >> T.int32(8)) * s) + ((x1 >> T.int32(8)) * c)
                 local[i] = T.if_then_else(d < T.int32(half_dim), lo >> T.int32(8), hi >> T.int32(8))
-                local[i] = T.if_then_else(R[d, 0] >= T.int32(0), local[i], T.int32(0) - local[i])
             for i in T.serial(thread_round):
                 chunksize = 1 << (i + 1)
                 chunknum = thread_elem // chunksize
@@ -248,7 +244,7 @@ def qk_norm_rope_i8(seq_len, heads, dim):
                         a = local[chunkbase + k]
                         b = local[chunkbase + k + chunksize // 2]
                         local[chunkbase + k] = a + b
-                        local[chunkbase + k + chunksize // 2] = a - b
+                        local[chunkbase + k + chunksize // 2] = local[chunkbase + k] - T.int32(2) * b
             _warp_hadamard_i32(local, other_val, thread_elem, threads, warp_round)
             for i in T.serial(thread_elem):
                 Y[h, t, tx * thread_elem + i] = T.fix.quant(local[i] * T.int32(22), scale=out_qt[0], out_dtype="int8")
@@ -372,7 +368,7 @@ def silu_hadamard_i8(rows, cols, block_dim=128):
                         a = local[chunkbase + k]
                         b = local[chunkbase + k + chunksize // 2]
                         local[chunkbase + k] = a + b
-                        local[chunkbase + k + chunksize // 2] = a - b
+                        local[chunkbase + k + chunksize // 2] = local[chunkbase + k] - T.int32(2) * b
             _warp_hadamard_i32(local, other, thread_elem, threads, warp_round)
             for i in T.serial(thread_elem):
                 Q[r, g * T.int32(block_dim) + tx * T.int32(thread_elem) + i] = T.fix.quant(local[i], scale=qt[0], out_dtype="int8")

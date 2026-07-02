@@ -17,6 +17,7 @@ from examples.qwen3_int_only.utils import (
     per_channel_i8_weight,
     q15_16,
     hadamard_rotation,
+    fast_hadamard,
     random_hadamard_rotation,
     rmsnorm_torch,
     rope_tables,
@@ -128,7 +129,7 @@ def write_timestamp(path, args, calib_tokens, calib_seq_len, metadata=None):
                 f"packed_layers={value('packed_layers', args.max_layers or 'all')}",
                 f"use_r1={value('use_r1', int(args.use_r1))}",
                 f"use_r2={value('use_r2', int(args.use_r2))}",
-                f"use_r3={value('use_r3', int(args.use_r3))}",
+                f"r3_impl={value('r3_impl', 'fwht')}",
                 f"weight_scale_dtype={value('weight_scale_dtype', 'fp32')}",
             )
         )
@@ -146,6 +147,8 @@ def current_pack_metadata(path, args, config):
     if metadata.get("hidden_size") != str(config.hidden_size) or metadata.get("num_hidden_layers") != str(config.num_hidden_layers):
         return None
     if metadata.get("weight_scale_dtype") != "fp32":
+        return None
+    if metadata.get("r3_impl") != "fwht":
         return None
     expected_layers = str(args.max_layers or config.num_hidden_layers)
     if metadata.get("packed_layers") != expected_layers:
@@ -169,14 +172,8 @@ def current_pack_metadata(path, args, config):
     return metadata if ok else None
 
 
-def block_hadamard(x, rotation, block_dim=128):
-    shape = x.shape
-    y = x.to(torch.float64).reshape(*shape[:-1], shape[-1] // block_dim, block_dim)
-    return (y @ rotation.to(x.device, torch.float64)).reshape(shape).to(torch.float32)
-
-
 @torch.no_grad()
-def run_calib_segment(x, w, norms, cos, sin, config, r3, prefix_tokens):
+def run_calib_segment(x, w, norms, cos, sin, config, prefix_tokens):
     input_norm, post_norm, q_norm, k_norm = norms
     h = rmsnorm_torch(x, input_norm)
     q = h @ w["q_proj"].T
@@ -189,9 +186,8 @@ def run_calib_segment(x, w, norms, cos, sin, config, r3, prefix_tokens):
     k = rmsnorm_torch(k.reshape(batch, seq_len, config.num_key_value_heads, config.head_dim), k_norm)
     q_rope = rope_torch(q.reshape(batch * seq_len, config.q_size), cos_b, sin_b, config.num_attention_heads, config.head_dim).reshape(batch, seq_len, config.num_attention_heads, config.head_dim)
     k_rope = rope_torch(k.reshape(batch * seq_len, config.kv_size), cos_b, sin_b, config.num_key_value_heads, config.head_dim).reshape(batch, seq_len, config.num_key_value_heads, config.head_dim)
-    if r3 is not None:
-        q_rope = (q_rope.to(torch.float64) @ r3.to(torch.float64)).to(torch.float32)
-        k_rope = (k_rope.to(torch.float64) @ r3.to(torch.float64)).to(torch.float32)
+    q_rope = fast_hadamard(q_rope)
+    k_rope = fast_hadamard(k_rope)
     v = v.reshape(batch, seq_len, config.num_key_value_heads, config.head_dim)
     stats = {
         "input_qkv_i8": q15_16(h[:, prefix_tokens:]),
@@ -212,7 +208,7 @@ def run_calib_segment(x, w, norms, cos, sin, config, r3, prefix_tokens):
     gate = m @ w["gate_proj"].T
     up = m @ w["up_proj"].T
     gated = torch.nn.functional.silu(gate) * up
-    gated_h = block_hadamard(gated, w["down_hadamard"])
+    gated_h = fast_hadamard(gated, config.head_dim)
     stats["post_mlp_i8"] = q15_16(m[:, prefix_tokens:])
     stats["gated_mlp_i8"] = q15_16(gated_h[:, prefix_tokens:])
     return x + gated_h @ w["down_proj"].T, stats
@@ -225,7 +221,6 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--use-r1", action="store_true")
     parser.add_argument("--use-r2", action="store_true")
-    parser.add_argument("--use-r3", action="store_true")
     parser.add_argument("--rotate-seed", type=int, default=ROTATE_SEED)
     parser.add_argument("--calib-text", default="")
     parser.add_argument("--calib-dataset", default="fineweb")
@@ -259,7 +254,6 @@ def main():
     tensors = {}
     r1 = random_hadamard_rotation(config.hidden_size, args.rotate_seed, args.device) if args.use_r1 else None
     r2 = random_hadamard_rotation(config.head_dim, args.rotate_seed + 1, args.device) if args.use_r2 else None
-    r3 = random_hadamard_rotation(config.head_dim, args.rotate_seed + 2, args.device) if args.use_r3 else None
     down_hadamard = hadamard_rotation(config.head_dim, args.device)
     with SafeTensorReader(args.model_dir) as reader:
         def tensor(name, device=args.device, dtype=torch.float32):
@@ -332,7 +326,7 @@ def main():
                 micro = max(args.calib_micro_batch, 1)
                 for start in range(0, calib_x.shape[0], micro):
                     end = min(start + micro, calib_x.shape[0])
-                    next_x[start:end], stats = run_calib_segment(calib_x[start:end], layer_float, (input_norm, post_norm, q_norm, k_norm), cos, sin, config, r3, args.calib_prefix_tokens)
+                    next_x[start:end], stats = run_calib_segment(calib_x[start:end], layer_float, (input_norm, post_norm, q_norm, k_norm), cos, sin, config, args.calib_prefix_tokens)
                     stats_amax = update_stats_amax(stats_amax, stats)
                 calib_x = next_x
                 for name, scale in scales_from_amax(stats_amax).items():
@@ -344,7 +338,7 @@ def main():
         metadata={
             "use_r1": str(int(args.use_r1)),
             "use_r2": str(int(args.use_r2)),
-            "use_r3": str(int(args.use_r3)),
+            "r3_impl": "fwht",
             "model_dir": args.model_dir,
             "hidden_size": str(config.hidden_size),
             "intermediate_size": str(config.intermediate_size),

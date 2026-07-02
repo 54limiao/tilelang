@@ -8,7 +8,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from examples.qwen3_int_only.model_int_only import Q15_16, Qwen3IntOnlyBlock
 from examples.qwen3_int_only.model_hybrid import Qwen3HybridBlock
 from examples.qwen3_int_only.utils.ppl import iter_texts, quant_i8_static_q15_16
-from examples.qwen3_int_only.utils import ROTATE_SEED, Qwen3Config, load_packed_qwen3, q15_16, random_hadamard_rotation, rope_tables, rope_tables_q15_16
+from examples.qwen3_int_only.utils import ROTATE_SEED, Qwen3Config, fast_hadamard, load_packed_qwen3, q15_16, random_hadamard_rotation, rope_tables, rope_tables_q15_16
 
 
 DEFAULT_MODEL_DIR = "/publicdata/huggingface.co/Qwen/Qwen3-0.6B"
@@ -112,12 +112,10 @@ def build_cache_kv(model_dir, tokenizer, cache_prompt, layer_weights, config, us
     elif hasattr(past, "to_legacy_cache"):
         past = past.to_legacy_cache()
     r2 = random_hadamard_rotation(config.head_dim, ROTATE_SEED + 1, "cuda") if use_r2 else None
-    r3 = random_hadamard_rotation(config.head_dim, ROTATE_SEED + 2, "cuda")
     cache_kv = []
     for weights, (k, v) in zip(layer_weights, past[: len(layer_weights)]):
-        k = k[0].float().contiguous()
+        k = fast_hadamard(k[0].float().contiguous())
         v = v[0].float().contiguous()
-        k = (k.to(torch.float64) @ r3.to(torch.float64)).to(torch.float32)
         if r2 is not None:
             v = (v.to(torch.float64) @ r2.to(torch.float64)).to(torch.float32)
         kq = quant_i8_static_q15_16(k, weights.k_post_rope_i8_scale[:, None])
@@ -127,7 +125,7 @@ def build_cache_kv(model_dir, tokenizer, cache_prompt, layer_weights, config, us
 
 
 @torch.no_grad()
-def run_block(block, x, x8, xs8, weights, cos, sin, r3_q15, prof, cache_k=None, cache_v=None):
+def run_block(block, x, x8, xs8, weights, cos, sin, prof, cache_k=None, cache_v=None):
     cfg = block.config
     ops = op_counts(block.seq_len, cfg, block.cache_len)
     tc_ops = tc_op_counts(block.seq_len, cfg, block.cache_len)
@@ -139,11 +137,11 @@ def run_block(block, x, x8, xs8, weights, cos, sin, r3_q15, prof, cache_k=None, 
     v = qkv[:, cfg.q_size + cfg.kv_size :].contiguous()
     q_attn = prof.time(
         "qk_norm_rope_i8",
-        lambda: block.qk_rope_q(q.reshape(block.seq_len * cfg.num_attention_heads, cfg.head_dim).contiguous(), weights.q_norm, block.lut_rsqrt, pos_cos, pos_sin, r3_q15, weights.q_post_rope_i8_qt),
+        lambda: block.qk_rope_q(q.reshape(block.seq_len * cfg.num_attention_heads, cfg.head_dim).contiguous(), weights.q_norm, block.lut_rsqrt, pos_cos, pos_sin, weights.q_post_rope_i8_qt),
     )
     k_attn = prof.time(
         "qk_norm_rope_i8",
-        lambda: block.qk_rope_k(k.reshape(block.seq_len * cfg.num_key_value_heads, cfg.head_dim).contiguous(), weights.k_norm, block.lut_rsqrt, pos_cos, pos_sin, r3_q15, weights.k_post_rope_i8_qt),
+        lambda: block.qk_rope_k(k.reshape(block.seq_len * cfg.num_key_value_heads, cfg.head_dim).contiguous(), weights.k_norm, block.lut_rsqrt, pos_cos, pos_sin, weights.k_post_rope_i8_qt),
     )
     v_attn = prof.time("quant_v_i8", lambda: block.quant_v(v.reshape(block.seq_len, cfg.num_key_value_heads, cfg.head_dim), weights.v_i8_qt))
     cache_k = block.empty_cache_k if cache_k is None else cache_k
@@ -221,8 +219,6 @@ def main():
     if args.backend == "hybrid":
         cos = cos.contiguous()
         sin = sin.contiguous()
-    r3_q15 = q15_16(random_hadamard_rotation(config.head_dim, ROTATE_SEED + 2))
-
     def run_layers(prof):
         if args.backend == "hybrid":
             residual = embed[ids].float().contiguous()
@@ -254,7 +250,7 @@ def main():
             if args.backend == "hybrid":
                 residual, mlp = run_block_hybrid(block, residual, x8, weights[layer_idx], cos, sin, prof, cache_k, cache_v)
             else:
-                residual, mlp = run_block(block, residual, x8, xs8, weights[layer_idx], cos, sin, r3_q15, prof, cache_k, cache_v)
+                residual, mlp = run_block(block, residual, x8, xs8, weights[layer_idx], cos, sin, prof, cache_k, cache_v)
         return residual, mlp
 
     peak_tops = args.peak_tops or default_int8_peak_tops()
