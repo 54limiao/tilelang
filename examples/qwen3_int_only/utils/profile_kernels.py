@@ -21,14 +21,14 @@ def packed_flags(packed_dir):
 
 def op_counts(seq_len, cfg, cache_len=0):
     qk_ops = 2 * cfg.num_attention_heads * seq_len * (seq_len + cache_len) * cfg.head_dim
-    pv_ops = 2 * qk_ops
+    pv_ops = 2 * cfg.num_attention_heads * seq_len * (seq_len + cache_len) * cfg.head_dim
     return {
         "qkv_proj_i8": 2 * seq_len * cfg.hidden_size * (cfg.q_size + 2 * cfg.kv_size),
         "o_proj_i8_static": 2 * seq_len * cfg.q_size * cfg.hidden_size,
         "gate_up_proj_static": 2 * seq_len * cfg.hidden_size * (2 * cfg.intermediate_size),
-        "down_residual_static": 2 * 2 * seq_len * cfg.intermediate_size * cfg.hidden_size,
-        "attention_i8v8_fused_static": qk_ops * 2 + pv_ops,
-        "attention_cache_i8v8_fused_static": qk_ops * 2 + pv_ops,
+        "down_residual_static": 2 * seq_len * cfg.intermediate_size * cfg.hidden_size,
+        "attention_i8v8_fused_static": qk_ops + pv_ops,
+        "attention_cache_i8v8_fused_static": qk_ops + pv_ops,
     }
 
 

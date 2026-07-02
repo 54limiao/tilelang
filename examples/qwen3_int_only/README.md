@@ -26,8 +26,8 @@ Kernel profile for the int-only LLM block path: 2048 tokens, 28 layers, prefix K
 
 | kernel | avg ms | total ms | pct | TOPS |
 | --- | ---: | ---: | ---: | ---: |
-| attention_cache_i8v8_fused_static | 1.021 | 85.775 | 49.89 | 67.63 |
-| down_residual_static | 0.196 | 16.465 | 9.58 | 131.47 |
+| attention_cache_i8v8_fused_static | 1.021 | 85.775 | 49.89 | 33.85 |
+| down_residual_static | 0.196 | 16.465 | 9.58 | 65.74 |
 | qkv_proj_i8 | 0.146 | 12.265 | 7.13 | 117.66 |
 | gate_up_proj_static | 0.139 | 11.702 | 6.81 | 184.99 |
 | rope_sq8_q_attn_hadamard | 0.092 | 7.770 | 4.52 | - |
@@ -40,7 +40,7 @@ Kernel profile for the int-only LLM block path: 2048 tokens, 28 layers, prefix K
 | sq8_v_attn_noscale | 0.039 | 3.246 | 1.89 | - |
 | residual_attn_rms_q15 | 0.038 | 3.196 | 1.86 | - |
 | sq8_hidden_static | 0.032 | 2.674 | 1.56 | - |
-| total | 2.047 | 171.915 | 100.00 | 71.55 |
+| total | 2.047 | 171.915 | 100.00 | 48.37 |
 
 The first run writes `qwen3_int_only.safetensors` and `timestamp`; later runs skip packing when the pack matches the current static schema. Use `FORCE_PACK=1 examples/qwen3_int_only/test_static_path.sh` to rebuild.
 
