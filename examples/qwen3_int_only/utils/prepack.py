@@ -1,4 +1,5 @@
 import argparse
+from datetime import datetime, timezone
 from pathlib import Path
 
 import torch
@@ -50,6 +51,56 @@ def load_calib_ids(model_dir, calib_text, calib_dataset, calib_parquet, calib_co
         if len(ids) >= tokens:
             return torch.tensor(ids[:tokens], device=device, dtype=torch.long)
     return torch.tensor(ids, device=device, dtype=torch.long)
+
+
+def resolve_calib_shape(args):
+    if args.calib_seq_len and args.calib_batches:
+        return args.calib_seq_len * args.calib_batches, args.calib_seq_len
+    if args.calib_tokens:
+        return args.calib_tokens, args.calib_tokens
+    return 0, args.calib_seq_len
+
+
+def write_timestamp(path, args, calib_tokens, calib_seq_len, metadata=None):
+    def value(name, default):
+        return (metadata or {}).get(name, str(default))
+
+    path.write_text(
+        "\n".join(
+            (
+                f"packed_at_utc={datetime.now(timezone.utc).isoformat()}",
+                f"model_dir={args.model_dir}",
+                f"calib_dataset={value('calib_dataset', args.calib_dataset)}",
+                f"calib_parquet={value('calib_parquet', args.calib_parquet or '')}",
+                f"calib_tokens={value('calib_tokens', calib_tokens)}",
+                f"calib_seq_len={value('calib_seq_len', calib_seq_len)}",
+                f"calib_batches={value('calib_batches', args.calib_batches)}",
+                f"calib_prefix_tokens={value('calib_prefix_tokens', args.calib_prefix_tokens)}",
+                f"use_r1={value('use_r1', int(args.use_r1))}",
+                f"use_r2={value('use_r2', int(args.use_r2))}",
+                f"use_r3={value('use_r3', int(args.use_r3))}",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def current_pack_metadata(path):
+    with safe_open(str(path), framework="pt", device="cpu") as f:
+        keys = set(f.keys())
+        metadata = f.metadata() or {}
+    ok = all(
+        key in keys
+        for key in (
+            "layers.0.q_post_rope_i8.scale",
+            "layers.0.k_post_rope_i8.scale",
+            "layers.0.v_i8.scale",
+            "layers.0.post_mlp_i8.scale",
+            "layers.0.gated_mlp_i16.scale",
+        )
+    )
+    return metadata if ok else None
 
 
 @torch.no_grad()
@@ -137,10 +188,22 @@ def main():
     parser.add_argument("--calib-seq-len", type=int, default=0)
     parser.add_argument("--calib-batches", type=int, default=0)
     parser.add_argument("--calib-prefix-tokens", type=int, default=0)
+    parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / "qwen3_int_only.safetensors"
+    timestamp = out_dir / "timestamp"
+    calib_tokens, calib_seq_len = resolve_calib_shape(args)
+    metadata = current_pack_metadata(path) if path.exists() and not args.force else None
+    if metadata is not None:
+        if not timestamp.exists():
+            write_timestamp(timestamp, args, calib_tokens, calib_seq_len, metadata)
+        print(f"skip existing pack: {path}")
+        print(timestamp.read_text(encoding="utf-8").strip())
+        return
+
     tensors = {}
     calib_weights = []
     calib_norms = []
@@ -196,13 +259,6 @@ def main():
             calib_weights.append(layer_float)
             calib_norms.append((input_norm, post_norm, q_norm, k_norm))
 
-    calib_tokens = args.calib_tokens
-    calib_seq_len = args.calib_seq_len
-    if args.calib_seq_len and args.calib_batches:
-        calib_tokens = args.calib_seq_len * args.calib_batches
-        calib_seq_len = args.calib_seq_len
-    elif args.calib_tokens:
-        calib_seq_len = args.calib_tokens
     if calib_tokens:
         ids = load_calib_ids(args.model_dir, args.calib_text, args.calib_dataset, args.calib_parquet, args.calib_column, calib_tokens, args.device)
         for layer_idx, scales in enumerate(calibrate_attention_scales(embed, calib_weights, calib_norms, ids, QWEN3_0_6B, r3, args.calib_prefix_tokens, calib_seq_len)):
@@ -210,7 +266,6 @@ def main():
             for name, scale in scales.items():
                 tensors[f"{dst}.{name}.scale"] = scale.cpu().contiguous()
 
-    path = out_dir / "qwen3_int_only.safetensors"
     save_file(
         tensors,
         str(path),
@@ -226,7 +281,9 @@ def main():
             "calib_prefix_tokens": str(args.calib_prefix_tokens),
         },
     )
+    write_timestamp(timestamp, args, calib_tokens, calib_seq_len)
     print(path)
+    print(timestamp)
 
 
 if __name__ == "__main__":

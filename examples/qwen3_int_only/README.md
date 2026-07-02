@@ -25,16 +25,29 @@ Pack weights and calibration scales:
   --calib-prefix-tokens 512
 ```
 
-Run the 2048-token FineWeb quality baseline against HF bf16:
+`utils/prepack.py` writes `qwen3_int_only.safetensors` and `timestamp` under `--out-dir`; a later run skips packing when the packed file matches the current static schema. Set `FORCE_PACK=1` when using the shell entry below to rebuild.
+
+Run the standard 2048-token FineWeb quality baseline against HF bf16. This prints int-only PPL and compares logits with float/HF using cos, mse, mae, max_abs, and rel_mse:
+
+```bash
+examples/qwen3_int_only/test_static_path.sh
+```
+
+Equivalent direct command:
 
 ```bash
 /root/venv/bin/python examples/qwen3_int_only/utils/ppl.py \
   --model-dir /publicdata/huggingface.co/Qwen/Qwen3-0.6B \
   --packed-dir /tmp/Qwen3-0.6B-static-calib-32x2048 \
+  --backend int-only \
+  --compare-backend hf \
   --eval-dataset fineweb \
   --max-tokens 2049 \
   --batch-size 1 \
-  --num-batches 1
+  --num-batches 1 \
+  --cache-prompt "你是一个有用而无害的聊天助手。" \
+  --use-r1 \
+  --use-r2
 ```
 
 Short static MLP gated-i16 check from the current implementation:
