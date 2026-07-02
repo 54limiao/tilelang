@@ -172,8 +172,6 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=257)
     parser.add_argument("--layer", type=int, default=0)
     parser.add_argument("--layers", default="")
-    parser.add_argument("--use-r3", action="store_true")
-    parser.add_argument("--split-attn", action="store_true")
     parser.add_argument("--jsonl-out", default="")
     args = parser.parse_args()
 
@@ -181,11 +179,11 @@ def main():
     ids = load_ids(tokenizer, args, args.max_tokens, "cuda")
     seq_len = ids.numel() - 1
     ids = ids[: seq_len + 1]
-    imodel = Qwen3IntOnlyModel(seq_len, model_dir=args.model_dir, packed_dir=args.packed_dir, use_r3=args.use_r3, split_attn=args.split_attn)
+    imodel = Qwen3IntOnlyModel(seq_len, model_dir=args.model_dir, packed_dir=args.packed_dir, use_r3=True, fast_hadamard=False)
     embed, _lm_head, _final_norm, fweights = load_packed_qwen3(args.packed_dir)
     for weights in fweights:
         attach_dequant_fp(weights)
-    r3 = random_hadamard_rotation(imodel.config.head_dim, ROTATE_SEED + 2, "cuda") if args.use_r3 else None
+    r3 = random_hadamard_rotation(imodel.config.head_dim, ROTATE_SEED + 2, "cuda")
     targets = sorted(set(parse_layers(args.layers, args.layer)))
     max_layer = targets[-1]
     xf = embed[ids[:-1]]
@@ -211,8 +209,8 @@ def main():
                         "eval_dataset": args.eval_dataset,
                         "eval_parquet": args.eval_parquet,
                         "eval_text": args.eval_text,
-                        "use_r3": args.use_r3,
-                        "split_attn": args.split_attn,
+                        "use_r3": True,
+                        "fused_static": True,
                     }
                 )
                 f.write(json.dumps(row, sort_keys=True) + "\n")

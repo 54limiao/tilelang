@@ -11,7 +11,6 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from examples.qwen3_int_only.model import (
     Q15_16,
     QWEN3_0_6B,
-    Qwen3FloatModel,
     Qwen3IntOnlyModel,
     parse_layer_set,
 )
@@ -170,11 +169,6 @@ def hf_logits(model, windows, cache_prompt, tokenizer):
 
 
 @torch.no_grad()
-def local_float_logits(model, window, layers, verbose):
-    return model.logits(window[:-1], layers=layers, verbose=verbose).float()
-
-
-@torch.no_grad()
 def build_cache_kv(hf_model, tokenizer, cache_prompt, layers, use_r2, use_r3):
     if not cache_prompt:
         return None, 0
@@ -211,35 +205,30 @@ def prepare_eval(args):
         hf_model = AutoModelForCausalLM.from_pretrained(
             args.model_dir, local_files_only=True, trust_remote_code=True, dtype=torch.bfloat16
         ).to("cuda")
-    local_model = None
-    if args.backend == "local-float" or args.compare_backend == "local-float":
-        local_model = Qwen3FloatModel(seq_len, model_dir=args.model_dir)
 
     cache_kv, cache_len = None, 0
     if args.backend == "int-only":
         _packed_r1, packed_r2 = packed_flags(args.packed_dir)
         cache_kv, cache_len = build_cache_kv(
-            hf_model, tokenizer, args.cache_prompt, max(layer_sweep), args.use_r2 or packed_r2, args.use_r3
+            hf_model, tokenizer, args.cache_prompt, max(layer_sweep), args.use_r2 or packed_r2, True
         )
         int_model = Qwen3IntOnlyModel(
             seq_len,
             model_dir=args.model_dir,
             packed_dir=args.packed_dir,
             cache_len=cache_len,
-            use_r3=args.use_r3,
-            split_attn=args.split_attn,
-            fused_attn=args.fused_attn,
-            fast_hadamard=args.fast_hadamard,
+            use_r3=True,
+            fast_hadamard=True,
             mlp_i16=args.mlp_i16,
             mlp_i16_layers=parse_layer_set(args.mlp_i16_layers),
         )
     else:
         int_model = None
-    return tokenizer, windows, hf_model, local_model, int_model, cache_kv, layer_sweep
+    return tokenizer, windows, hf_model, int_model, cache_kv, layer_sweep
 
 
 @torch.no_grad()
-def run_eval(args, tokenizer, windows, hf_model, local_model, int_model, cache_kv, layers):
+def run_eval(args, tokenizer, windows, hf_model, int_model, cache_kv, layers):
     acc = new_acc()
     window_rows = []
     for start in range(0, windows.shape[0], args.batch_size):
@@ -247,8 +236,6 @@ def run_eval(args, tokenizer, windows, hf_model, local_model, int_model, cache_k
         golden = None
         if args.compare_backend == "hf":
             golden = hf_logits(hf_model, batch, args.cache_prompt, tokenizer)
-        elif args.compare_backend == "local-float":
-            golden = torch.stack([local_float_logits(local_model, row, layers, False) for row in batch])
 
         if args.backend == "hf":
             logits = hf_logits(hf_model, batch, args.cache_prompt, tokenizer)
@@ -258,15 +245,6 @@ def run_eval(args, tokenizer, windows, hf_model, local_model, int_model, cache_k
                     wacc = new_acc()
                     ref = None if golden is None else golden[idx]
                     add_metrics(wacc, logits[idx], batch[idx, 1:], ref)
-                    window_rows.append((start + idx, finish_metrics(wacc)))
-        elif args.backend == "local-float":
-            for idx, row in enumerate(batch):
-                logits = local_float_logits(local_model, row, layers, args.verbose)
-                ref = None if golden is None else golden[idx]
-                add_metrics(acc, logits, row[1:], ref)
-                if args.jsonl_windows:
-                    wacc = new_acc()
-                    add_metrics(wacc, logits, row[1:], ref)
                     window_rows.append((start + idx, finish_metrics(wacc)))
         else:
             for idx, row in enumerate(batch):
@@ -283,9 +261,9 @@ def run_eval(args, tokenizer, windows, hf_model, local_model, int_model, cache_k
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-dir", default="/code/Qwen3-0.6B")
-    parser.add_argument("--packed-dir")
-    parser.add_argument("--backend", choices=["hf", "local-float", "int-only"], default="local-float")
-    parser.add_argument("--compare-backend", choices=["none", "hf", "local-float"], default="none")
+    parser.add_argument("--packed-dir", default="/tmp/Qwen3-0.6B-static-calib-32x2048")
+    parser.add_argument("--backend", choices=["hf", "int-only"], default="int-only")
+    parser.add_argument("--compare-backend", choices=["none", "hf"], default="hf")
     parser.add_argument("--max-tokens", type=int, default=2049)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-batches", type=int, default=1)
@@ -296,21 +274,17 @@ def main():
     parser.add_argument("--layers", type=int)
     parser.add_argument("--layer-sweep", default="")
     parser.add_argument("--verbose", action="store_true")
-    parser.add_argument("--cache-prompt")
+    parser.add_argument("--cache-prompt", default="你是一个有用而无害的聊天助手。")
     parser.add_argument("--use-r1", action="store_true")
     parser.add_argument("--use-r2", action="store_true")
-    parser.add_argument("--use-r3", action="store_true")
-    parser.add_argument("--split-attn", action="store_true")
-    parser.add_argument("--fused-attn", action="store_true")
-    parser.add_argument("--fast-hadamard", action="store_true")
     parser.add_argument("--mlp-i16", action="store_true")
     parser.add_argument("--mlp-i16-layers", default="")
     parser.add_argument("--jsonl-out", default="")
     parser.add_argument("--jsonl-windows", action="store_true")
     args = parser.parse_args()
-    tokenizer, windows, hf_model, local_model, int_model, cache_kv, layer_sweep = prepare_eval(args)
+    tokenizer, windows, hf_model, int_model, cache_kv, layer_sweep = prepare_eval(args)
     for layers in layer_sweep:
-        metrics, window_rows = run_eval(args, tokenizer, windows, hf_model, local_model, int_model, cache_kv, layers)
+        metrics, window_rows = run_eval(args, tokenizer, windows, hf_model, int_model, cache_kv, layers)
         if args.layer_sweep:
             print(f"layers={layers} ", end="")
         print_metrics(args.backend, metrics, args.compare_backend)
@@ -326,12 +300,11 @@ def main():
                 "eval_parquet": args.eval_parquet,
                 "eval_text": args.eval_text,
                 "eval_column": args.eval_column,
-                "split_attn": args.split_attn,
-                "fused_attn": args.fused_attn,
-                "fast_hadamard": args.fast_hadamard,
                 "use_r1": args.use_r1,
                 "use_r2": args.use_r2,
-                "use_r3": args.use_r3,
+                "use_r3": True,
+                "fused_static": True,
+                "fast_hadamard": True,
                 "mlp_i16": args.mlp_i16,
                 "mlp_i16_layers": args.mlp_i16_layers,
             }
