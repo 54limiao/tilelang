@@ -22,19 +22,19 @@ Current 2048-token FineWeb quality result against HF bf16:
 
 Kernel profile for the int-only LLM block path: 2048 tokens, 28 layers, prefix KV cache enabled, 16 measured repeats.
 
-| kernel | total ms | math TOPS | math util | tc TOPS | tc util | pct |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| attention_i8 | 347.574 | 44.50 | 7.13% | 89.01 | 14.26% | 46.18% |
-| linear_i8 | 121.594 | 189.89 | 30.43% | 189.89 | 30.43% | 16.16% |
-| linear_i16 | 79.248 | 72.84 | 11.67% | 145.68 | 23.35% | 10.53% |
-| rope_sq8 | 61.556 | - | - | - | - | 8.18% |
-| rms_q15 | 57.412 | - | - | - | - | 7.63% |
-| rms_sq8 | 39.517 | - | - | - | - | 5.25% |
-| silu_i16 | 29.464 | - | - | - | - | 3.92% |
-| quant_v_i8 | 16.205 | - | - | - | - | 2.15% |
-| total | 752.570 | 58.91 | 9.44% | 87.13 | 13.96% | 100.00% |
+| kernel | total ms | math TOPS | tc TOPS | tc util | pct |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| attention_i8 | 347.574 | 44.50 | 89.01 | 14.26% | 46.18% |
+| linear_i8 | 121.594 | 189.89 | 189.89 | 30.43% | 16.16% |
+| linear_i16 | 79.248 | 72.84 | 145.68 | 23.35% | 10.53% |
+| rope_sq8 | 61.556 | - | - | - | 8.18% |
+| rms_q15 | 57.412 | - | - | - | 7.63% |
+| rms_sq8 | 39.517 | - | - | - | 5.25% |
+| silu_i16 | 29.464 | - | - | - | 3.92% |
+| quant_v_i8 | 16.205 | - | - | - | 2.15% |
+| total | 752.570 | 58.91 | 87.13 | 13.96% | 100.00% |
 
-Utilization uses the A100 int8 tensorcore peak, 624 TOPS. `math TOPS` is the model matmul work, counted as `2MNK / time`. `tc TOPS` is the int8 tensorcore-equivalent work issued by the current kernels. The `linear_i16_down` kernel implements `int16@int8` as two `int8@int8` GEMMs over the high 8 bits and middle 7 bits, so its `tc TOPS` is counted as 2x the math work. The current `attention_i8` kernel recomputes QK and computes P16@V8 as two int8 GEMMs over the high 8 bits and middle 7 bits of P, so its `tc TOPS` is counted as `2 * QK + 2 * PV`.
+Utilization uses the A100 int8 tensorcore peak, 624 TOPS. `math TOPS` is the model matmul work, counted as `2MNK / time`. `tc TOPS` is the int8 tensorcore-equivalent work issued by the current kernels. The `linear_i16_down` kernel implements `int16@int8` as two `int8@int8` GEMMs over the high 8 bits and middle 7 bits, so its `tc TOPS` is counted as 2x the math work. The current `attention_i8` kernel computes QK once for online softmax statistics and recomputes QK for PV, then computes P16@V8 as two int8 GEMMs over the high 8 bits and middle 7 bits of P, so its `tc TOPS` counts two QK GEMMs plus two PV GEMMs.
 
 The first run writes `qwen3_int_only.safetensors` and `timestamp`; later runs skip packing when the pack matches the current static schema. Use `FORCE_PACK=1 examples/qwen3_int_only/test_static_path.sh` to rebuild.
 
@@ -49,3 +49,5 @@ Main quantization path:
 - comparison: int-only logits are compared with HF bf16 logits using PPL, cosine, MSE, MAE, max_abs, and rel_mse
 
 The showcase implementation is in `model.py` and `kernels.py`; packing, QuaRot, PPL, and profiling live under `utils/`.
+
+Kernel numpy prototypes live under `utils/proto/` and can be checked with `python -m examples.qwen3_int_only.utils.proto.run_all`.
