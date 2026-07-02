@@ -388,6 +388,7 @@ def linear_i8(rows, in_features, out_features, block_m=64, block_n=128, block_k=
             x_shared = T.alloc_shared((block_m, block_k), "int8")
             w_shared = T.alloc_shared((block_n, block_k), "int8")
             acc = T.alloc_fragment((block_m, block_n), "int32")
+            y_shared = T.alloc_shared((block_m, block_n), "int32")
 
             T.use_swizzle(panel_size=10, enable=enable_swizzle)
             T.clear(acc)
@@ -397,7 +398,9 @@ def linear_i8(rows, in_features, out_features, block_m=64, block_n=128, block_k=
                 T.gemm(x_shared, w_shared, acc, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
 
             for m, n in T.Parallel(block_m, block_n):
-                Y[br * block_m + m, bo * block_n + n] = T.fix.quant(acc[m, n], scale=QT[bo * block_n + n], out_dtype="int32")
+                acc[m, n] = T.fix.quant(acc[m, n], scale=QT[bo * block_n + n], out_dtype="int32")
+            T.copy(acc, y_shared)
+            T.copy(y_shared, Y[br * block_m, bo * block_n])
 
     return main
 
