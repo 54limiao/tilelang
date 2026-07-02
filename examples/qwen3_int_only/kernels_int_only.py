@@ -388,13 +388,15 @@ def silu_hadamard_i8(rows, cols, block_dim=128):
 def _linear_i8_cfg(rows, in_features, out_features):
     # Empirical A100 int8 GEMM tiling. Large problems (big K and N) saturate the
     # tensorcores best with a 128x128x64 tile (block_k=64, more N reuse); small
-    # problems (0.6B, K<=3072) prefer a deeper 64x128x128 tile. Values divide the
-    # real Qwen hidden/intermediate sizes (multiples of 128).
+    # 0.6B projections prefer fewer pipeline stages, while the narrow down_proj
+    # shape is faster with a 64-wide N tile.
     big = in_features >= 4096 and out_features >= 4096
     if big and rows % 128 == 0 and in_features % 64 == 0 and out_features % 128 == 0:
         return dict(block_m=128, block_n=128, block_k=64, num_stages=3, threads=128)
+    if rows % 64 == 0 and in_features >= 2048 and out_features <= 2048 and in_features % 128 == 0 and out_features % 64 == 0:
+        return dict(block_m=64, block_n=64, block_k=128, num_stages=3, threads=128)
     if rows % 64 == 0 and in_features % 128 == 0 and out_features % 128 == 0:
-        return dict(block_m=64, block_n=128, block_k=128, num_stages=3, threads=128)
+        return dict(block_m=64, block_n=128, block_k=128, num_stages=2, threads=128)
     return dict(block_m=64, block_n=64, block_k=64, num_stages=2, threads=128)
 
 

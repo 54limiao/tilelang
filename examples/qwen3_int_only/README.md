@@ -104,25 +104,25 @@ Kernel profile for the hybrid LLM block path: 2048 tokens, 28 layers, prefix KV 
 
 | kernel | total ms | math TOPS | tc TOPS | tc util | pct |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| attention_hybrid | 306.169 | 50.52 | 75.78 | 12.14% | 45.13% |
-| linear_i8 | 149.406 | 193.18 | 193.18 | 30.96% | 22.02% |
-| qk_norm_rope_quant_hybrid | 139.517 | - | - | - | 20.56% |
-| silu_hadamard_quant_hybrid | 36.374 | - | - | - | 5.36% |
-| rms_quant_hybrid | 31.554 | - | - | - | 4.65% |
-| quant_v_i8 | 15.460 | - | - | - | 2.28% |
-| total | 678.480 | 65.33 | 76.75 | 12.30% | 100.00% |
+| attention_hybrid | 300.833 | 51.42 | 77.13 | 12.36% | 45.73% |
+| linear_i8 | 139.345 | 207.13 | 207.13 | 33.19% | 21.18% |
+| qk_norm_rope_quant_hybrid | 137.258 | - | - | - | 20.86% |
+| silu_hadamard_quant_hybrid | 34.060 | - | - | - | 5.18% |
+| rms_quant_hybrid | 31.219 | - | - | - | 4.75% |
+| quant_v_i8 | 15.201 | - | - | - | 2.31% |
+| total | 657.916 | 67.38 | 79.14 | 12.68% | 100.00% |
 
 Kernel profile for the int-only LLM block path: 2048 tokens, 28 layers, prefix KV cache enabled, 16 measured repeats.
 
 | kernel | total ms | math TOPS | tc TOPS | tc util | pct |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| attention_i8 | 248.985 | 62.13 | 93.19 | 14.93% | 36.41% |
-| qk_norm_rope_i8 | 202.130 | - | - | - | 29.56% |
-| linear_i8 | 148.222 | 194.72 | 194.72 | 31.21% | 21.68% |
-| rms_sq8 | 37.520 | - | - | - | 5.49% |
-| silu_hadamard_i8 | 31.480 | - | - | - | 4.60% |
-| quant_v_i8 | 15.464 | - | - | - | 2.26% |
-| total | 683.801 | 64.83 | 76.14 | 12.20% | 100.00% |
+| attention_i8 | 256.633 | 60.27 | 90.41 | 14.49% | 37.22% |
+| qk_norm_rope_i8 | 206.598 | - | - | - | 29.96% |
+| linear_i8 | 144.498 | 199.74 | 199.74 | 32.01% | 20.95% |
+| rms_sq8 | 35.438 | - | - | - | 5.14% |
+| silu_hadamard_i8 | 31.261 | - | - | - | 4.53% |
+| quant_v_i8 | 15.141 | - | - | - | 2.20% |
+| total | 689.568 | 64.29 | 75.50 | 12.10% | 100.00% |
 
 ## Qwen3-14B
 
@@ -135,29 +135,29 @@ Kernel profile for the int-only LLM block path: 2048 tokens, 28 layers, prefix K
 | hybrid | 2048 | 3.062984 | 21.391299 | 0.98538696 | 4.82325177e-01 |
 | int-only | 2048 | 3.087627 | 21.924997 | 0.96796332 | 1.08189079e+00 |
 
-Kernel profile for the hybrid LLM block path: 2048 tokens, 40 layers, prefix KV cache enabled, 8 measured repeats.
+Kernel profile for the hybrid LLM block path: 2048 tokens, 40 layers, prefix KV cache enabled, 16 measured repeats.
 
 | kernel | total ms | math TOPS | tc TOPS | tc util | pct |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| linear_i8 | 1040.170 | 416.21 | 416.21 | 66.70% | 55.86% |
-| attention_hybrid | 475.812 | 58.05 | 87.08 | 13.95% | 25.55% |
-| qk_norm_rope_quant_hybrid | 182.468 | - | - | - | 9.80% |
-| silu_hadamard_quant_hybrid | 84.561 | - | - | - | 4.54% |
-| rms_quant_hybrid | 68.081 | - | - | - | 3.66% |
-| quant_v_i8 | 10.944 | - | - | - | 0.59% |
-| total | 1862.037 | 247.34 | 254.76 | 40.83% | 100.00% |
+| linear_i8 | 2093.133 | 413.67 | 413.67 | 66.29% | 55.80% |
+| attention_hybrid | 953.622 | 57.93 | 86.90 | 13.93% | 25.42% |
+| qk_norm_rope_quant_hybrid | 365.161 | - | - | - | 9.73% |
+| silu_hadamard_quant_hybrid | 173.267 | - | - | - | 4.62% |
+| rms_quant_hybrid | 143.268 | - | - | - | 3.82% |
+| quant_v_i8 | 22.884 | - | - | - | 0.61% |
+| total | 3751.334 | 245.54 | 252.91 | 40.53% | 100.00% |
 
-Kernel profile for the int-only LLM block path: 2048 tokens, 40 layers, prefix KV cache enabled, 8 measured repeats.
+Kernel profile for the int-only LLM block path: 2048 tokens, 40 layers, prefix KV cache enabled, 16 measured repeats.
 
 | kernel | total ms | math TOPS | tc TOPS | tc util | pct |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| linear_i8 | 1039.107 | 416.64 | 416.64 | 66.77% | 56.05% |
-| attention_i8 | 384.670 | 71.81 | 107.71 | 17.26% | 20.75% |
-| qk_norm_rope_i8 | 272.695 | - | - | - | 14.71% |
-| silu_hadamard_i8 | 76.718 | - | - | - | 4.14% |
-| rms_sq8 | 69.580 | - | - | - | 3.75% |
-| quant_v_i8 | 11.035 | - | - | - | 0.60% |
-| total | 1853.806 | 248.44 | 255.89 | 41.01% | 100.00% |
+| linear_i8 | 2081.866 | 415.91 | 415.91 | 66.65% | 55.89% |
+| attention_i8 | 772.077 | 71.55 | 107.33 | 17.20% | 20.73% |
+| qk_norm_rope_i8 | 544.309 | - | - | - | 14.61% |
+| silu_hadamard_i8 | 156.584 | - | - | - | 4.20% |
+| rms_sq8 | 146.952 | - | - | - | 3.94% |
+| quant_v_i8 | 23.271 | - | - | - | 0.62% |
+| total | 3725.059 | 247.27 | 254.69 | 40.82% | 100.00% |
 
 On 0.6B, attention is a large share because the MLP/linear matrices are small. On 14B, the same 2048-token attention work is much less dominant relative to the hidden/intermediate-size linear work, so `linear_i8` becomes the main cost.
 
