@@ -376,7 +376,27 @@ def silu_hadamard_i8(rows, cols, block_dim=128):
     return main
 
 
-def linear_i8(rows, in_features, out_features, block_m=64, block_n=128, block_k=128, num_stages=3, threads=128, enable_swizzle=True):
+def _linear_i8_cfg(rows, in_features, out_features):
+    # Empirical A100 int8 GEMM tiling. Large problems (big K and N) saturate the
+    # tensorcores best with a 128x128x64 tile (block_k=64, more N reuse); small
+    # problems (0.6B, K<=3072) prefer a deeper 64x128x128 tile. Values divide the
+    # real Qwen hidden/intermediate sizes (multiples of 128).
+    big = in_features >= 4096 and out_features >= 4096
+    if big and rows % 128 == 0 and in_features % 64 == 0 and out_features % 128 == 0:
+        return dict(block_m=128, block_n=128, block_k=64, num_stages=3, threads=128)
+    if rows % 64 == 0 and in_features % 128 == 0 and out_features % 128 == 0:
+        return dict(block_m=64, block_n=128, block_k=128, num_stages=3, threads=128)
+    return dict(block_m=64, block_n=64, block_k=64, num_stages=2, threads=128)
+
+
+def linear_i8(rows, in_features, out_features, block_m=None, block_n=None, block_k=None, num_stages=None, threads=None, enable_swizzle=True):
+    cfg = _linear_i8_cfg(rows, in_features, out_features)
+    block_m = cfg["block_m"] if block_m is None else block_m
+    block_n = cfg["block_n"] if block_n is None else block_n
+    block_k = cfg["block_k"] if block_k is None else block_k
+    num_stages = cfg["num_stages"] if num_stages is None else num_stages
+    threads = cfg["threads"] if threads is None else threads
+
     @T.prim_func
     def main(
         X: T.Tensor((rows, in_features), "int8"),
