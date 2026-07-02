@@ -3,8 +3,11 @@
 Run the standard 2048-token quality check:
 
 ```bash
+# export MODEL_DIR=/publicdata/huggingface.co/Qwen/Qwen3-14B
 examples/qwen3_int_only/test_static_path.sh
 ```
+
+The script defaults to Qwen3-0.6B. Export `MODEL_DIR=/publicdata/huggingface.co/Qwen/Qwen3-14B` to run another Qwen3 model; the default pack path follows the model name under `/tmp`, and `PACKED_DIR=...` can override it. For large models, copy the HF model directory to `/tmp` or `/code` first and export that local path to avoid slow publicdata reads.
 
 Default inputs:
 
@@ -19,6 +22,15 @@ Current 2048-token FineWeb quality result against HF bf16:
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | HF bf16 | 2048 | 3.801437 | 44.765483 | - | - | - |
 | int-only | 2048 | 3.807890 | 45.055291 | 0.99143751 | 1.94956367e-01 | 1.70894618e-02 |
+
+Current Qwen3-14B 2048-token FineWeb quality result against HF bf16:
+
+| backend | tokens | loss | ppl | cos | mse | rel_mse |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| HF bf16 | 2048 | pending local-model rerun | pending local-model rerun | - | - | - |
+| int-only | 2048 | 9.610601 | 14922.141941 | 0.53104687 | 1.39142853e+01 | 8.44334629e-01 |
+
+The 14B quality result is currently not acceptable and needs debugging before it should be treated as a working 14B deployment result. HF-only 14B measurement from publicdata was interrupted because loading the first shard took more than two minutes; copy the model to `/tmp` or `/code` and rerun to fill the HF bf16 row.
 
 Qwen3-0.6B kernel profile for the int-only LLM block path: 2048 tokens, 28 layers, prefix KV cache enabled, 16 measured repeats.
 

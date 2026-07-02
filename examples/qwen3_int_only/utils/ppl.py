@@ -1,7 +1,9 @@
 import argparse
 import gzip
+import importlib.util
 import json
 import math
+import sys
 from pathlib import Path
 
 import torch
@@ -24,6 +26,17 @@ DATASETS = {
 def packed_use_r2(packed_dir):
     with safe_open(f"{packed_dir}/qwen3_int_only.safetensors", framework="pt", device="cpu") as f:
         return (f.metadata() or {}).get("use_r2") == "1"
+
+
+def load_cache_scales(packed_dir, layers, device="cuda"):
+    with safe_open(f"{packed_dir}/qwen3_int_only.safetensors", framework="pt", device="cpu") as f:
+        return [
+            (
+                f.get_tensor(f"layers.{idx}.k_post_rope_i8.scale").to(device),
+                f.get_tensor(f"layers.{idx}.v_i8.scale").to(device),
+            )
+            for idx in range(layers)
+        ]
 
 
 def resolve_dataset(name):
@@ -77,15 +90,19 @@ def add_metrics(acc, logits, labels, golden=None):
     acc["loss_sum"] += float(loss_sum)
     acc["tokens"] += int(labels.numel())
     if golden is not None:
-        got = logits.reshape(-1)
-        ref = golden.float().reshape(-1)
-        diff = got - ref
-        acc["dot"] += float(torch.dot(got, ref))
-        acc["got2"] += float(torch.dot(got, got))
-        acc["ref2"] += float(torch.dot(ref, ref))
-        acc["se"] += float(torch.dot(diff, diff))
-        acc["ae"] += float(torch.sum(torch.abs(diff)))
-        acc["max_abs"] = max(acc["max_abs"], float(torch.max(torch.abs(diff))))
+        got = logits.detach().cpu().reshape(-1)
+        ref = golden.detach().float().cpu().reshape(-1)
+        for start in range(0, got.numel(), 16 * 1024 * 1024):
+            end = min(start + 16 * 1024 * 1024, got.numel())
+            got_chunk = got[start:end]
+            ref_chunk = ref[start:end]
+            diff = got_chunk - ref_chunk
+            acc["dot"] += float(torch.dot(got_chunk, ref_chunk))
+            acc["got2"] += float(torch.dot(got_chunk, got_chunk))
+            acc["ref2"] += float(torch.dot(ref_chunk, ref_chunk))
+            acc["se"] += float(torch.dot(diff, diff))
+            acc["ae"] += float(torch.sum(torch.abs(diff)))
+            acc["max_abs"] = max(acc["max_abs"], float(torch.max(torch.abs(diff))))
         acc["logits"] += int(got.numel())
 
 
@@ -110,6 +127,25 @@ def print_metrics(backend, metrics, compare_backend="hf"):
     print(msg)
 
 
+def load_hf_model(model_dir):
+    print("loading HF model", file=sys.stderr, flush=True)
+    kwargs = dict(local_files_only=True, trust_remote_code=True, dtype=torch.bfloat16)
+    if importlib.util.find_spec("accelerate") is not None:
+        kwargs["device_map"] = {"": "cuda"}
+        model = AutoModelForCausalLM.from_pretrained(model_dir, **kwargs)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(model_dir, **kwargs).to("cuda")
+    print("loaded HF model", file=sys.stderr, flush=True)
+    return model
+
+
+def hf_metrics(model, windows, cache_prompt, tokenizer):
+    acc = new_acc()
+    logits = hf_logits(model, windows, cache_prompt, tokenizer)
+    add_metrics(acc, logits, windows[:, 1:])
+    return finish_metrics(acc), logits.cpu()
+
+
 @torch.no_grad()
 def hf_logits(model, windows, cache_prompt, tokenizer):
     prefix = torch.tensor(tokenizer(cache_prompt, add_special_tokens=False).input_ids, device=windows.device, dtype=torch.long)
@@ -118,7 +154,7 @@ def hf_logits(model, windows, cache_prompt, tokenizer):
 
 
 @torch.no_grad()
-def build_cache_kv(hf_model, tokenizer, cache_prompt, layer_weights, use_r2, config):
+def build_cache_kv(hf_model, tokenizer, cache_prompt, cache_scales, use_r2, config):
     cache_ids = torch.tensor(tokenizer(cache_prompt, add_special_tokens=False).input_ids, device="cuda", dtype=torch.long)
     past = hf_model(cache_ids[None, :], use_cache=True).past_key_values
     if hasattr(past, "layers"):
@@ -128,13 +164,13 @@ def build_cache_kv(hf_model, tokenizer, cache_prompt, layer_weights, use_r2, con
     r2 = random_hadamard_rotation(config.head_dim, ROTATE_SEED + 1, "cuda") if use_r2 else None
     r3 = random_hadamard_rotation(config.head_dim, ROTATE_SEED + 2, "cuda")
     cache_kv = []
-    for weights, (k, v) in zip(layer_weights, past[: len(layer_weights)]):
+    for (k_scale, v_scale), (k, v) in zip(cache_scales, past[: len(cache_scales)]):
         k = (k[0].float().contiguous().to(torch.float64) @ r3.to(torch.float64)).to(torch.float32)
         v = v[0].float().contiguous()
         if r2 is not None:
             v = (v.to(torch.float64) @ r2.to(torch.float64)).to(torch.float32)
-        kq = quant_i8_static_q15_16(k, weights.k_post_rope_i8_scale[:, None])
-        vq = quant_i8_static_q15_16(v, weights.v_i8_scale[:, None])
+        kq = quant_i8_static_q15_16(k, k_scale[:, None])
+        vq = quant_i8_static_q15_16(v, v_scale[:, None])
         cache_kv.append((kq, vq))
     return cache_kv, int(cache_ids.numel())
 
@@ -167,19 +203,28 @@ def main():
     ids = load_ids(tokenizer, args, window_tokens * args.batch_size * args.num_batches, "cuda")
     windows = ids[: (ids.numel() // window_tokens) * window_tokens].reshape(-1, window_tokens)
     windows = windows[: args.batch_size * args.num_batches]
-    hf_model = AutoModelForCausalLM.from_pretrained(args.model_dir, local_files_only=True, trust_remote_code=True, dtype=torch.bfloat16).to("cuda")
+    hf_model = load_hf_model(args.model_dir)
 
     if args.backend == "hf":
-        acc = new_acc()
-        logits = hf_logits(hf_model, windows, args.cache_prompt, tokenizer)
-        add_metrics(acc, logits, windows[:, 1:])
-        print_metrics("hf", finish_metrics(acc), "none")
+        metrics, _ = hf_metrics(hf_model, windows, args.cache_prompt, tokenizer)
+        print_metrics("hf", metrics, "none")
         return
 
-    _, _, _, packed_layers = load_packed_qwen3(args.packed_dir, config)
-    cache_kv, cache_len = build_cache_kv(hf_model, tokenizer, args.cache_prompt, packed_layers[: args.layers], args.use_r2 or packed_use_r2(args.packed_dir), config)
+    print("running HF golden", file=sys.stderr, flush=True)
+    if args.compare_backend == "hf":
+        hf_stats, golden = hf_metrics(hf_model, windows, args.cache_prompt, tokenizer)
+        print_metrics("hf", hf_stats, "none")
+    else:
+        golden = None
+    use_r2 = args.use_r2 or packed_use_r2(args.packed_dir)
+    cache_scales = load_cache_scales(args.packed_dir, args.layers)
+    print("building cache kv", file=sys.stderr, flush=True)
+    cache_kv, cache_len = build_cache_kv(hf_model, tokenizer, args.cache_prompt, cache_scales, use_r2, config)
+    del hf_model, cache_scales
+    torch.cuda.empty_cache()
+    print("loading int-only model", file=sys.stderr, flush=True)
     int_model = Qwen3IntOnlyModel(windows.shape[1] - 1, model_dir=args.model_dir, packed_dir=args.packed_dir, config=config, cache_len=cache_len)
-    golden = hf_logits(hf_model, windows, args.cache_prompt, tokenizer) if args.compare_backend == "hf" else None
+    print("running int-only logits", file=sys.stderr, flush=True)
     acc = new_acc()
     for idx, row in enumerate(windows):
         logits = int_model.logits(row[:-1], layers=args.layers, cache_kv=cache_kv).float()
