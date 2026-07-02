@@ -5,9 +5,9 @@ import torch
 from safetensors import safe_open
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from examples.qwen3_int_only.model import Q15_16, QWEN3_0_6B, Qwen3IntOnlyBlock
+from examples.qwen3_int_only.model import Q15_16, Qwen3IntOnlyBlock
 from examples.qwen3_int_only.utils.ppl import iter_texts, quant_i8_static_q15_16
-from examples.qwen3_int_only.utils import ROTATE_SEED, load_packed_qwen3, q15_16, random_hadamard_rotation, rope_tables_q15_16
+from examples.qwen3_int_only.utils import ROTATE_SEED, Qwen3Config, load_packed_qwen3, q15_16, random_hadamard_rotation, rope_tables_q15_16
 
 
 DEFAULT_MODEL_DIR = "/publicdata/huggingface.co/Qwen/Qwen3-0.6B"
@@ -101,7 +101,7 @@ class Profiler:
 
 
 @torch.no_grad()
-def build_cache_kv(model_dir, tokenizer, cache_prompt, layer_weights, use_r2=True):
+def build_cache_kv(model_dir, tokenizer, cache_prompt, layer_weights, config, use_r2=True):
     hf_model = AutoModelForCausalLM.from_pretrained(model_dir, local_files_only=True, trust_remote_code=True, dtype=torch.bfloat16).to("cuda")
     cache_ids = torch.tensor(tokenizer(cache_prompt, add_special_tokens=False).input_ids, device="cuda", dtype=torch.long)
     past = hf_model(cache_ids[None, :], use_cache=True).past_key_values
@@ -109,8 +109,8 @@ def build_cache_kv(model_dir, tokenizer, cache_prompt, layer_weights, use_r2=Tru
         past = [(layer.keys, layer.values) for layer in past.layers]
     elif hasattr(past, "to_legacy_cache"):
         past = past.to_legacy_cache()
-    r2 = random_hadamard_rotation(QWEN3_0_6B.head_dim, ROTATE_SEED + 1, "cuda") if use_r2 else None
-    r3 = random_hadamard_rotation(QWEN3_0_6B.head_dim, ROTATE_SEED + 2, "cuda")
+    r2 = random_hadamard_rotation(config.head_dim, ROTATE_SEED + 1, "cuda") if use_r2 else None
+    r3 = random_hadamard_rotation(config.head_dim, ROTATE_SEED + 2, "cuda")
     cache_kv = []
     for weights, (k, v) in zip(layer_weights, past[: len(layer_weights)]):
         k = k[0].float().contiguous()
@@ -167,6 +167,9 @@ def main():
     parser.add_argument("--jsonl-out", default="")
     args = parser.parse_args()
 
+    config = Qwen3Config.from_model_dir(args.model_dir)
+    if args.layers == 0:
+        args.layers = config.num_hidden_layers
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir, local_files_only=True, trust_remote_code=True)
     ids = []
     for text in iter_texts("fineweb", "text"):
@@ -178,11 +181,11 @@ def main():
     seq_len -= seq_len % 32
     ids = torch.tensor(ids[:seq_len], device="cuda", dtype=torch.long)
     _packed_r1, packed_r2 = packed_flags(args.packed_dir)
-    embed, _, _, weights = load_packed_qwen3(args.packed_dir, QWEN3_0_6B)
-    cache_kv, cache_len = build_cache_kv(args.model_dir, tokenizer, args.cache_prompt, weights[: args.layers], packed_r2)
-    block = Qwen3IntOnlyBlock(seq_len, QWEN3_0_6B, cache_len=cache_len)
-    cos, sin, _ = rope_tables_q15_16(seq_len + cache_len, QWEN3_0_6B.head_dim, QWEN3_0_6B.rope_theta)
-    r3_q15 = q15_16(random_hadamard_rotation(QWEN3_0_6B.head_dim, ROTATE_SEED + 2))
+    embed, _, _, weights = load_packed_qwen3(args.packed_dir, config)
+    cache_kv, cache_len = build_cache_kv(args.model_dir, tokenizer, args.cache_prompt, weights[: args.layers], config, packed_r2)
+    block = Qwen3IntOnlyBlock(seq_len, config, cache_len=cache_len)
+    cos, sin, _ = rope_tables_q15_16(seq_len + cache_len, config.head_dim, config.rope_theta)
+    r3_q15 = q15_16(random_hadamard_rotation(config.head_dim, ROTATE_SEED + 2))
 
     def run_layers(prof):
         residual = q15_16(embed[ids])

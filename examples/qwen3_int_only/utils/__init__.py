@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+from pathlib import Path
 
 import torch
 from safetensors import safe_open
@@ -42,8 +44,53 @@ class Qwen3Config:
     def kv_size(self):
         return self.num_key_value_heads * self.head_dim
 
+    @staticmethod
+    def from_model_dir(model_dir):
+        data = json.loads((Path(model_dir) / "config.json").read_text(encoding="utf-8"))
+        return Qwen3Config(
+            hidden_size=int(data["hidden_size"]),
+            intermediate_size=int(data["intermediate_size"]),
+            num_hidden_layers=int(data["num_hidden_layers"]),
+            num_attention_heads=int(data["num_attention_heads"]),
+            num_key_value_heads=int(data["num_key_value_heads"]),
+            head_dim=int(data.get("head_dim", data["hidden_size"] // data["num_attention_heads"])),
+            rope_theta=float(data.get("rope_theta", 1_000_000.0)),
+            vocab_size=int(data["vocab_size"]),
+        )
+
 
 QWEN3_0_6B = Qwen3Config()
+
+
+class SafeTensorReader:
+    def __init__(self, model_dir):
+        self.model_dir = Path(model_dir)
+        index = self.model_dir / "model.safetensors.index.json"
+        self.weight_map = None
+        self.files = {}
+        if index.exists():
+            self.weight_map = json.loads(index.read_text(encoding="utf-8"))["weight_map"]
+        else:
+            self.single_file = self.model_dir / "model.safetensors"
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        for f in self.files.values():
+            f.__exit__(exc_type, exc, tb)
+
+    def _file_for(self, name):
+        if self.weight_map is None:
+            return self.single_file.name
+        return self.weight_map[name]
+
+    def get_tensor(self, name, device="cpu"):
+        file_name = self._file_for(name)
+        if file_name not in self.files:
+            f = safe_open(str(self.model_dir / file_name), framework="pt", device="cpu")
+            self.files[file_name] = f.__enter__()
+        return self.files[file_name].get_tensor(name).to(device)
 
 
 def q15_16(x):
@@ -237,13 +284,13 @@ def load_packed_qwen3(packed_dir, config=QWEN3_0_6B, device="cuda"):
 
 
 def load_embed_tokens(model_dir="/publicdata/huggingface.co/Qwen/Qwen3-0.6B", device="cuda"):
-    with safe_open(f"{model_dir}/model.safetensors", framework="pt", device="cpu") as f:
-        return f.get_tensor("model.embed_tokens.weight").to(torch.float32).to(device)
+    with SafeTensorReader(model_dir) as reader:
+        return reader.get_tensor("model.embed_tokens.weight").to(torch.float32).to(device)
 
 
 def load_lm_head(model_dir="/publicdata/huggingface.co/Qwen/Qwen3-0.6B", device="cuda"):
-    with safe_open(f"{model_dir}/model.safetensors", framework="pt", device="cpu") as f:
-        return f.get_tensor("lm_head.weight").to(torch.float32).to(device)
+    with SafeTensorReader(model_dir) as reader:
+        return reader.get_tensor("lm_head.weight").to(torch.float32).to(device)
 
 
 def rmsnorm_torch(x, weight):

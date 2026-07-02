@@ -21,15 +21,15 @@ CALIB_SEQ_LEN="${CALIB_SEQ_LEN:-2048}"
 CALIB_BATCHES="${CALIB_BATCHES:-32}"
 CALIB_PREFIX_TOKENS="${CALIB_PREFIX_TOKENS:-512}"
 FORCE_PACK="${FORCE_PACK:-0}"
+USE_R1="${USE_R1:-1}"
+USE_R2="${USE_R2:-1}"
+USE_R3="${USE_R3:-1}"
 START_TS="$(date +%s)"
 
 PREPACK_ARGS=(
   examples/qwen3_int_only/utils/prepack.py
   --model-dir "${MODEL_DIR}"
   --out-dir "${PACKED_DIR}"
-  --use-r1
-  --use-r2
-  --use-r3
   --calib-dataset "${CALIB_DATASET}"
   --calib-column "${CALIB_COLUMN}"
   --calib-seq-len "${CALIB_SEQ_LEN}"
@@ -37,6 +37,18 @@ PREPACK_ARGS=(
   --calib-prefix-tokens "${CALIB_PREFIX_TOKENS}"
   --cache-prompt "${CACHE_PROMPT}"
 )
+
+if [[ "${USE_R1}" == "1" ]]; then
+  PREPACK_ARGS+=(--use-r1)
+fi
+
+if [[ "${USE_R2}" == "1" ]]; then
+  PREPACK_ARGS+=(--use-r2)
+fi
+
+if [[ "${USE_R3}" == "1" ]]; then
+  PREPACK_ARGS+=(--use-r3)
+fi
 
 if [[ -n "${CALIB_PARQUET}" ]]; then
   PREPACK_ARGS+=(--calib-parquet "${CALIB_PARQUET}")
@@ -58,9 +70,15 @@ PPL_ARGS=(
   --batch-size "${BATCH_SIZE}"
   --num-batches "${NUM_BATCHES}"
   --cache-prompt "${CACHE_PROMPT}"
-  --use-r1
-  --use-r2
 )
+
+if [[ "${USE_R1}" == "1" ]]; then
+  PPL_ARGS+=(--use-r1)
+fi
+
+if [[ "${USE_R2}" == "1" ]]; then
+  PPL_ARGS+=(--use-r2)
+fi
 
 if [[ -n "${EVAL_PARQUET}" ]]; then
   PPL_ARGS+=(--eval-parquet "${EVAL_PARQUET}")

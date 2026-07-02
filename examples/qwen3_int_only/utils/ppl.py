@@ -8,8 +8,8 @@ import torch
 from safetensors import safe_open
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from examples.qwen3_int_only.model import Q15_16, QWEN3_0_6B, Qwen3IntOnlyModel
-from examples.qwen3_int_only.utils import ROTATE_SEED, load_packed_qwen3, random_hadamard_rotation
+from examples.qwen3_int_only.model import Q15_16, Qwen3IntOnlyModel
+from examples.qwen3_int_only.utils import ROTATE_SEED, Qwen3Config, load_packed_qwen3, random_hadamard_rotation
 
 
 DEFAULT_MODEL_DIR = "/publicdata/huggingface.co/Qwen/Qwen3-0.6B"
@@ -118,15 +118,15 @@ def hf_logits(model, windows, cache_prompt, tokenizer):
 
 
 @torch.no_grad()
-def build_cache_kv(hf_model, tokenizer, cache_prompt, layer_weights, use_r2):
+def build_cache_kv(hf_model, tokenizer, cache_prompt, layer_weights, use_r2, config):
     cache_ids = torch.tensor(tokenizer(cache_prompt, add_special_tokens=False).input_ids, device="cuda", dtype=torch.long)
     past = hf_model(cache_ids[None, :], use_cache=True).past_key_values
     if hasattr(past, "layers"):
         past = [(layer.keys, layer.values) for layer in past.layers]
     elif hasattr(past, "to_legacy_cache"):
         past = past.to_legacy_cache()
-    r2 = random_hadamard_rotation(QWEN3_0_6B.head_dim, ROTATE_SEED + 1, "cuda") if use_r2 else None
-    r3 = random_hadamard_rotation(QWEN3_0_6B.head_dim, ROTATE_SEED + 2, "cuda")
+    r2 = random_hadamard_rotation(config.head_dim, ROTATE_SEED + 1, "cuda") if use_r2 else None
+    r3 = random_hadamard_rotation(config.head_dim, ROTATE_SEED + 2, "cuda")
     cache_kv = []
     for weights, (k, v) in zip(layer_weights, past[: len(layer_weights)]):
         k = (k[0].float().contiguous().to(torch.float64) @ r3.to(torch.float64)).to(torch.float32)
@@ -153,12 +153,15 @@ def main():
     parser.add_argument("--eval-dataset", default="fineweb")
     parser.add_argument("--eval-parquet", default="")
     parser.add_argument("--eval-column", default="text")
-    parser.add_argument("--layers", type=int, default=QWEN3_0_6B.num_hidden_layers)
+    parser.add_argument("--layers", type=int, default=0)
     parser.add_argument("--cache-prompt", default="你是一个有用而无害的聊天助手。")
     parser.add_argument("--use-r1", action="store_true")
     parser.add_argument("--use-r2", action="store_true")
     args = parser.parse_args()
 
+    config = Qwen3Config.from_model_dir(args.model_dir)
+    if args.layers == 0:
+        args.layers = config.num_hidden_layers
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir, local_files_only=True, trust_remote_code=True)
     window_tokens = args.max_tokens + 1
     ids = load_ids(tokenizer, args, window_tokens * args.batch_size * args.num_batches, "cuda")
@@ -173,9 +176,9 @@ def main():
         print_metrics("hf", finish_metrics(acc), "none")
         return
 
-    _, _, _, packed_layers = load_packed_qwen3(args.packed_dir, QWEN3_0_6B)
-    cache_kv, cache_len = build_cache_kv(hf_model, tokenizer, args.cache_prompt, packed_layers[: args.layers], args.use_r2 or packed_use_r2(args.packed_dir))
-    int_model = Qwen3IntOnlyModel(windows.shape[1] - 1, model_dir=args.model_dir, packed_dir=args.packed_dir, cache_len=cache_len)
+    _, _, _, packed_layers = load_packed_qwen3(args.packed_dir, config)
+    cache_kv, cache_len = build_cache_kv(hf_model, tokenizer, args.cache_prompt, packed_layers[: args.layers], args.use_r2 or packed_use_r2(args.packed_dir), config)
+    int_model = Qwen3IntOnlyModel(windows.shape[1] - 1, model_dir=args.model_dir, packed_dir=args.packed_dir, config=config, cache_len=cache_len)
     golden = hf_logits(hf_model, windows, args.cache_prompt, tokenizer) if args.compare_backend == "hf" else None
     acc = new_acc()
     for idx, row in enumerate(windows):

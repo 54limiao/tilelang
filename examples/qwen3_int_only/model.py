@@ -12,7 +12,7 @@ from examples.qwen3_int_only.kernels import (
     silu_hadamard_i8,
     quant_v_i8,
 )
-from examples.qwen3_int_only.utils import ROTATE_SEED, QWEN3_0_6B, Qwen3BlockWeights, load_packed_qwen3, q15_16, random_hadamard_rotation, rope_tables_q15_16
+from examples.qwen3_int_only.utils import ROTATE_SEED, QWEN3_0_6B, Qwen3BlockWeights, Qwen3Config, load_packed_qwen3, q15_16, random_hadamard_rotation, rope_tables_q15_16
 from examples.qwen3_int_only.utils.lut import exp_lut_neg, rsqrt_lut, sigmoid_lut
 
 Q15_16 = 1 << 16
@@ -89,7 +89,8 @@ class Qwen3IntOnlyBlock:
 
 
 class Qwen3IntOnlyModel:
-    def __init__(self, seq_len, model_dir="/publicdata/huggingface.co/Qwen/Qwen3-0.6B", packed_dir="/tmp/Qwen3-0.6B-static-calib-32x2048", config=QWEN3_0_6B, cache_len=0, rotate_seed=ROTATE_SEED):
+    def __init__(self, seq_len, model_dir="/publicdata/huggingface.co/Qwen/Qwen3-0.6B", packed_dir="/tmp/Qwen3-0.6B-static-calib-32x2048", config=None, cache_len=0, rotate_seed=ROTATE_SEED):
+        config = Qwen3Config.from_model_dir(model_dir) if config is None else config
         self.seq_len = seq_len
         self.cache_len = cache_len
         self.config = config

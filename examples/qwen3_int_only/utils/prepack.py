@@ -10,7 +10,8 @@ from transformers import AutoTokenizer
 from examples.qwen3_int_only.utils.ppl import iter_texts
 from examples.qwen3_int_only.utils import (
     ROTATE_SEED,
-    QWEN3_0_6B,
+    Qwen3Config,
+    SafeTensorReader,
     per_channel_i8_weight,
     q15_16,
     hadamard_rotation,
@@ -81,6 +82,7 @@ def write_timestamp(path, args, calib_tokens, calib_seq_len, metadata=None):
                 f"calib_batches={value('calib_batches', args.calib_batches)}",
                 f"calib_prefix_tokens={value('calib_prefix_tokens', args.calib_prefix_tokens)}",
                 f"cache_prompt={value('cache_prompt', args.cache_prompt)}",
+                f"packed_layers={value('packed_layers', args.max_layers or 'all')}",
                 f"use_r1={value('use_r1', int(args.use_r1))}",
                 f"use_r2={value('use_r2', int(args.use_r2))}",
                 f"use_r3={value('use_r3', int(args.use_r3))}",
@@ -91,10 +93,17 @@ def write_timestamp(path, args, calib_tokens, calib_seq_len, metadata=None):
     )
 
 
-def current_pack_metadata(path):
+def current_pack_metadata(path, args, config):
     with safe_open(str(path), framework="pt", device="cpu") as f:
         keys = set(f.keys())
         metadata = f.metadata() or {}
+    if metadata.get("model_dir") != args.model_dir:
+        return None
+    if metadata.get("hidden_size") != str(config.hidden_size) or metadata.get("num_hidden_layers") != str(config.num_hidden_layers):
+        return None
+    expected_layers = str(args.max_layers or config.num_hidden_layers)
+    if metadata.get("packed_layers") != expected_layers:
+        return None
     ok = all(
         key in keys
         for key in (
@@ -217,6 +226,7 @@ def main():
     parser.add_argument("--calib-batches", type=int, default=0)
     parser.add_argument("--calib-prefix-tokens", type=int, default=0)
     parser.add_argument("--cache-prompt", default="")
+    parser.add_argument("--max-layers", type=int, default=0)
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
@@ -225,7 +235,9 @@ def main():
     path = out_dir / "qwen3_int_only.safetensors"
     timestamp = out_dir / "timestamp"
     calib_tokens, calib_seq_len = resolve_calib_shape(args)
-    metadata = current_pack_metadata(path) if path.exists() and not args.force else None
+    config = Qwen3Config.from_model_dir(args.model_dir)
+    metadata = current_pack_metadata(path, args, config) if path.exists() and not args.force else None
+    pack_layers = args.max_layers or config.num_hidden_layers
     if metadata is not None:
         if not timestamp.exists():
             write_timestamp(timestamp, args, calib_tokens, calib_seq_len, metadata)
@@ -236,25 +248,28 @@ def main():
     tensors = {}
     calib_weights = []
     calib_norms = []
-    r1 = random_hadamard_rotation(QWEN3_0_6B.hidden_size, args.rotate_seed, args.device) if args.use_r1 else None
-    r2 = random_hadamard_rotation(QWEN3_0_6B.head_dim, args.rotate_seed + 1, args.device) if args.use_r2 else None
-    r3 = random_hadamard_rotation(QWEN3_0_6B.head_dim, args.rotate_seed + 2, args.device) if args.use_r3 else None
-    down_hadamard = hadamard_rotation(QWEN3_0_6B.head_dim, args.device)
-    with safe_open(f"{args.model_dir}/model.safetensors", framework="pt", device="cpu") as f:
-        def tensor(name, device=args.device):
-            return f.get_tensor(name).to(torch.float32).to(device)
+    r1 = random_hadamard_rotation(config.hidden_size, args.rotate_seed, args.device) if args.use_r1 else None
+    r2 = random_hadamard_rotation(config.head_dim, args.rotate_seed + 1, args.device) if args.use_r2 else None
+    r3 = random_hadamard_rotation(config.head_dim, args.rotate_seed + 2, args.device) if args.use_r3 else None
+    down_hadamard = hadamard_rotation(config.head_dim, args.device)
+    with SafeTensorReader(args.model_dir) as reader:
+        def tensor(name, device=args.device, dtype=torch.float32):
+            out = reader.get_tensor(name, device)
+            return out if dtype is None else out.to(dtype)
 
-        embed = tensor("model.embed_tokens.weight")
-        lm_head = tensor("lm_head.weight")
+        embed = tensor("model.embed_tokens.weight", "cpu" if not args.use_r1 else args.device, None)
+        lm_head = tensor("lm_head.weight", "cpu" if not args.use_r1 else args.device, None)
         final_norm = tensor("model.norm.weight")
         if args.use_r1:
+            embed = embed.to(torch.float32)
+            lm_head = lm_head.to(torch.float32)
             embed = rotate_input(embed, r1)
             lm_head = rotate_norm_input(lm_head, final_norm, r1)
             final_norm = torch.ones_like(final_norm)
         tensors["model.embed_tokens.weight"] = embed.cpu().contiguous()
         tensors["lm_head.weight"] = lm_head.cpu().contiguous()
         tensors["model.norm.weight"] = q15_16(final_norm).cpu()
-        for layer_idx in range(QWEN3_0_6B.num_hidden_layers):
+        for layer_idx in range(pack_layers):
             src = f"model.layers.{layer_idx}"
             dst = f"layers.{layer_idx}"
             input_norm = tensor(f"{src}.input_layernorm.weight")
@@ -268,13 +283,13 @@ def main():
                 if args.use_r1 and name in ("gate_proj", "up_proj"):
                     weight = rotate_norm_input(weight, post_norm, r1)
                 if args.use_r2 and name == "v_proj":
-                    weight = rotate_head_output(weight, QWEN3_0_6B.head_dim, r2)
+                    weight = rotate_head_output(weight, config.head_dim, r2)
                 if args.use_r2 and name == "o_proj":
-                    weight = rotate_head_input(weight, QWEN3_0_6B.head_dim, r2)
+                    weight = rotate_head_input(weight, config.head_dim, r2)
                 if args.use_r1 and name in ("o_proj", "down_proj"):
                     weight = rotate_output(weight, r1)
                 if name == "down_proj":
-                    weight = rotate_block_input(weight, QWEN3_0_6B.head_dim, down_hadamard)
+                    weight = rotate_block_input(weight, config.head_dim, down_hadamard)
                 layer_float[name] = weight
                 w, s = per_channel_i8_weight(weight)
                 tensors[f"{dst}.{name}.weight"] = w.cpu().contiguous()
@@ -301,7 +316,7 @@ def main():
 
     if calib_tokens:
         ids = load_calib_ids(args.model_dir, args.calib_text, args.calib_dataset, args.calib_parquet, args.calib_column, calib_tokens, args.device, args.cache_prompt)
-        all_scales = calibrate_attention_scales(embed, calib_weights, calib_norms, ids, QWEN3_0_6B, r3, args.calib_prefix_tokens, calib_seq_len)
+        all_scales = calibrate_attention_scales(embed, calib_weights, calib_norms, ids, config, r3, args.calib_prefix_tokens, calib_seq_len)
         for layer_idx, scales in enumerate(all_scales):
             dst = f"layers.{layer_idx}"
             for name, scale in scales.items():
@@ -314,6 +329,14 @@ def main():
             "use_r1": str(int(args.use_r1)),
             "use_r2": str(int(args.use_r2)),
             "use_r3": str(int(args.use_r3)),
+            "model_dir": args.model_dir,
+            "hidden_size": str(config.hidden_size),
+            "intermediate_size": str(config.intermediate_size),
+            "num_hidden_layers": str(config.num_hidden_layers),
+            "num_attention_heads": str(config.num_attention_heads),
+            "num_key_value_heads": str(config.num_key_value_heads),
+            "head_dim": str(config.head_dim),
+            "packed_layers": str(pack_layers),
             "calib_tokens": str(calib_tokens),
             "calib_dataset": args.calib_dataset,
             "calib_parquet": str(args.calib_parquet or ""),
