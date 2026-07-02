@@ -29,8 +29,6 @@ def op_counts(seq_len, cfg, cache_len=0):
         "down_residual_static": 2 * 2 * seq_len * cfg.intermediate_size * cfg.hidden_size,
         "attention_i8v8_fused_static": qk_ops * 2 + pv_ops,
         "attention_cache_i8v8_fused_static": qk_ops * 2 + pv_ops,
-        "rope_sq8_q_attn_hadamard": 2 * seq_len * cfg.num_attention_heads * cfg.head_dim * cfg.head_dim,
-        "rope_sq8_k_attn_hadamard": 2 * seq_len * cfg.num_key_value_heads * cfg.head_dim * cfg.head_dim,
     }
 
 

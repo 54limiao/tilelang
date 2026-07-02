@@ -30,17 +30,17 @@ Kernel profile for the int-only LLM block path: 2048 tokens, 28 layers, prefix K
 | down_residual_static | 0.196 | 16.465 | 9.58 | 131.47 |
 | qkv_proj_i8 | 0.146 | 12.265 | 7.13 | 117.66 |
 | gate_up_proj_static | 0.139 | 11.702 | 6.81 | 184.99 |
-| rope_sq8_q_attn_hadamard | 0.092 | 7.770 | 4.52 | 11.61 |
+| rope_sq8_q_attn_hadamard | 0.092 | 7.770 | 4.52 | - |
 | rms_q_q15 | 0.070 | 5.852 | 3.40 | - |
 | o_proj_i8_static | 0.066 | 5.571 | 3.24 | 129.51 |
 | silu_mul_sq16_mid_fast | 0.065 | 5.420 | 3.15 | - |
-| rope_sq8_k_attn_hadamard | 0.057 | 4.751 | 2.76 | 9.49 |
+| rope_sq8_k_attn_hadamard | 0.057 | 4.751 | 2.76 | - |
 | rms_k_q15 | 0.045 | 3.795 | 2.21 | - |
 | rms_input_dq8_fast | 0.041 | 3.434 | 2.00 | - |
 | sq8_v_attn_noscale | 0.039 | 3.246 | 1.89 | - |
 | residual_attn_rms_q15 | 0.038 | 3.196 | 1.86 | - |
 | sq8_hidden_static | 0.032 | 2.674 | 1.56 | - |
-| total | - | 171.915 | 100.00 | 72.34 |
+| total | 2.047 | 171.915 | 100.00 | 71.55 |
 
 The first run writes `qwen3_int_only.safetensors` and `timestamp`; later runs skip packing when the pack matches the current static schema. Use `FORCE_PACK=1 examples/qwen3_int_only/test_static_path.sh` to rebuild.
 
