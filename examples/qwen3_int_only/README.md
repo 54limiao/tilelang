@@ -67,4 +67,4 @@ Trace a block against the dequantized packed-weight float reference:
   --jsonl-out /tmp/qwen_trace_metrics.jsonl
 ```
 
-The showcase files are `model.py` and `kernels.py`. Packing, QuaRot helpers, and torch reference utilities live in `utils.py`; `prepack.py`, `ppl.py`, `profile_kernels.py`, and `trace_block.py` are tools.
+The showcase files are `model.py` and `kernels.py`. Packing, QuaRot helpers, and torch reference utilities live in `utils/`; `prepack.py`, `ppl.py`, `profile_kernels.py`, and `trace_block.py` are tools.
