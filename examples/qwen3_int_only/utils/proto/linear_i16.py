@@ -1,6 +1,6 @@
 import numpy as np
 
-from examples.qwen3_int_only.utils.proto.common import Q15_16, i32, metrics
+from examples.qwen3_int_only.utils.proto.common import Q15_16, fix_quant, metrics, ratio_qt
 
 
 def proto(X, XS, W, WS):
@@ -10,8 +10,8 @@ def proto(X, XS, W, WS):
     w = W.astype(np.int32)
     acc_hi = x_hi @ w.T
     acc_mid = x_mid @ w.T
-    y = ((acc_hi.astype(np.int64) + (acc_mid.astype(np.int64) >> 7)) * int(XS[0]) * WS.astype(np.int64)[None, :]) >> 8
-    return i32(y)
+    qt = ratio_qt(int(XS[0]) * WS.astype(np.int64), np.full_like(WS.astype(np.int64), 256))
+    return fix_quant(acc_hi.astype(np.int64) + (acc_mid.astype(np.int64) >> 7), qt[None, :], "int32")
 
 
 def check(rng):

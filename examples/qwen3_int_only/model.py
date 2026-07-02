@@ -39,11 +39,11 @@ class Qwen3IntOnlyBlock:
         self.quant_v = tilelang.compile(quant_v_i8(seq_len, kvh, hd), out_idx=[2], target="cuda")
         self.rope_q = tilelang.compile(rope_sq8(seq_len, qh, hd), out_idx=[5], target="cuda")
         self.rope_k = tilelang.compile(rope_sq8(seq_len, kvh, hd), out_idx=[5], target="cuda")
-        self.qkv_proj = tilelang.compile(linear_i8(seq_len, h, q_dim + 2 * kv_dim, 64, 128, 64), out_idx=[4], target="cuda")
-        self.o_proj = tilelang.compile(linear_i8(seq_len, q_dim, h, 64, 64, 64), out_idx=[4], target="cuda")
-        self.gate_up_proj = tilelang.compile(linear_i8(seq_len, h, 2 * im, 64, 128, 64), out_idx=[4], target="cuda")
+        self.qkv_proj = tilelang.compile(linear_i8(seq_len, h, q_dim + 2 * kv_dim, 64, 128, 64), out_idx=[3], target="cuda")
+        self.o_proj = tilelang.compile(linear_i8(seq_len, q_dim, h, 64, 64, 64), out_idx=[3], target="cuda")
+        self.gate_up_proj = tilelang.compile(linear_i8(seq_len, h, 2 * im, 64, 128, 64), out_idx=[3], target="cuda")
         self.silu_mul = tilelang.compile(silu_i16(seq_len, im), out_idx=[4, 5], target="cuda")
-        self.down_proj = tilelang.compile(linear_i16(seq_len, im, h, 64, 64, 64), out_idx=[4], target="cuda")
+        self.down_proj = tilelang.compile(linear_i16(seq_len, im, h, 64, 64, 64), out_idx=[3], target="cuda")
         self.attn = tilelang.compile(attention_i8(qh, kvh, seq_len, cache_len, hd), out_idx=[9], target="cuda")
         self.lut_rsqrt = torch.from_numpy(rsqrt_lut()).cuda()
         self.lut_sigmoid = torch.from_numpy(sigmoid_lut()).cuda()
@@ -57,7 +57,7 @@ class Qwen3IntOnlyBlock:
         cfg = self.config
         cache_k = self.empty_cache_k if cache_k is None else cache_k
         cache_v = self.empty_cache_v if cache_v is None else cache_v
-        qkv = self.qkv_proj(x8, weights.input_qkv_i8_scale, weights.qkv_proj.weight, weights.qkv_proj.scale)
+        qkv = self.qkv_proj(x8, weights.qkv_proj.weight, weights.qkv_out_qt)
         q = qkv[:, : cfg.q_size].contiguous()
         k = qkv[:, cfg.q_size : cfg.q_size + cfg.kv_size].contiguous()
         v = qkv[:, cfg.q_size + cfg.kv_size :].contiguous()
@@ -79,13 +79,13 @@ class Qwen3IntOnlyBlock:
             self.lut_exp,
             weights.attn_out_qt,
         )
-        attn_out = self.o_proj(attn8, weights.attn_i8_scale, weights.o_proj.weight, weights.o_proj.scale)
+        attn_out = self.o_proj(attn8, weights.o_proj.weight, weights.o_out_qt)
         residual, h8, _ = self.rms_sq8(x, attn_out, weights.post_attention_layernorm, self.lut_rsqrt, weights.post_mlp_i8_qt)
-        gate_up = self.gate_up_proj(h8, weights.post_mlp_i8_scale, weights.gate_up_proj.weight, weights.gate_up_proj.scale)
+        gate_up = self.gate_up_proj(h8, weights.gate_up_proj.weight, weights.gate_up_out_qt)
         gate = gate_up[:, : cfg.intermediate_size].contiguous()
         up = gate_up[:, cfg.intermediate_size :].contiguous()
         gated, _ = self.silu_mul(gate, up, self.lut_sigmoid, weights.gated_mlp_i16_qt)
-        mlp = self.down_proj(gated, weights.gated_mlp_i16_scale, weights.down_proj.weight, weights.down_proj.scale)
+        mlp = self.down_proj(gated, weights.down_proj.weight, weights.down_out_qt)
         return residual, mlp
 
 

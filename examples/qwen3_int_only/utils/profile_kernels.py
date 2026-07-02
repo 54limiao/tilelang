@@ -133,7 +133,7 @@ def run_block(block, x, x8, xs8, weights, cos, sin, r3_q15, prof, cache_k=None, 
     tc_ops = tc_op_counts(block.seq_len, cfg, block.cache_len)
     pos_cos = cos[block.cache_len : block.cache_len + block.seq_len]
     pos_sin = sin[block.cache_len : block.cache_len + block.seq_len]
-    qkv = prof.time("linear_i8", lambda: block.qkv_proj(x8, weights.input_qkv_i8_scale, weights.qkv_proj.weight, weights.qkv_proj.scale), ops["linear_i8_qkv"], tc_ops["linear_i8_qkv"])
+    qkv = prof.time("linear_i8", lambda: block.qkv_proj(x8, weights.qkv_proj.weight, weights.qkv_out_qt), ops["linear_i8_qkv"], tc_ops["linear_i8_qkv"])
     q = qkv[:, : cfg.q_size].contiguous()
     k = qkv[:, cfg.q_size : cfg.q_size + cfg.kv_size].contiguous()
     v = qkv[:, cfg.q_size + cfg.kv_size :].contiguous()
@@ -146,15 +146,13 @@ def run_block(block, x, x8, xs8, weights, cos, sin, r3_q15, prof, cache_k=None, 
     cache_k = block.empty_cache_k if cache_k is None else cache_k
     cache_v = block.empty_cache_v if cache_v is None else cache_v
     attn8 = prof.time("attention_i8", lambda: block.attn(q_attn, cache_k, cache_v, k_attn, v_attn, weights.q_post_rope_i8_scale, weights.k_post_rope_i8_scale, block.lut_exp, weights.attn_out_qt), ops["attention_i8"], tc_ops["attention_i8"])
-    attn_out = prof.time("linear_i8", lambda: block.o_proj(attn8, weights.attn_i8_scale, weights.o_proj.weight, weights.o_proj.scale), ops["linear_i8_o"], tc_ops["linear_i8_o"])
+    attn_out = prof.time("linear_i8", lambda: block.o_proj(attn8, weights.o_proj.weight, weights.o_out_qt), ops["linear_i8_o"], tc_ops["linear_i8_o"])
     h, h8, _hs8 = prof.time("rms_sq8", lambda: block.rms_sq8(x, attn_out, weights.post_attention_layernorm, block.lut_rsqrt, weights.post_mlp_i8_qt))
-    hs8 = weights.post_mlp_i8_scale
-    gate_up = prof.time("linear_i8", lambda: block.gate_up_proj(h8, hs8, weights.gate_up_proj.weight, weights.gate_up_proj.scale), ops["linear_i8_gate_up"], tc_ops["linear_i8_gate_up"])
+    gate_up = prof.time("linear_i8", lambda: block.gate_up_proj(h8, weights.gate_up_proj.weight, weights.gate_up_out_qt), ops["linear_i8_gate_up"], tc_ops["linear_i8_gate_up"])
     gate = gate_up[:, : cfg.intermediate_size].contiguous()
     up = gate_up[:, cfg.intermediate_size :].contiguous()
     gated, _gs = prof.time("silu_i16", lambda: block.silu_mul(gate, up, block.lut_sigmoid, weights.gated_mlp_i16_qt))
-    gs = weights.gated_mlp_i16_scale
-    mlp = prof.time("linear_i16", lambda: block.down_proj(gated, gs, weights.down_proj.weight, weights.down_proj.scale), ops["linear_i16_down"], tc_ops["linear_i16_down"])
+    mlp = prof.time("linear_i16", lambda: block.down_proj(gated, weights.down_proj.weight, weights.down_out_qt), ops["linear_i16_down"], tc_ops["linear_i16_down"])
     return h, mlp
 
 

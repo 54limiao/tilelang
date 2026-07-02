@@ -33,20 +33,40 @@ def pack_scale(real_multiplier):
     return (best_shift << Q_MULTIPLIER_WIDTH) | (best_mul & MASK)
 
 
+def ratio_qt(numer, denom):
+    n = np.asarray(numer, dtype=np.int64).clip(min=1)
+    d = np.asarray(denom, dtype=np.int64).clip(min=1)
+    ratio = n.astype(np.float64) / d.astype(np.float64)
+    best_mul = np.zeros_like(n, dtype=np.int64)
+    best_shift = np.zeros_like(n, dtype=np.int64)
+    best_err = np.full(ratio.shape, np.inf, dtype=np.float64)
+    for shift in range(64):
+        mul_f = np.rint(ratio * float(1 << shift))
+        valid = (mul_f >= 1.0) & (mul_f < float(1 << Q_MULTIPLIER_WIDTH))
+        mul = np.where(valid, mul_f, 0).astype(np.int64)
+        err = np.abs(ratio - (mul_f / float(1 << shift)))
+        take = valid & (err <= best_err)
+        best_mul = np.where(take, mul, best_mul)
+        best_shift = np.where(take, shift, best_shift)
+        best_err = np.where(take, err, best_err)
+    return ((best_shift << Q_MULTIPLIER_WIDTH) | (best_mul & MASK)).astype(np.uint32)
+
+
 def round_shift(x, shift):
     x = np.asarray(x, dtype=np.int64)
-    shift = int(shift)
+    shift = np.asarray(shift, dtype=np.int64)
     out = x >> shift
-    if shift >= 1:
-        out += (x >> (shift - 1)) & 1
+    out += np.where(shift >= 1, (x >> np.maximum(shift - 1, 0)) & 1, 0)
     return out
 
 
 def fix_quant(x, scale, out_dtype="int32"):
-    scale = pack_scale(scale) if isinstance(scale, float) else (int(scale) & 0xFFFFFFFF)
+    if isinstance(scale, float):
+        scale = pack_scale(scale)
+    scale = np.asarray(scale, dtype=np.uint32)
     mul = scale & MASK
     shift = (scale >> Q_MULTIPLIER_WIDTH) & 0x3F
-    out = round_shift(np.asarray(x, dtype=np.int64) * mul, shift)
+    out = round_shift(np.asarray(x, dtype=np.int64) * mul.astype(np.int64), shift)
     if out_dtype == "int8":
         out = np.clip(out, -128, 127)
     elif out_dtype == "int16":

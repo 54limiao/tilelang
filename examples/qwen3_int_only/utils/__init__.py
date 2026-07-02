@@ -56,9 +56,10 @@ def ratio_qt(numer, denom):
     best_shift = torch.zeros_like(n, dtype=torch.int64)
     best_err = torch.full_like(ratio, float("inf"), dtype=torch.float64)
     for shift in range(64):
-        mul = torch.round(ratio * float(1 << shift)).to(torch.int64)
-        valid = (mul >= 1) & (mul < (1 << QT_WIDTH))
-        err = torch.abs(ratio - (mul.to(torch.float64) / float(1 << shift)))
+        mul_f = torch.round(ratio * float(1 << shift))
+        valid = (mul_f >= 1.0) & (mul_f < float(1 << QT_WIDTH))
+        mul = torch.where(valid, mul_f, torch.zeros_like(mul_f)).to(torch.int64)
+        err = torch.abs(ratio - (mul_f / float(1 << shift)))
         take = valid & (err <= best_err)
         best_mul = torch.where(take, mul, best_mul)
         best_shift = torch.where(take, torch.full_like(best_shift, shift), best_shift)
@@ -119,6 +120,10 @@ class Qwen3BlockWeights:
     attn_i8_scale: torch.Tensor | None = None
     attn_i8_qt: torch.Tensor | None = None
     attn_out_qt: torch.Tensor | None = None
+    qkv_out_qt: torch.Tensor | None = None
+    o_out_qt: torch.Tensor | None = None
+    gate_up_out_qt: torch.Tensor | None = None
+    down_out_qt: torch.Tensor | None = None
     post_mlp_i8_scale: torch.Tensor | None = None
     post_mlp_i8_qt: torch.Tensor | None = None
     gated_mlp_i16_scale: torch.Tensor | None = None
@@ -163,19 +168,29 @@ def load_packed_qwen3(packed_dir, config=QWEN3_0_6B, device="cuda"):
             return linear(prefix)
         return Int8LinearWeight(torch.cat([tensors[f"{name}.weight"] for name in names], dim=0), torch.cat([tensors[f"{name}.scale"] for name in names], dim=0))
 
+    def linear_i8_qt(xs_name, linear_weight):
+        return ratio_qt(optional(xs_name).to(torch.int64) * linear_weight.scale.to(torch.int64), torch.full_like(linear_weight.scale.to(torch.int64), Q15_16))
+
+    def linear_i16_qt(xs_name, linear_weight):
+        return ratio_qt(optional(xs_name).to(torch.int64) * linear_weight.scale.to(torch.int64), torch.full_like(linear_weight.scale.to(torch.int64), 256))
+
     for layer_idx in range(config.num_hidden_layers):
         p = f"layers.{layer_idx}"
+        qkv_proj = cat_linear(f"{p}.qkv_proj", (f"{p}.q_proj", f"{p}.k_proj", f"{p}.v_proj"))
+        o_proj = linear(f"{p}.o_proj")
+        gate_up_proj = cat_linear(f"{p}.gate_up_proj", (f"{p}.gate_proj", f"{p}.up_proj"))
+        down_proj = linear(f"{p}.down_proj")
         blocks.append(
             Qwen3BlockWeights(
                 q_proj=linear(f"{p}.q_proj"),
                 k_proj=linear(f"{p}.k_proj"),
                 v_proj=linear(f"{p}.v_proj"),
-                qkv_proj=cat_linear(f"{p}.qkv_proj", (f"{p}.q_proj", f"{p}.k_proj", f"{p}.v_proj")),
-                o_proj=linear(f"{p}.o_proj"),
+                qkv_proj=qkv_proj,
+                o_proj=o_proj,
                 gate_proj=linear(f"{p}.gate_proj"),
                 up_proj=linear(f"{p}.up_proj"),
-                gate_up_proj=cat_linear(f"{p}.gate_up_proj", (f"{p}.gate_proj", f"{p}.up_proj")),
-                down_proj=linear(f"{p}.down_proj"),
+                gate_up_proj=gate_up_proj,
+                down_proj=down_proj,
                 input_layernorm=tensors[f"{p}.input_layernorm"],
                 post_attention_layernorm=tensors[f"{p}.post_attention_layernorm"],
                 q_norm=tensors[f"{p}.q_norm"],
@@ -191,6 +206,10 @@ def load_packed_qwen3(packed_dir, config=QWEN3_0_6B, device="cuda"):
                 attn_i8_scale=optional(f"{p}.attn_i8.scale"),
                 attn_i8_qt=optional_qt(f"{p}.attn_i8.scale"),
                 attn_out_qt=ratio_qt(optional(f"{p}.v_i8.scale"), optional(f"{p}.attn_i8.scale").to(torch.int64) * 32767),
+                qkv_out_qt=linear_i8_qt(f"{p}.input_qkv_i8.scale", qkv_proj),
+                o_out_qt=linear_i8_qt(f"{p}.attn_i8.scale", o_proj),
+                gate_up_out_qt=linear_i8_qt(f"{p}.post_mlp_i8.scale", gate_up_proj),
+                down_out_qt=linear_i16_qt(f"{p}.gated_mlp_i16.scale", down_proj),
                 post_mlp_i8_scale=optional(f"{p}.post_mlp_i8.scale"),
                 post_mlp_i8_qt=optional_qt(f"{p}.post_mlp_i8.scale"),
                 gated_mlp_i16_scale=optional(f"{p}.gated_mlp_i16.scale"),
