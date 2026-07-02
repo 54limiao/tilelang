@@ -11,6 +11,7 @@ from transformers import AutoTokenizer
 from examples.qwen3_int_only.utils.ppl import iter_texts
 from examples.qwen3_int_only.utils import (
     ROTATE_SEED,
+    Q15_16,
     Qwen3Config,
     SafeTensorReader,
     per_channel_i8_weight,
@@ -18,7 +19,7 @@ from examples.qwen3_int_only.utils import (
     hadamard_rotation,
     random_hadamard_rotation,
     rmsnorm_torch,
-    rope_tables_q15_16,
+    rope_tables,
     rope_torch,
     rotate_block_input,
     rotate_head_input,
@@ -62,7 +63,7 @@ def update_tensor_amax(acc, x):
 def update_stats_amax(acc, stats):
     out = {} if acc is None else acc
     for name, value in stats.items():
-        if name in ("input_qkv_i8", "attn_i8", "post_mlp_i8", "gated_mlp_i16", "gated_mlp_i8"):
+        if name in ("input_qkv_i8", "attn_i8", "post_mlp_i8", "gated_mlp_i8"):
             out[name] = update_tensor_amax(out.get(name), value)
         else:
             out[name] = update_head_amax(out.get(name), value)
@@ -70,7 +71,7 @@ def update_stats_amax(acc, stats):
 
 
 def scale_from_amax(amax, qmax):
-    return torch.div(amax + qmax - 1, qmax, rounding_mode="floor").clamp(min=1).to(torch.uint32)
+    return (amax.float() / float(qmax * Q15_16)).clamp(min=1.0 / Q15_16).to(torch.float32)
 
 
 def scales_from_amax(layer):
@@ -83,7 +84,6 @@ def scales_from_amax(layer):
         "v_i8": scale_from_amax(layer["v_i8"], 127),
         "attn_i8": scale_from_amax(layer["attn_i8"], 127),
         "post_mlp_i8": scale_from_amax(layer["post_mlp_i8"], 127),
-        "gated_mlp_i16": scale_from_amax(layer["gated_mlp_i16"], 32767),
         "gated_mlp_i8": scale_from_amax(layer["gated_mlp_i8"], 127),
     }
 
@@ -163,7 +163,6 @@ def current_pack_metadata(path, args, config):
             "layers.0.v_i8.scale",
             "layers.0.attn_i8.scale",
             "layers.0.post_mlp_i8.scale",
-            "layers.0.gated_mlp_i16.scale",
             "layers.0.gated_mlp_i8.scale",
         )
     )
@@ -215,7 +214,6 @@ def run_calib_segment(x, w, norms, cos, sin, config, r3, prefix_tokens):
     gated = torch.nn.functional.silu(gate) * up
     gated_h = block_hadamard(gated, w["down_hadamard"])
     stats["post_mlp_i8"] = q15_16(m[:, prefix_tokens:])
-    stats["gated_mlp_i16"] = q15_16(gated[:, prefix_tokens:])
     stats["gated_mlp_i8"] = q15_16(gated_h[:, prefix_tokens:])
     return x + gated_h @ w["down_proj"].T, stats
 
@@ -285,8 +283,7 @@ def main():
         if calib_tokens:
             ids = load_calib_ids(args.model_dir, args.calib_text, args.calib_dataset, args.calib_parquet, args.calib_column, calib_tokens, args.device, args.cache_prompt)
             calib_x = embed.to(args.device, torch.float32)[ids.reshape(-1, calib_seq_len)]
-            cos_q15, sin_q15, _ = rope_tables_q15_16(calib_seq_len, config.head_dim, config.rope_theta, args.device)
-            cos, sin = cos_q15.float() / 65536.0, sin_q15.float() / 65536.0
+            cos, sin, _ = rope_tables(calib_seq_len, config.head_dim, config.rope_theta, args.device)
         for layer_idx in range(pack_layers):
             src = f"model.layers.{layer_idx}"
             dst = f"layers.{layer_idx}"

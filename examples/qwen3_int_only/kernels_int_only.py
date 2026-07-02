@@ -135,10 +135,10 @@ def rope_sq8(seq_len, heads, dim, qmax=127):
                 src_d = T.if_then_else(d < T.int32(dim // 2), d, d - T.int32(dim // 2))
                 x0 = X[r, src_d]
                 x1 = X[r, src_d + dim // 2]
-                c = COS[t, src_d]
-                s = SIN[t, src_d]
-                lo = ((x0 >> T.int32(8)) * (c >> T.int32(8))) - ((x1 >> T.int32(8)) * (s >> T.int32(8)))
-                hi = ((x0 >> T.int32(8)) * (s >> T.int32(8))) + ((x1 >> T.int32(8)) * (c >> T.int32(8)))
+                c = COS[t, src_d] >> T.int32(8)
+                s = SIN[t, src_d] >> T.int32(8)
+                lo = ((x0 >> T.int32(8)) * c) - ((x1 >> T.int32(8)) * s)
+                hi = ((x0 >> T.int32(8)) * s) + ((x1 >> T.int32(8)) * c)
                 v0 = T.if_then_else(d < T.int32(dim // 2), lo >> T.int32(8), hi >> T.int32(8))
                 local[i] = T.if_then_else(R[d, 0] >= T.int32(0), v0, T.int32(0) - v0)
             for i in T.serial(thread_round):
@@ -230,28 +230,6 @@ def rms_sq8(rows, cols, qmax=127):
     return main
 
 
-def silu_i16(rows, cols):
-    @T.prim_func
-    def main(
-        Gate: T.Tensor((rows, cols), "int32"),
-        Up: T.Tensor((rows, cols), "int32"),
-        LUT: T.Tensor((1024,), "int32"),
-        QT: T.Tensor((1,), "uint32"),
-        Q: T.Tensor((rows, cols), "int16"),
-        S: T.Tensor((rows,), "uint32"),
-    ):
-        with T.Kernel(rows, threads=128) as r:
-            vals = T.alloc_fragment((1, cols), "int32")
-            qt = T.alloc_fragment((1,), "int32")
-            qt[0] = T.cast(QT[0], "int32")
-            S[r] = QT[0]
-            for c in T.Parallel(cols):
-                vals[0, c] = (((Gate[r, c] >> T.int32(10)) * T.fix.lut_10bit(Gate[r, c], LUT, scale=SCALE_INV_1024, out_dtype="int32")) >> T.int32(8)) * (Up[r, c] >> T.int32(8))
-                Q[r, c] = T.fix.quant(vals[0, c], scale=qt[0], out_dtype="int16")
-
-    return main
-
-
 def silu_hadamard_i8(rows, cols, block_dim=128):
     thread_elem = 8
     threads = 16
@@ -330,39 +308,6 @@ def linear_i8(rows, in_features, out_features, block_m=16, block_n=32, block_k=6
     return main
 
 
-def linear_i16(rows, in_features, out_features, block_m=16, block_n=32, block_k=64):
-    @T.prim_func
-    def main(
-        X: T.Tensor((rows, in_features), "int16"),
-        W: T.Tensor((out_features, in_features), "int8"),
-        QT: T.Tensor((out_features,), "uint32"),
-        Y: T.Tensor((rows, out_features), "int32"),
-    ):
-        with T.Kernel(T.ceildiv(out_features, block_n), T.ceildiv(rows, block_m), threads=128) as (bo, br):
-            x_hi = T.alloc_shared((block_m, block_k), "int8")
-            x_mid = T.alloc_shared((block_m, block_k), "int8")
-            w_shared = T.alloc_shared((block_n, block_k), "int8")
-            acc_hi = T.alloc_fragment((block_m, block_n), "int32")
-            acc_mid = T.alloc_fragment((block_m, block_n), "int32")
-            x_val = T.alloc_fragment((block_m, block_k), "int32")
-
-            T.clear(acc_hi)
-            T.clear(acc_mid)
-            for ko in T.Pipelined(in_features // block_k, num_stages=2):
-                for m, k in T.Parallel(block_m, block_k):
-                    x_val[m, k] = T.cast(X[br * block_m + m, ko * block_k + k], "int32")
-                    x_hi[m, k] = T.cast(x_val[m, k] >> T.int32(8), "int8")
-                    x_mid[m, k] = T.cast((x_val[m, k] - ((x_val[m, k] >> T.int32(8)) << T.int32(8))) >> T.int32(1), "int8")
-                T.copy(W[bo * block_n, ko * block_k], w_shared)
-                T.gemm(x_hi, w_shared, acc_hi, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
-                T.gemm(x_mid, w_shared, acc_mid, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
-
-            for m, n in T.Parallel(block_m, block_n):
-                Y[br * block_m + m, bo * block_n + n] = T.fix.quant(acc_hi[m, n] + (acc_mid[m, n] >> T.int32(7)), scale=QT[bo * block_n + n], out_dtype="int32")
-
-    return main
-
-
 def attention_i8(q_heads, kv_heads, seqlen, cache_len, dim, block_m=16, block_n=64, score_shift=26, lut_scale=SCALE_EXP_LUT):
     group = q_heads // kv_heads
     kv_len = cache_len + seqlen
@@ -375,8 +320,7 @@ def attention_i8(q_heads, kv_heads, seqlen, cache_len, dim, block_m=16, block_n=
         CACHE_V: T.Tensor((kv_heads, cache_len, dim), "int8"),
         K: T.Tensor((kv_heads, seqlen, dim), "int8"),
         V: T.Tensor((kv_heads, seqlen, dim), "int8"),
-        QS: T.Tensor((q_heads,), "uint32"),
-        KS: T.Tensor((kv_heads,), "uint32"),
+        SCORE_QT: T.Tensor((q_heads,), "uint32"),
         LUT: T.Tensor((1024,), "int16"),
         OQT: T.Tensor((kv_heads,), "uint32"),
         O: T.Tensor((seqlen, q_size), "int8"),
@@ -397,14 +341,13 @@ def attention_i8(q_heads, kv_heads, seqlen, cache_len, dim, block_m=16, block_n=
             old_scale = T.alloc_fragment((block_m,), "int32")
             block_sum = T.alloc_fragment((block_m,), "int32")
             denom = T.alloc_fragment((block_m,), "int32")
-            q_scale = T.alloc_fragment((1,), "int32")
-            k_scale = T.alloc_fragment((block_n,), "int32")
+            score_qt = T.alloc_fragment((1,), "uint32")
             out_qt = T.alloc_fragment((1,), "int32")
             out = T.alloc_fragment((block_m, dim), "int32")
             prob = T.alloc_fragment((block_m, block_n), "int32")
             pv = T.alloc_fragment((block_m, dim), "int32")
             acc = T.alloc_fragment((block_m, dim), "int32")
-            q_scale[0] = T.cast(QS[h], "int32") >> T.int32(4)
+            score_qt[0] = SCORE_QT[h]
             out_qt[0] = T.cast(OQT[kh], "int32")
             for m in T.Parallel(block_m):
                 score_max[m] = T.int32(I32_MIN)
@@ -416,13 +359,11 @@ def attention_i8(q_heads, kv_heads, seqlen, cache_len, dim, block_m=16, block_n=
                 for j, d in T.Parallel(block_n, dim):
                     pos = nb * block_n + j
                     k_shared[j, d] = T.if_then_else(pos < cache_len, CACHE_K[kh, pos, d], T.if_then_else(pos < kv_len, K[kh, pos - cache_len, d], T.int8(0)))
-                for j in T.Parallel(block_n):
-                    k_scale[j] = T.max(T.cast(KS[kh], "int32"), T.int32(1))
                 T.clear(qk)
                 T.gemm(q_shared, k_shared, qk, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
                 for m, j in T.Parallel(block_m, block_n):
                     pos = nb * block_n + j
-                    score[m, j] = ((qk[m, j] >> T.int32(8)) * (((q_scale[0] * (k_scale[j] >> T.int32(4))) >> T.int32(8)) * T.int32(5793))) >> T.int32(score_shift - 8)
+                    score[m, j] = T.fix.quant(qk[m, j] >> T.int32(8), scale=score_qt[0], out_dtype="int32")
                     score[m, j] = T.if_then_else(pos <= cache_len + row_base + m, score[m, j], T.int32(-32768))
                 T.reduce_max(score, block_max, dim=1, clear=True)
                 for m in T.Parallel(block_m):
@@ -440,13 +381,11 @@ def attention_i8(q_heads, kv_heads, seqlen, cache_len, dim, block_m=16, block_n=
                     pos = nb * block_n + j
                     k_shared[j, d] = T.if_then_else(pos < cache_len, CACHE_K[kh, pos, d], T.if_then_else(pos < kv_len, K[kh, pos - cache_len, d], T.int8(0)))
                     v_shared[j, d] = T.if_then_else(pos < cache_len, CACHE_V[kh, pos, d], T.if_then_else(pos < kv_len, V[kh, pos - cache_len, d], T.int8(0)))
-                for j in T.Parallel(block_n):
-                    k_scale[j] = T.max(T.cast(KS[kh], "int32"), T.int32(1))
                 T.clear(qk)
                 T.gemm(q_shared, k_shared, qk, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
                 for m, j in T.Parallel(block_m, block_n):
                     pos = nb * block_n + j
-                    score[m, j] = ((qk[m, j] >> T.int32(8)) * (((q_scale[0] * (k_scale[j] >> T.int32(4))) >> T.int32(8)) * T.int32(5793))) >> T.int32(score_shift - 8)
+                    score[m, j] = T.fix.quant(qk[m, j] >> T.int32(8), scale=score_qt[0], out_dtype="int32")
                     score[m, j] = T.if_then_else(pos <= cache_len + row_base + m, T.fix.lut_10bit(score[m, j] - score_max[m], LUT, scale=lut_scale, out_dtype="int32"), T.int32(0))
                     prob[m, j] = T.min(T.truncdiv((score[m, j] * T.int32(32767)) + (denom[m] >> T.int32(1)), denom[m]), T.int32(32767))
                     p_hi[m, j] = T.cast(prob[m, j] >> T.int32(8), "int8")

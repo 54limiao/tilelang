@@ -11,6 +11,7 @@ PACKED_DIR="${PACKED_DIR:-/tmp/${MODEL_NAME}-static-calib-32x2048}"
 EVAL_DATASET="${EVAL_DATASET:-fineweb}"
 EVAL_COLUMN="${EVAL_COLUMN:-text}"
 EVAL_PARQUET="${EVAL_PARQUET:-}"
+BACKEND="${BACKEND:-int-only}"
 EVAL_TOKENS="${EVAL_TOKENS:-2048}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 NUM_BATCHES="${NUM_BATCHES:-1}"
@@ -65,7 +66,7 @@ PPL_ARGS=(
   examples/qwen3_int_only/utils/ppl.py
   --model-dir "${MODEL_DIR}"
   --packed-dir "${PACKED_DIR}"
-  --backend int-only
+  --backend "${BACKEND}"
   --compare-backend hf
   --eval-dataset "${EVAL_DATASET}"
   --eval-column "${EVAL_COLUMN}"
@@ -92,7 +93,7 @@ PACK_START_TS="$(date +%s)"
 "${PYTHON}" "${PREPACK_ARGS[@]}"
 PACK_END_TS="$(date +%s)"
 
-echo "[2/2] evaluate int-only against float/HF: ppl cos mse, tokens=${EVAL_TOKENS}"
+echo "[2/2] evaluate ${BACKEND} against float/HF: ppl cos mse, tokens=${EVAL_TOKENS}"
 EVAL_START_TS="$(date +%s)"
 "${PYTHON}" "${PPL_ARGS[@]}"
 END_TS="$(date +%s)"

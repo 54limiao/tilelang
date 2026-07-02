@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 import tilelang
 
-from examples.qwen3_int_only.kernels import (
+from examples.qwen3_int_only.kernels_int_only import (
     rms_q15,
     rms_sq8,
     attention_i8,
@@ -43,7 +43,7 @@ class Qwen3IntOnlyBlock:
         self.gate_up_proj = tilelang.compile(linear_i8(seq_len, h, 2 * im, 64, 128, 64), out_idx=[3], target="cuda")
         self.silu_hadamard = tilelang.compile(silu_hadamard_i8(seq_len, im), out_idx=[4, 5], target="cuda")
         self.down_proj = tilelang.compile(linear_i8(seq_len, im, h, 64, 64, 64), out_idx=[3], target="cuda")
-        self.attn = tilelang.compile(attention_i8(qh, kvh, seq_len, cache_len, hd), out_idx=[9], target="cuda")
+        self.attn = tilelang.compile(attention_i8(qh, kvh, seq_len, cache_len, hd), out_idx=[8], target="cuda")
         self.lut_rsqrt = torch.from_numpy(rsqrt_lut()).cuda()
         self.lut_sigmoid = torch.from_numpy(sigmoid_lut()).cuda()
         self.lut_exp = torch.from_numpy(exp_lut_neg()).cuda()
@@ -73,8 +73,7 @@ class Qwen3IntOnlyBlock:
             cache_v,
             k_attn,
             v_attn,
-            weights.q_post_rope_i8_scale,
-            weights.k_post_rope_i8_scale,
+            weights.attn_score_qt,
             self.lut_exp,
             weights.attn_out_qt,
         )

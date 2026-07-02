@@ -6,8 +6,9 @@ from safetensors import safe_open
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from examples.qwen3_int_only.model import Q15_16, Qwen3IntOnlyBlock
+from examples.qwen3_int_only.model_hybrid import Qwen3HybridBlock
 from examples.qwen3_int_only.utils.ppl import iter_texts, quant_i8_static_q15_16
-from examples.qwen3_int_only.utils import ROTATE_SEED, Qwen3Config, load_packed_qwen3, q15_16, random_hadamard_rotation, rope_tables_q15_16
+from examples.qwen3_int_only.utils import ROTATE_SEED, Qwen3Config, load_packed_qwen3, q15_16, random_hadamard_rotation, rope_tables, rope_tables_q15_16
 
 
 DEFAULT_MODEL_DIR = "/publicdata/huggingface.co/Qwen/Qwen3-0.6B"
@@ -31,13 +32,14 @@ def op_counts(seq_len, cfg, cache_len=0):
     }
 
 
-def tc_op_counts(seq_len, cfg, cache_len=0):
+def tc_op_counts(seq_len, cfg, cache_len=0, backend="int-only"):
     # math_ops is the model matmul work. tc_ops is the int8 tensorcore work we
-    # actually issue: attention recomputes QK and splits P16@V8 into two int8 GEMMs.
+    # actually issue. int-only attention recomputes QK; hybrid attention uses
+    # single-pass online softmax and computes QK once.
     ops = op_counts(seq_len, cfg, cache_len)
     qk_ops = 2 * cfg.num_attention_heads * seq_len * (seq_len + cache_len) * cfg.head_dim
     pv_ops = qk_ops
-    ops["attention_i8"] = 2 * qk_ops + 2 * pv_ops
+    ops["attention_i8"] = (qk_ops if backend == "hybrid" else 2 * qk_ops) + 2 * pv_ops
     return ops
 
 
@@ -143,7 +145,7 @@ def run_block(block, x, x8, xs8, weights, cos, sin, r3_q15, prof, cache_k=None, 
     v_attn = prof.time("quant_v_i8", lambda: block.quant_v(v_heads.reshape(block.seq_len, cfg.num_key_value_heads, cfg.head_dim), weights.v_i8_qt))
     cache_k = block.empty_cache_k if cache_k is None else cache_k
     cache_v = block.empty_cache_v if cache_v is None else cache_v
-    attn8 = prof.time("attention_i8", lambda: block.attn(q_attn, cache_k, cache_v, k_attn, v_attn, weights.q_post_rope_i8_scale, weights.k_post_rope_i8_scale, block.lut_exp, weights.attn_out_qt), ops["attention_i8"], tc_ops["attention_i8"])
+    attn8 = prof.time("attention_i8", lambda: block.attn(q_attn, cache_k, cache_v, k_attn, v_attn, weights.attn_score_qt, block.lut_exp, weights.attn_out_qt), ops["attention_i8"], tc_ops["attention_i8"])
     attn_out = prof.time("linear_i8", lambda: block.o_proj(attn8, weights.o_proj.weight, weights.o_out_qt), ops["linear_i8_o"], tc_ops["linear_i8_o"])
     h, h8, _hs8 = prof.time("rms_sq8", lambda: block.rms_sq8(x, attn_out, weights.post_attention_layernorm, block.lut_rsqrt, weights.post_mlp_i8_qt))
     gate_up = prof.time("linear_i8", lambda: block.gate_up_proj(h8, weights.gate_up_proj.weight, weights.gate_up_out_qt), ops["linear_i8_gate_up"], tc_ops["linear_i8_gate_up"])
@@ -154,10 +156,38 @@ def run_block(block, x, x8, xs8, weights, cos, sin, r3_q15, prof, cache_k=None, 
     return h, mlp
 
 
+@torch.no_grad()
+def run_block_hybrid(block, x, x8, weights, cos, sin, prof, cache_k=None, cache_v=None):
+    cfg = block.config
+    ops = op_counts(block.seq_len, cfg, block.cache_len)
+    tc_ops = tc_op_counts(block.seq_len, cfg, block.cache_len, backend="hybrid")
+    cache_k = block.empty_cache_k if cache_k is None else cache_k
+    cache_v = block.empty_cache_v if cache_v is None else cache_v
+    qkv = prof.time("linear_i8", lambda: block.qkv_proj(x8, weights.qkv_proj.weight, weights.qkv_out_qt), ops["linear_i8_qkv"], tc_ops["linear_i8_qkv"])
+    q = qkv[:, : cfg.q_size].contiguous()
+    k = qkv[:, cfg.q_size : cfg.q_size + cfg.kv_size].contiguous()
+    v = qkv[:, cfg.q_size + cfg.kv_size :].contiguous()
+    pos_cos = cos[block.cache_len : block.cache_len + block.seq_len]
+    pos_sin = sin[block.cache_len : block.cache_len + block.seq_len]
+    q_attn = prof.time("qk_norm_rope_quant_hybrid", lambda: block.qk_norm_rope_quant(q, weights.q_norm, pos_cos, pos_sin, cfg.num_attention_heads, weights.q_post_rope_i8_scale))
+    k_attn = prof.time("qk_norm_rope_quant_hybrid", lambda: block.qk_norm_rope_quant(k, weights.k_norm, pos_cos, pos_sin, cfg.num_key_value_heads, weights.k_post_rope_i8_scale))
+    v_attn = prof.time("quant_v_i8", lambda: block.quant_v(v.reshape(block.seq_len, cfg.num_key_value_heads, cfg.head_dim), weights.v_i8_qt))
+    attn8 = prof.time("attention_hybrid", lambda: block.attention_hybrid(q_attn, k_attn, v_attn, cache_k, cache_v, weights), ops["attention_i8"], tc_ops["attention_i8"])
+    attn_out = prof.time("linear_i8", lambda: block.o_proj(attn8, weights.o_proj.weight, weights.o_out_qt), ops["linear_i8_o"], tc_ops["linear_i8_o"])
+    h, h8 = prof.time("rms_quant_hybrid", lambda: block.rms_quant(x, attn_out, weights.post_attention_layernorm, weights.post_mlp_i8_scale))
+    gate_up = prof.time("linear_i8", lambda: block.gate_up_proj(h8, weights.gate_up_proj.weight, weights.gate_up_out_qt), ops["linear_i8_gate_up"], tc_ops["linear_i8_gate_up"])
+    gate = gate_up[:, : cfg.intermediate_size].contiguous()
+    up = gate_up[:, cfg.intermediate_size :].contiguous()
+    gated = prof.time("silu_hadamard_quant_hybrid", lambda: block.silu_quant(gate, up, weights.gated_mlp_i8_scale))
+    mlp = prof.time("linear_i8", lambda: block.down_proj(gated, weights.down_proj.weight, weights.down_out_qt), ops["linear_i8_down"], tc_ops["linear_i8_down"])
+    return h, mlp
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-dir", default=DEFAULT_MODEL_DIR)
     parser.add_argument("--packed-dir", default="/tmp/Qwen3-0.6B-static-calib-32x2048")
+    parser.add_argument("--backend", choices=["int-only", "hybrid"], default="int-only")
     parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--layers", type=int, default=28)
     parser.add_argument("--warmup", type=int, default=1)
@@ -183,25 +213,44 @@ def main():
     _packed_r1, packed_r2 = packed_flags(args.packed_dir)
     embed, _, _, weights = load_packed_qwen3(args.packed_dir, config)
     cache_kv, cache_len = build_cache_kv(args.model_dir, tokenizer, args.cache_prompt, weights[: args.layers], config, packed_r2)
-    block = Qwen3IntOnlyBlock(seq_len, config, cache_len=cache_len)
-    cos, sin, _ = rope_tables_q15_16(seq_len + cache_len, config.head_dim, config.rope_theta)
+    block = Qwen3HybridBlock(seq_len, config, cache_len=cache_len) if args.backend == "hybrid" else Qwen3IntOnlyBlock(seq_len, config, cache_len=cache_len)
+    cos, sin, _ = rope_tables(seq_len + cache_len, config.head_dim, config.rope_theta) if args.backend == "hybrid" else rope_tables_q15_16(seq_len + cache_len, config.head_dim, config.rope_theta)
+    if args.backend == "hybrid":
+        cos = cos.contiguous()
+        sin = sin.contiguous()
     r3_q15 = q15_16(random_hadamard_rotation(config.head_dim, ROTATE_SEED + 2))
 
     def run_layers(prof):
         residual = q15_16(embed[ids])
-        _res, x8, xs8 = prof.time(
-            "rms_sq8",
-            lambda: block.rms_sq8(residual, block.zero_hidden, weights[0].input_layernorm, block.lut_rsqrt, weights[0].input_qkv_i8_qt),
-        )
+        if args.backend == "hybrid":
+            _res, x8 = prof.time(
+                "rms_quant_hybrid",
+                lambda: block.rms_quant(residual, None, weights[0].input_layernorm, weights[0].input_qkv_i8_scale),
+            )
+            xs8 = None
+        else:
+            _res, x8, xs8 = prof.time(
+                "rms_sq8",
+                lambda: block.rms_sq8(residual, block.zero_hidden, weights[0].input_layernorm, block.lut_rsqrt, weights[0].input_qkv_i8_qt),
+            )
         mlp = None
         for layer_idx in range(args.layers):
             if layer_idx:
-                residual, x8, xs8 = prof.time(
-                    "rms_sq8",
-                    lambda: block.rms_sq8(residual, mlp, weights[layer_idx].input_layernorm, block.lut_rsqrt, weights[layer_idx].input_qkv_i8_qt),
-                )
+                if args.backend == "hybrid":
+                    residual, x8 = prof.time(
+                        "rms_quant_hybrid",
+                        lambda: block.rms_quant(residual, mlp, weights[layer_idx].input_layernorm, weights[layer_idx].input_qkv_i8_scale),
+                    )
+                else:
+                    residual, x8, xs8 = prof.time(
+                        "rms_sq8",
+                        lambda: block.rms_sq8(residual, mlp, weights[layer_idx].input_layernorm, block.lut_rsqrt, weights[layer_idx].input_qkv_i8_qt),
+                    )
             cache_k, cache_v = cache_kv[layer_idx]
-            residual, mlp = run_block(block, residual, x8, xs8, weights[layer_idx], cos, sin, r3_q15, prof, cache_k, cache_v)
+            if args.backend == "hybrid":
+                residual, mlp = run_block_hybrid(block, residual, x8, weights[layer_idx], cos, sin, prof, cache_k, cache_v)
+            else:
+                residual, mlp = run_block(block, residual, x8, xs8, weights[layer_idx], cos, sin, r3_q15, prof, cache_k, cache_v)
         return residual, mlp
 
     peak_tops = args.peak_tops or default_int8_peak_tops()
@@ -226,6 +275,7 @@ def main():
     )
     if args.jsonl_out:
         row = {
+            "backend": args.backend,
             "max_tokens": args.max_tokens,
             "seq_len": seq_len,
             "layers": args.layers,

@@ -120,12 +120,28 @@ def pack_qt(ratio):
     return (((best_shift << QT_WIDTH) | best_mul).to(torch.uint32)).contiguous()
 
 
+def scale_to_q15(scale):
+    if scale is None:
+        return None
+    if scale.dtype.is_floating_point:
+        return torch.clamp(torch.round(scale * Q15_16), 1, (1 << 31) - 1).to(torch.uint32).contiguous()
+    return scale.to(torch.uint32).contiguous()
+
+
+def scale_to_fp32(scale):
+    if scale is None:
+        return None
+    if scale.dtype.is_floating_point:
+        return scale.to(torch.float32).contiguous()
+    return (scale.to(torch.float32) / float(Q15_16)).contiguous()
+
+
 def reciprocal_qt(scale):
-    return ratio_qt(torch.ones_like(scale), scale)
+    return ratio_qt(torch.ones_like(scale_to_q15(scale)), scale_to_q15(scale))
 
 
 def reciprocal_sqrt_qt(scale, dim):
-    denom = torch.clamp(torch.round(scale.float() * (dim**0.5)).to(torch.int64), min=1)
+    denom = torch.clamp(torch.round(scale_to_q15(scale).float() * (dim**0.5)).to(torch.int64), min=1)
     return ratio_qt(torch.ones_like(denom), denom)
 
 
@@ -134,11 +150,16 @@ def per_channel_i8_weight(w):
     return torch.round(w / scale[:, None]).clamp(-128, 127).to(torch.int8), scale.to(torch.float32)
 
 
-def rope_tables_q15_16(seq_len, head_dim, rope_theta=1_000_000.0, device="cuda"):
+def rope_tables(seq_len, head_dim, rope_theta=1_000_000.0, device="cuda"):
     pos = torch.arange(seq_len, device=device).float()[:, None]
     dim = torch.arange(head_dim // 2, device=device).float()[None, :]
     theta = pos * (rope_theta ** (-(2.0 * dim) / head_dim))
-    return q15_16(torch.cos(theta)), q15_16(torch.sin(theta)), theta
+    return torch.cos(theta).contiguous(), torch.sin(theta).contiguous(), theta
+
+
+def rope_tables_q15_16(seq_len, head_dim, rope_theta=1_000_000.0, device="cuda"):
+    cos, sin, theta = rope_tables(seq_len, head_dim, rope_theta, device)
+    return q15_16(cos), q15_16(sin), theta
 
 
 @dataclass
@@ -177,6 +198,8 @@ class Qwen3BlockWeights:
     v_i8_qt: torch.Tensor | None = None
     attn_i8_scale: torch.Tensor | None = None
     attn_i8_qt: torch.Tensor | None = None
+    attn_score_qt: torch.Tensor | None = None
+    attn_score_scale: torch.Tensor | None = None
     attn_out_qt: torch.Tensor | None = None
     qkv_out_qt: torch.Tensor | None = None
     o_out_qt: torch.Tensor | None = None
@@ -184,8 +207,6 @@ class Qwen3BlockWeights:
     down_out_qt: torch.Tensor | None = None
     post_mlp_i8_scale: torch.Tensor | None = None
     post_mlp_i8_qt: torch.Tensor | None = None
-    gated_mlp_i16_scale: torch.Tensor | None = None
-    gated_mlp_i16_qt: torch.Tensor | None = None
     gated_mlp_i8_scale: torch.Tensor | None = None
     gated_mlp_i8_qt: torch.Tensor | None = None
 
@@ -223,6 +244,9 @@ def load_packed_qwen3(packed_dir, config=QWEN3_0_6B, device="cuda", layers=None)
         def optional(name):
             return tensor(name) if name in keys else None
 
+        def optional_scale(name):
+            return scale_to_fp32(optional(name))
+
         def optional_qt(name):
             s = optional(name)
             return None if s is None else reciprocal_qt(s)
@@ -236,19 +260,18 @@ def load_packed_qwen3(packed_dir, config=QWEN3_0_6B, device="cuda", layers=None)
             return Int8LinearWeight(torch.cat([tensor(f"{name}.weight") for name in names], dim=0), torch.cat([tensor(f"{name}.scale") for name in names], dim=0))
 
         def linear_i8_qt(xs_name, linear_weight):
-            return pack_qt(optional(xs_name).to(torch.float64) * linear_weight.scale.to(torch.float64))
-
-        def linear_i16_qt(xs_name, linear_weight):
-            return pack_qt(optional(xs_name).to(torch.float64) * linear_weight.scale.to(torch.float64) * 256.0)
-
-        def down_qt(p, linear_weight):
-            scale = optional(f"{p}.gated_mlp_i8.scale")
-            if scale is None:
-                return linear_i16_qt(f"{p}.gated_mlp_i16.scale", linear_weight)
-            return linear_i8_qt(f"{p}.gated_mlp_i8.scale", linear_weight)
+            return pack_qt(scale_to_q15(optional(xs_name)).to(torch.float64) * linear_weight.scale.to(torch.float64))
 
         for layer_idx in range(n_layers):
             p = f"layers.{layer_idx}"
+            q_rope_scale = optional_scale(f"{p}.q_post_rope_i8.scale")
+            k_rope_scale = optional_scale(f"{p}.k_post_rope_i8.scale")
+            group = config.num_attention_heads // config.num_key_value_heads
+            q_rope_q15 = scale_to_q15(q_rope_scale).to(torch.int64)
+            k_rope_q15 = scale_to_q15(k_rope_scale).repeat_interleave(group).to(torch.int64)
+            attn_score_ratio = (((q_rope_q15 >> 4) * (k_rope_q15 >> 4)) >> 8).to(torch.float64) * 5793.0 / float(1 << 18)
+            attn_score_qt = pack_qt(attn_score_ratio)
+            attn_score_scale = (q_rope_scale.to(torch.float64) * k_rope_scale.repeat_interleave(group).to(torch.float64) / (config.head_dim**0.5)).to(torch.float32).contiguous()
             qkv_proj = cat_linear(f"{p}.qkv_proj", (f"{p}.q_proj", f"{p}.k_proj", f"{p}.v_proj"))
             o_proj = linear(f"{p}.o_proj")
             gate_up_proj = cat_linear(f"{p}.gate_up_proj", (f"{p}.gate_proj", f"{p}.up_proj"))
@@ -268,27 +291,27 @@ def load_packed_qwen3(packed_dir, config=QWEN3_0_6B, device="cuda", layers=None)
                     post_attention_layernorm=tensor(f"{p}.post_attention_layernorm"),
                     q_norm=tensor(f"{p}.q_norm"),
                     k_norm=tensor(f"{p}.k_norm"),
-                    input_qkv_i8_scale=optional(f"{p}.input_qkv_i8.scale"),
+                    input_qkv_i8_scale=optional_scale(f"{p}.input_qkv_i8.scale"),
                     input_qkv_i8_qt=optional_qt(f"{p}.input_qkv_i8.scale"),
-                    q_post_rope_i8_scale=optional(f"{p}.q_post_rope_i8.scale"),
+                    q_post_rope_i8_scale=optional_scale(f"{p}.q_post_rope_i8.scale"),
                     q_post_rope_i8_qt=optional_qt(f"{p}.q_post_rope_i8.scale"),
-                    k_post_rope_i8_scale=optional(f"{p}.k_post_rope_i8.scale"),
+                    k_post_rope_i8_scale=optional_scale(f"{p}.k_post_rope_i8.scale"),
                     k_post_rope_i8_qt=optional_qt(f"{p}.k_post_rope_i8.scale"),
-                    v_i8_scale=optional(f"{p}.v_i8.scale"),
+                    v_i8_scale=optional_scale(f"{p}.v_i8.scale"),
                     v_i8_qt=optional_qt(f"{p}.v_i8.scale"),
-                    attn_i8_scale=optional(f"{p}.attn_i8.scale"),
+                    attn_i8_scale=optional_scale(f"{p}.attn_i8.scale"),
                     attn_i8_qt=optional_qt(f"{p}.attn_i8.scale"),
-                    attn_out_qt=ratio_qt(optional(f"{p}.v_i8.scale"), optional(f"{p}.attn_i8.scale").to(torch.int64) * 32767),
+                    attn_score_qt=attn_score_qt,
+                    attn_score_scale=attn_score_scale,
+                    attn_out_qt=ratio_qt(scale_to_q15(optional(f"{p}.v_i8.scale")), scale_to_q15(optional(f"{p}.attn_i8.scale")).to(torch.int64) * 32767),
                     qkv_out_qt=linear_i8_qt(f"{p}.input_qkv_i8.scale", qkv_proj),
                     o_out_qt=linear_i8_qt(f"{p}.attn_i8.scale", o_proj),
                     gate_up_out_qt=linear_i8_qt(f"{p}.post_mlp_i8.scale", gate_up_proj),
-                    down_out_qt=down_qt(p, down_proj),
-                    gated_mlp_i8_scale=optional(f"{p}.gated_mlp_i8.scale"),
+                    down_out_qt=linear_i8_qt(f"{p}.gated_mlp_i8.scale", down_proj),
+                    gated_mlp_i8_scale=optional_scale(f"{p}.gated_mlp_i8.scale"),
                     gated_mlp_i8_qt=None if optional(f"{p}.gated_mlp_i8.scale") is None else reciprocal_sqrt_qt(optional(f"{p}.gated_mlp_i8.scale"), config.head_dim),
-                    post_mlp_i8_scale=optional(f"{p}.post_mlp_i8.scale"),
+                    post_mlp_i8_scale=optional_scale(f"{p}.post_mlp_i8.scale"),
                     post_mlp_i8_qt=optional_qt(f"{p}.post_mlp_i8.scale"),
-                    gated_mlp_i16_scale=optional(f"{p}.gated_mlp_i16.scale"),
-                    gated_mlp_i16_qt=optional_qt(f"{p}.gated_mlp_i16.scale"),
                 )
             )
         return tensor("model.embed_tokens.weight"), tensor("lm_head.weight"), tensor("model.norm.weight"), blocks
