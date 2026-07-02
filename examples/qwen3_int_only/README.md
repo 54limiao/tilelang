@@ -42,7 +42,7 @@ Equivalent direct command:
   --backend int-only \
   --compare-backend hf \
   --eval-dataset fineweb \
-  --max-tokens 2049 \
+  --max-tokens 2048 \
   --batch-size 1 \
   --num-batches 1 \
   --cache-prompt "你是一个有用而无害的聊天助手。" \
@@ -62,7 +62,7 @@ Profile the same static path:
 /root/venv/bin/python examples/qwen3_int_only/utils/profile_kernels.py \
   --model-dir /publicdata/huggingface.co/Qwen/Qwen3-0.6B \
   --packed-dir /tmp/Qwen3-0.6B-static-calib-32x2048 \
-  --max-tokens 2049 \
+  --max-tokens 2048 \
   --layers 28 \
   --warmup 1 \
   --repeat 3

@@ -70,11 +70,12 @@ def load_ids(tokenizer, args, total_tokens, device):
 
 def eval_windows(tokenizer, args, device):
     windows = args.batch_size * args.num_batches
-    ids = load_ids(tokenizer, args, args.max_tokens * windows, device)
-    if ids.numel() < args.max_tokens:
+    window_tokens = args.max_tokens + 1
+    ids = load_ids(tokenizer, args, window_tokens * windows, device)
+    if ids.numel() < window_tokens:
         return ids[None, :]
-    windows = min(windows, ids.numel() // args.max_tokens)
-    return ids[: args.max_tokens * windows].reshape(windows, args.max_tokens)
+    windows = min(windows, ids.numel() // window_tokens)
+    return ids[: window_tokens * windows].reshape(windows, window_tokens)
 
 
 def quant_i8_q15_16(x):
@@ -259,7 +260,7 @@ def main():
     parser.add_argument("--packed-dir", default="/tmp/Qwen3-0.6B-static-calib-32x2048")
     parser.add_argument("--backend", choices=["hf", "int-only"], default="int-only")
     parser.add_argument("--compare-backend", choices=["none", "hf"], default="hf")
-    parser.add_argument("--max-tokens", type=int, default=2049)
+    parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-batches", type=int, default=1)
     parser.add_argument("--eval-text", default="")
