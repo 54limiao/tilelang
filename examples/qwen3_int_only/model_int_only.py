@@ -52,10 +52,6 @@ class Qwen3IntOnlyBlock:
         self.lut_sigmoid = torch.from_numpy(sigmoid_lut()).cuda()
         self.lut_exp = torch.from_numpy(exp_lut_neg()).cuda()
 
-    def input_rms_quant(self, x, weights: Qwen3BlockWeights):
-        _res, x8 = self.rms_residual(x, self.zero_hidden, self.lut_rsqrt, weights.input_qkv_i8_qt)
-        return x8
-
     def __call__(self, x, weights: Qwen3BlockWeights, cos, sin, cache_k=None, cache_v=None, x8=None):
         cfg = self.config
         cache_k = self.empty_cache_k if cache_k is None else cache_k
@@ -105,21 +101,16 @@ class Qwen3IntOnlyModel:
         self.layers = int_only_norm_weights(self.layers)
 
     def hidden(self, input_ids, layers=None, cache_kv=None):
-        mlp = None
         n_layers = self.config.num_hidden_layers if layers is None else layers
         residual = self.embed_kernel(input_ids.to(torch.int32).contiguous(), self.embed_i8, self.embed_i8_scale)
-        x8 = None if n_layers == 0 else self.block.input_rms_quant(residual, self.layers[0])
+        mlp = self.zero_hidden
         for layer_idx in range(n_layers):
-            if layer_idx:
-                residual, x8 = self.block.rms_residual(residual, mlp, self.lut_rsqrt, self.layers[layer_idx].input_qkv_i8_qt)
+            weights = self.layers[layer_idx]
+            residual, x8 = self.block.rms_residual(residual, mlp, self.lut_rsqrt, weights.input_qkv_i8_qt)
             layer_cache = None if cache_kv is None else cache_kv[layer_idx]
-            if layer_cache is None:
-                residual, mlp = self.block(residual, self.layers[layer_idx], self.cos, self.sin, x8=x8)
-            else:
-                residual, mlp = self.block(residual, self.layers[layer_idx], self.cos, self.sin, layer_cache[0], layer_cache[1], x8=x8)
-        if n_layers == 0:
-            _residual, x8 = self.block.rms_residual(residual, self.zero_hidden, self.lut_rsqrt, self.final_i8_qt)
-            return x8
+            cache_k = None if layer_cache is None else layer_cache[0]
+            cache_v = None if layer_cache is None else layer_cache[1]
+            residual, mlp = self.block(residual, weights, self.cos, self.sin, cache_k, cache_v, x8)
         _residual, x8 = self.block.rms_residual(residual, mlp, self.lut_rsqrt, self.final_i8_qt)
         return x8
 

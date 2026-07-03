@@ -94,21 +94,17 @@ class Qwen3HybridModel:
         self.embed, self.embed_i8, _embed_i8_q15_scale, self.embed_i8_scale, self.lm_head, self.norm_weight, self.layers, self.lm_head_i8, self.final_i8_scale, _final_i8_qt, self.lm_head_out_qt, self.lm_head_out_scale = load_packed_qwen3(packed_dir, config, layers=layers)
 
     def hidden(self, input_ids, layers=None, cache_kv=None):
-        mlp = None
         n_layers = self.config.num_hidden_layers if layers is None else layers
         residual = self.embed_kernel(input_ids.to(torch.int32).contiguous(), self.embed_i8, self.embed_i8_scale)
-        x8 = None
+        mlp = self.zero_hidden
         for layer_idx in range(n_layers):
-            if layer_idx == 0:
-                _, x8 = self.block.rms_quant(residual, None, self.layers[layer_idx].input_layernorm, self.layers[layer_idx].input_qkv_i8_scale)
-            else:
-                residual, x8 = self.block.rms_quant(residual, mlp, self.layers[layer_idx].input_layernorm, self.layers[layer_idx].input_qkv_i8_scale)
+            weights = self.layers[layer_idx]
+            residual, x8 = self.block.rms_quant(residual, mlp, weights.input_layernorm, weights.input_qkv_i8_scale)
             layer_cache = None if cache_kv is None else cache_kv[layer_idx]
-            if layer_cache is None:
-                residual, mlp = self.block(residual, self.layers[layer_idx], self.cos, self.sin, x8=x8)
-            else:
-                residual, mlp = self.block(residual, self.layers[layer_idx], self.cos, self.sin, layer_cache[0], layer_cache[1], x8)
-        _residual, x8 = self.block.rms_quant(residual, self.zero_hidden if mlp is None else mlp, self.norm_weight, self.final_i8_scale)
+            cache_k = None if layer_cache is None else layer_cache[0]
+            cache_v = None if layer_cache is None else layer_cache[1]
+            residual, mlp = self.block(residual, weights, self.cos, self.sin, cache_k, cache_v, x8)
+        _residual, x8 = self.block.rms_quant(residual, mlp, self.norm_weight, self.final_i8_scale)
         return x8
 
     def logits(self, input_ids, layers=None, cache_kv=None):

@@ -18,7 +18,7 @@ data:    /publicdata/huggingface.co/datasets/HuggingFaceFW/fineweb/sample/10BT/0
 
 ## Quantization Scheme
 
-This example uses one static calibration pass to pack the model and then runs both `hybrid` and `int-only` inference from the same packed weights. Linear inputs are statically quantized to `int8`; all linear weights are per-channel static `int8`. All GEMMs in both backends are integer GEMMs. Hybrid only changes the non-GEMM scalar work: RMSNorm, RoPE, SiLU, Hadamard scaling, and online softmax are TileLang fp32 kernels, while QK, PV, QKV/O/Gate-Up/Down projections remain integer GEMMs.
+This example uses one static calibration pass to pack the model and then runs both `hybrid` and `int-only` inference from the same packed weights. Linear inputs are statically quantized to `int8`; all linear weights are per-channel static `int8`. Embedding and lm_head are also packed as `int8`. All GEMMs in both backends are integer GEMMs. Hybrid only changes the non-GEMM scalar work: RMSNorm, RoPE, SiLU, Hadamard scaling, and online softmax are TileLang fp32 kernels, while QK, PV, QKV/O/Gate-Up/Down/lm_head projections remain integer GEMMs.
 
 The hybrid backend stores the residual stream as `fp32`; each RMSNorm consumes `fp32 residual + Q15.16 linear output`, then emits `int8` activations for the next integer GEMM. The int-only backend stores the residual stream as Q15.16 `int32` and keeps the whole block in fixed-point integer form.
 
@@ -26,7 +26,7 @@ Calibration is data driven. The default script uses FineWeb from `/publicdata/hu
 
 QuaRot is applied during packing. R1 smooths residual-channel activation ranges through a single model-wide weight rotation, R2 rotates the V/O path with one saved matrix per layer, R3 is a fixed exact fast Hadamard on the Q/K head dimension, and R4 is the exact Hadamard rotation used before down_proj. The pack saves `quarot.r1`, `quarot.r4`, and `layers.N.r2`; cache builders read those matrices from the pack instead of reconstructing them from random seeds. R2 and R3 affect KV-cache semantics, so the cache builder applies the saved R2 matrix and the fixed R3 transform when it quantizes HF-generated prefix KV tensors.
 
-Linear kernels consume `int8` activations and per-channel `int8` weights. Activation-scale x weight-scale factors are precomputed into packed XP5 quant parameters, so each linear kernel ends with one `T.fix.quant` from the `int32` accumulator back to Q15.16. The packed QKV and gate/up matrices are concatenated offline to avoid runtime packing kernels.
+Linear kernels consume `int8` activations and per-channel `int8` weights. Activation-scale x weight-scale factors are precomputed into packed XP5 quant parameters, so each linear kernel ends with one `T.fix.quant` from the `int32` accumulator back to Q15.16. The packed QKV and gate/up matrices are concatenated offline to avoid runtime packing kernels. The input embedding lookup is outside the transformer block: `hybrid` reads the packed int8 embedding into an fp32 residual stream, while `int-only` reads it into Q15.16. The final RMSNorm emits `final_i8`, and lm_head is an `int8 x int8` GEMM.
 
 Attention is the main difference between the two backends. `hybrid` keeps Q/K/V and all GEMMs integer but uses TileLang fp32 for online softmax and normalization work. `int-only` keeps online softmax in fixed-point with `T.fix.lut_10bit`. Both backends compute QK once and compute PV as `P int16 x V int8`.
 
@@ -40,23 +40,36 @@ Hybrid uses the same integer GEMM dataflow but moves scalar-heavy work to TileLa
 
 ```mermaid
 flowchart TD
-  A["fp32 residual"] --> B["RMSNorm and input int8 quant<br/>fp32 residual plus Q15.16 linear"]
-  B --> C["QKV int8 x int8 GEMM"]
-  C --> D["QK RMSNorm, RoPE, R3<br/>TileLang fp32 int8 output"]
-  C --> E["V int8 quant"]
-  E --> F["V cache and current int8"]
-  D --> G["QK int8 x int8 GEMM"]
-  G --> H["Single-pass online softmax to P int16<br/>TileLang fp32 state"]
-  F --> J["PV integer GEMM<br/>P int16 x V int8"]
-  H --> J
-  J --> K["attention int8 quant<br/>TileLang fp32 scale"]
-  K --> L["O int8 x int8 GEMM"]
-  L --> M["RMSNorm and MLP int8 quant<br/>fp32 residual plus Q15.16 O output"]
-  M --> N["Gate Up int8 x int8 GEMM"]
-  N --> O["SiLU, R4 Hadamard, int8 quant<br/>TileLang fp32"]
-  O --> P["Down int8 x int8 GEMM"]
-  P --> Q["next fp32 residual path"]
-  class B,D,E,K,M,O quant;
+  TOK["token ids"] --> EMB["int8 embedding lookup<br/>embed_f32"]
+  EMB --> RES0["fp32 residual"]
+
+  subgraph ATTN["Attention block"]
+    RES0 --> A_RMS["RMSNorm and QKV int8 quant<br/>fp32 residual plus Q15.16 input"]
+    A_RMS --> QKV["QKV int8 x int8 GEMM"]
+    QKV --> QKPRE["QK RMSNorm, RoPE, R3<br/>TileLang fp32 to int8"]
+    QKV --> VQ["V int8 quant"]
+    QKPRE --> QK["QK int8 x int8 GEMM"]
+    QK --> SM["single-pass online softmax<br/>TileLang fp32 to P int16"]
+    VQ --> PV["PV integer GEMM<br/>P int16 x V int8"]
+    SM --> PV
+    PV --> AQ["attention int8 quant<br/>TileLang fp32 scale"]
+    AQ --> OPROJ["O int8 x int8 GEMM"]
+  end
+
+  subgraph MLP["MLP block"]
+    OPROJ --> M_RMS["RMSNorm and MLP int8 quant<br/>fp32 residual plus Q15.16 O output"]
+    M_RMS --> GU["Gate Up int8 x int8 GEMM"]
+    GU --> ACT["SiLU, R4, int8 quant<br/>TileLang fp32"]
+    ACT --> DOWN["Down int8 x int8 GEMM"]
+  end
+
+  DOWN --> RES1["next fp32 residual"]
+  RES1 --> FINAL["final RMSNorm and final_i8 quant"]
+  FINAL --> HEAD["lm_head int8 x int8 GEMM"]
+  HEAD --> LOGITS["logits"]
+  class A_RMS,QKPRE,VQ,AQ,M_RMS,ACT,FINAL quant;
+  style ATTN fill:#f6f8fa,stroke:#8c959f,stroke-width:1px,color:#24292f
+  style MLP fill:#f6f8fa,stroke:#8c959f,stroke-width:1px,color:#24292f
   classDef quant fill:#fff3cd,stroke:#d39e00,stroke-width:2px,color:#24292f;
 ```
 
@@ -64,24 +77,36 @@ Int-only keeps the whole block in fixed-point integer form. The block order is R
 
 ```mermaid
 flowchart TD
-  A["Q15.16 residual int32"] --> B["Residual RMSNorm<br/>T.fix rsqrt LUT"]
-  B --> C["input_qkv int8 quant"]
-  C --> D["QKV int8 x int8 GEMM"]
-  D --> E["QK RMSNorm, RoPE, R3<br/>T.fix int8 output"]
-  D --> F["V int8 quant"]
-  F --> G["V cache and current int8"]
-  E --> H["QK int8 x int8 GEMM"]
-  H --> I["Online softmax to P int16<br/>T.fix.lut_10bit"]
-  G --> K["PV integer GEMM<br/>P int16 x V int8"]
-  I --> K
-  K --> L["attention int8 quant"]
-  L --> M["O int8 x int8 GEMM"]
-  M --> N["Residual RMSNorm and MLP int8 quant<br/>T.fix rsqrt LUT"]
-  N --> O["Gate Up int8 x int8 GEMM"]
-  O --> P["SiLU LUT and R4 Hadamard<br/>int8 quant"]
-  P --> Q["Down int8 x int8 GEMM"]
-  Q --> R["next Q15.16 residual int32"]
-  class C,E,F,L,N,P quant;
+  TOK["token ids"] --> EMB["int8 embedding lookup<br/>embed_q15"]
+  EMB --> RES0["Q15.16 residual int32"]
+
+  subgraph ATTN["Attention block"]
+    RES0 --> A_RMS["Residual RMSNorm and QKV int8 quant<br/>T.fix rsqrt LUT"]
+    A_RMS --> QKV["QKV int8 x int8 GEMM"]
+    QKV --> QKPRE["QK RMSNorm, RoPE, R3<br/>T.fix to int8"]
+    QKV --> VQ["V int8 quant"]
+    QKPRE --> QK["QK int8 x int8 GEMM"]
+    QK --> SM["online softmax to P int16<br/>T.fix.lut_10bit"]
+    VQ --> PV["PV integer GEMM<br/>P int16 x V int8"]
+    SM --> PV
+    PV --> AQ["attention int8 quant"]
+    AQ --> OPROJ["O int8 x int8 GEMM"]
+  end
+
+  subgraph MLP["MLP block"]
+    OPROJ --> M_RMS["Residual RMSNorm and MLP int8 quant<br/>T.fix rsqrt LUT"]
+    M_RMS --> GU["Gate Up int8 x int8 GEMM"]
+    GU --> ACT["SiLU LUT, R4, int8 quant"]
+    ACT --> DOWN["Down int8 x int8 GEMM"]
+  end
+
+  DOWN --> RES1["next Q15.16 residual int32"]
+  RES1 --> FINAL["final residual RMSNorm and final_i8 quant"]
+  FINAL --> HEAD["lm_head int8 x int8 GEMM"]
+  HEAD --> LOGITS["logits"]
+  class A_RMS,QKPRE,VQ,AQ,M_RMS,ACT,FINAL quant;
+  style ATTN fill:#f6f8fa,stroke:#8c959f,stroke-width:1px,color:#24292f
+  style MLP fill:#f6f8fa,stroke:#8c959f,stroke-width:1px,color:#24292f
   classDef quant fill:#fff3cd,stroke:#d39e00,stroke-width:2px,color:#24292f;
 ```
 
@@ -96,33 +121,35 @@ Kernel numpy prototypes live under `utils/proto/` and can be checked with `pytho
 | backend | tokens | loss | ppl | cos | mse |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | HF bf16 | 2048 | 3.801437 | 44.765483 | - | - |
-| fake-quant | 2048 | 3.818876 | 45.552979 | 0.99498089 | 1.18436021e-01 |
-| hybrid | 2048 | 3.817686 | 45.498784 | 0.99511293 | 1.15650337e-01 |
-| int-only | 2048 | 3.811387 | 45.213109 | 0.98970484 | 2.33813720e-01 |
+| fake-quant | 2048 | 3.827024 | 45.925637 | 0.99504178 | 1.16263217e-01 |
+| hybrid | 2048 | 3.815134 | 45.382829 | 0.99455598 | 1.26209386e-01 |
+| int-only | 2048 | 3.833913 | 46.243149 | 0.98968546 | 2.35026454e-01 |
 
-Kernel profile for the hybrid LLM block path: 2048 tokens, 28 layers, prefix KV cache enabled, 16 measured repeats.
-
-| kernel | total ms | math TOPS | tc TOPS | tc util | pct |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| attention_hybrid | 283.414 | 54.58 | 81.87 | 13.12% | 51.89% |
-| linear_i8 | 140.625 | 205.24 | 205.24 | 32.89% | 25.75% |
-| qk_norm_rope_quant_hybrid | 41.181 | - | - | - | 7.54% |
-| silu_hadamard_quant_hybrid | 34.114 | - | - | - | 6.25% |
-| rms_quant_hybrid | 31.436 | - | - | - | 5.76% |
-| quant_v_i8 | 15.423 | - | - | - | 2.82% |
-| total | 546.193 | 81.16 | 95.32 | 15.28% | 100.00% |
-
-Kernel profile for the int-only LLM block path: 2048 tokens, 28 layers, prefix KV cache enabled, 16 measured repeats.
+Kernel profile for the hybrid embedding + transformer block path: 2048 tokens, 28 layers, prefix KV cache enabled, 16 serial measured repeats. The final RMSNorm and lm_head are included in the quality path above, but not in this kernel profile table.
 
 | kernel | total ms | math TOPS | tc TOPS | tc util | pct |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| attention_i8 | 259.898 | 59.52 | 89.28 | 14.31% | 49.20% |
-| linear_i8 | 142.797 | 202.12 | 202.12 | 32.39% | 27.03% |
-| qk_norm_rope_i8 | 44.307 | - | - | - | 8.39% |
-| rms_sq8 | 35.348 | - | - | - | 6.69% |
-| silu_hadamard_i8 | 30.762 | - | - | - | 5.82% |
-| quant_v_i8 | 15.121 | - | - | - | 2.86% |
-| total | 528.234 | 83.92 | 98.56 | 15.80% | 100.00% |
+| attention_hybrid | 284.948 | 54.28 | 81.43 | 13.05% | 51.24% |
+| linear_i8 | 142.863 | 202.03 | 202.03 | 32.38% | 25.69% |
+| qk_norm_rope_quant_hybrid | 42.131 | - | - | - | 7.58% |
+| rms_quant_hybrid | 34.600 | - | - | - | 6.22% |
+| silu_hadamard_quant_hybrid | 34.434 | - | - | - | 6.19% |
+| quant_v_i8 | 16.200 | - | - | - | 2.91% |
+| embed_f32 | 0.949 | - | - | - | 0.17% |
+| total | 556.125 | 79.71 | 93.62 | 15.00% | 100.00% |
+
+Kernel profile for the int-only embedding + transformer block path: 2048 tokens, 28 layers, prefix KV cache enabled, 16 serial measured repeats. The final RMSNorm and lm_head are included in the quality path above, but not in this kernel profile table.
+
+| kernel | total ms | math TOPS | tc TOPS | tc util | pct |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| attention_i8 | 254.342 | 60.82 | 91.23 | 14.62% | 49.00% |
+| linear_i8 | 140.983 | 204.72 | 204.72 | 32.81% | 27.16% |
+| qk_norm_rope_i8 | 44.505 | - | - | - | 8.57% |
+| rms_residual | 32.472 | - | - | - | 6.26% |
+| silu_hadamard_i8 | 30.609 | - | - | - | 5.90% |
+| quant_v_i8 | 15.196 | - | - | - | 2.93% |
+| embed_q15 | 0.963 | - | - | - | 0.19% |
+| total | 519.069 | 85.40 | 100.30 | 16.07% | 100.00% |
 
 ## Qwen3-14B
 
@@ -131,33 +158,35 @@ Kernel profile for the int-only LLM block path: 2048 tokens, 28 layers, prefix K
 | backend | tokens | loss | ppl | cos | mse |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | HF bf16 | 2048 | 3.031365 | 20.725512 | - | - |
-| fake-quant | 2048 | 3.056284 | 21.248450 | 0.98738441 | 4.13797397e-01 |
-| hybrid | 2048 | 3.062984 | 21.391299 | 0.98538696 | 4.82325177e-01 |
-| int-only | 2048 | 3.086072 | 21.890931 | 0.96772017 | 1.09932060e+00 |
+| fake-quant | 2048 | 3.064358 | 21.420716 | 0.98755582 | 4.08353757e-01 |
+| hybrid | 2048 | 3.066517 | 21.467000 | 0.98510624 | 4.89788597e-01 |
+| int-only | 2048 | 3.088784 | 21.950364 | 0.96796236 | 1.09022166e+00 |
 
-Kernel profile for the hybrid LLM block path: 2048 tokens, 40 layers, prefix KV cache enabled, 16 measured repeats.
-
-| kernel | total ms | math TOPS | tc TOPS | tc util | pct |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| linear_i8 | 2080.764 | 416.13 | 416.13 | 66.69% | 60.52% |
-| attention_hybrid | 951.372 | 58.07 | 87.10 | 13.96% | 27.67% |
-| silu_hadamard_quant_hybrid | 168.165 | - | - | - | 4.89% |
-| rms_quant_hybrid | 136.022 | - | - | - | 3.96% |
-| qk_norm_rope_quant_hybrid | 79.822 | - | - | - | 2.32% |
-| quant_v_i8 | 21.913 | - | - | - | 0.64% |
-| total | 3438.058 | 267.92 | 275.95 | 44.22% | 100.00% |
-
-Kernel profile for the int-only LLM block path: 2048 tokens, 40 layers, prefix KV cache enabled, 16 measured repeats.
+Kernel profile for the hybrid embedding + transformer block path: 2048 tokens, 40 layers, prefix KV cache enabled, 16 serial measured repeats. The final RMSNorm and lm_head are included in the quality path above, but not in this kernel profile table.
 
 | kernel | total ms | math TOPS | tc TOPS | tc util | pct |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| linear_i8 | 2078.041 | 416.67 | 416.67 | 66.77% | 63.86% |
-| attention_i8 | 767.517 | 71.98 | 107.97 | 17.30% | 23.59% |
-| silu_hadamard_i8 | 153.052 | - | - | - | 4.70% |
-| rms_sq8 | 141.362 | - | - | - | 4.34% |
-| qk_norm_rope_i8 | 91.623 | - | - | - | 2.82% |
-| quant_v_i8 | 22.250 | - | - | - | 0.68% |
-| total | 3253.845 | 283.08 | 291.57 | 46.73% | 100.00% |
+| linear_i8 | 2078.598 | 416.56 | 416.56 | 66.76% | 60.50% |
+| attention_hybrid | 948.454 | 58.25 | 87.37 | 14.00% | 27.61% |
+| silu_hadamard_quant_hybrid | 170.987 | - | - | - | 4.98% |
+| rms_quant_hybrid | 133.578 | - | - | - | 3.89% |
+| qk_norm_rope_quant_hybrid | 80.361 | - | - | - | 2.34% |
+| quant_v_i8 | 22.166 | - | - | - | 0.65% |
+| embed_f32 | 1.466 | - | - | - | 0.04% |
+| total | 3435.609 | 268.11 | 276.15 | 44.25% | 100.00% |
+
+Kernel profile for the int-only embedding + transformer block path: 2048 tokens, 40 layers, prefix KV cache enabled, 16 serial measured repeats. The final RMSNorm and lm_head are included in the quality path above, but not in this kernel profile table.
+
+| kernel | total ms | math TOPS | tc TOPS | tc util | pct |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| linear_i8 | 2081.500 | 415.98 | 415.98 | 66.66% | 63.97% |
+| attention_i8 | 769.615 | 71.78 | 107.67 | 17.26% | 23.65% |
+| silu_hadamard_i8 | 152.530 | - | - | - | 4.69% |
+| rms_residual | 135.905 | - | - | - | 4.18% |
+| qk_norm_rope_i8 | 91.135 | - | - | - | 2.80% |
+| quant_v_i8 | 21.639 | - | - | - | 0.67% |
+| embed_q15 | 1.465 | - | - | - | 0.05% |
+| total | 3253.789 | 283.09 | 291.58 | 46.73% | 100.00% |
 
 On 0.6B, attention is a large share because the MLP/linear matrices are small. On 14B, the same 2048-token attention work is much less dominant relative to the hidden/intermediate-size linear work, so `linear_i8` becomes the main cost.
 
