@@ -157,13 +157,17 @@ def rope_sq8(seq_len, heads, dim, qmax=127):
     return main
 
 
-def qk_norm_rope_i8(seq_len, heads, dim):
+def qk_norm_rope_i8(seq_len, heads, dim, gpb=8):
     mean_shift = int(math.log2(dim))
     thread_elem = 8
-    threads = 16
+    lanes = 16
     thread_round = 3
     warp_round = 4
     half_dim = dim // 2
+    total = seq_len * heads
+    while total % gpb != 0:
+        gpb //= 2
+    threads = lanes * gpb
 
     @T.prim_func
     def main(
@@ -175,42 +179,54 @@ def qk_norm_rope_i8(seq_len, heads, dim):
         QT: T.Tensor((heads,), "uint32"),
         Y: T.Tensor((heads, seq_len, dim), "int8"),
     ):
-        with T.Kernel(seq_len * heads, threads=threads) as r:
+        # Pack `gpb` independent (token, head) rows per block; each row is handled
+        # by its own 16-lane group with hand-rolled warp-shuffle reductions. This
+        # is numerically identical to the one-row-per-block version but raises
+        # occupancy ~10x (each block was previously only 16 threads).
+        with T.Kernel(total // gpb, threads=threads) as blk:
             tx = T.get_thread_binding(0)
+            grp = tx // lanes
+            lane = tx - grp * lanes
+            r = blk * gpb + grp
             t = r // heads
             h = r - t * heads
-            x = T.alloc_fragment((1, dim), "int32")
-            q = T.alloc_fragment((1, dim), "int32")
-            xx = T.alloc_fragment((1, dim), "int32")
-            amax = T.alloc_fragment((1,), "int32")
-            scale = T.alloc_fragment((1,), "int32")
-            row_qt = T.alloc_fragment((1,), "int32")
-            ss = T.alloc_fragment((1,), "int32")
-            ns = T.alloc_fragment((1,), "int32")
-            wk = T.alloc_fragment((1,), "int32")
-            inv = T.alloc_fragment((1,), "int32")
-            fold = T.alloc_fragment((1,), "int32")
-            norm_qt = T.alloc_fragment((1,), "int32")
-            out_qt = T.alloc_local((1,), "int32")
+            xv = T.alloc_local((thread_elem,), "int32")
+            qv = T.alloc_local((thread_elem,), "int32")
+            pv = T.alloc_local((thread_elem,), "int32")
             local = T.alloc_local((thread_elem,), "int32")
-            other_val = T.alloc_local((thread_elem,), "int32")
+            other = T.alloc_local((thread_elem,), "int32")
+            m = T.alloc_local((1,), "int32")
+            ssl = T.alloc_local((1,), "int32")
+            ns = T.alloc_local((1,), "int32")
+            wk = T.alloc_local((1,), "int32")
+            row_qt = T.alloc_local((1,), "int32")
+            norm_qt = T.alloc_local((1,), "int32")
+            inv = T.alloc_local((1,), "int32")
+            fold = T.alloc_local((1,), "int32")
+            out_qt = T.alloc_local((1,), "int32")
             out_qt[0] = T.cast(QT[h], "int32")
-            for d in T.Parallel(dim):
-                x[0, d] = X[r, d]
-                q[0, d] = T.if_then_else(x[0, d] < T.int32(0), T.int32(0) - x[0, d], x[0, d])
-            T.reduce_max(q, amax, dim=1, clear=True)
-            scale[0] = T.max((amax[0] + T.int32(32766)) // T.int32(32767), T.int32(1))
+            m[0] = T.int32(0)
+            for i in T.serial(thread_elem):
+                xv[i] = X[r, lane * T.int32(thread_elem) + i]
+                m[0] = T.max(m[0], T.if_then_else(xv[i] < T.int32(0), T.int32(0) - xv[i], xv[i]))
+            m[0] = T.max(m[0], T.tvm_warp_shuffle(0xFFFFFFFF, m[0], lane ^ T.int32(8), lanes, lanes))
+            m[0] = T.max(m[0], T.tvm_warp_shuffle(0xFFFFFFFF, m[0], lane ^ T.int32(4), lanes, lanes))
+            m[0] = T.max(m[0], T.tvm_warp_shuffle(0xFFFFFFFF, m[0], lane ^ T.int32(2), lanes, lanes))
+            m[0] = T.max(m[0], T.tvm_warp_shuffle(0xFFFFFFFF, m[0], lane ^ T.int32(1), lanes, lanes))
+            scale_v = T.max((m[0] + T.int32(32766)) // T.int32(32767), T.int32(1))
             row_qt[0] = (T.int32(DYN_SCALE_SHIFT) << T.int32(Q_MULTIPLIER_WIDTH)) | T.min(
-                (T.int32(DYN_SCALE_ONE) + (scale[0] >> T.int32(1))) // scale[0],
-                T.int32(MASK),
-            )
-            for d in T.Parallel(dim):
-                q[0, d] = T.fix.quant(x[0, d], scale=row_qt[0], out_dtype="int16")
-                xx[0, d] = (q[0, d] * q[0, d]) >> T.int32(mean_shift)
-            T.reduce_sum(xx, ss, dim=1, clear=True)
-            ss[0] += T.int32(1)
+                (T.int32(DYN_SCALE_ONE) + (scale_v >> T.int32(1))) // scale_v, T.int32(MASK))
+            ssl[0] = T.int32(0)
+            for i in T.serial(thread_elem):
+                qv[i] = T.cast(T.fix.quant(xv[i], scale=row_qt[0], out_dtype="int16"), "int32")
+                ssl[0] += (qv[i] * qv[i]) >> T.int32(mean_shift)
+            ssl[0] += T.tvm_warp_shuffle(0xFFFFFFFF, ssl[0], lane ^ T.int32(8), lanes, lanes)
+            ssl[0] += T.tvm_warp_shuffle(0xFFFFFFFF, ssl[0], lane ^ T.int32(4), lanes, lanes)
+            ssl[0] += T.tvm_warp_shuffle(0xFFFFFFFF, ssl[0], lane ^ T.int32(2), lanes, lanes)
+            ssl[0] += T.tvm_warp_shuffle(0xFFFFFFFF, ssl[0], lane ^ T.int32(1), lanes, lanes)
+            ssl[0] += T.int32(1)
             ns[0] = T.int32(0)
-            wk[0] = ss[0]
+            wk[0] = ssl[0]
             if (wk[0] & T.int32(-65536)) != T.int32(0):
                 ns[0] += T.int32(16)
                 wk[0] = wk[0] >> T.int32(16)
@@ -222,16 +238,20 @@ def qk_norm_rope_i8(seq_len, heads, dim):
                 wk[0] = wk[0] >> T.int32(4)
             if (wk[0] & T.int32(0xC)) != T.int32(0):
                 ns[0] += T.int32(2)
-            inv[0] = T.fix.lut_10bit(ss[0], RLUT, scale=((ns[0] - T.int32(7)) << T.int32(Q_MULTIPLIER_WIDTH)) | T.int32(1), out_dtype="int32")
+            inv[0] = T.fix.lut_10bit(ssl[0], RLUT, scale=((ns[0] - T.int32(7)) << T.int32(Q_MULTIPLIER_WIDTH)) | T.int32(1), out_dtype="int32")
             fold[0] = T.fix.quant(inv[0], scale=SCALE_1024, out_dtype="int32")
             norm_qt[0] = ((T.int32(6) + (ns[0] >> T.int32(1))) << T.int32(Q_MULTIPLIER_WIDTH)) | ((fold[0] >> T.int32(4)) & T.int32(MASK))
             for i in T.serial(thread_elem):
-                d = tx * thread_elem + i
-                src_d = T.if_then_else(d < T.int32(half_dim), d, d - T.int32(half_dim))
-                x0 = (T.fix.quant(q[0, src_d], scale=norm_qt[0], out_dtype="int32") * (W[src_d] >> T.int32(8))) >> T.int32(2)
-                x1 = (T.fix.quant(q[0, src_d + T.int32(half_dim)], scale=norm_qt[0], out_dtype="int32") * (W[src_d + T.int32(half_dim)] >> T.int32(8))) >> T.int32(2)
-                c = COS[t, src_d] >> T.int32(8)
-                s = SIN[t, src_d] >> T.int32(8)
+                pv[i] = T.tvm_warp_shuffle(0xFFFFFFFF, qv[i], lane ^ T.int32(8), lanes, lanes)
+            for i in T.serial(thread_elem):
+                d = lane * T.int32(thread_elem) + i
+                src = (lane & T.int32(7)) * T.int32(thread_elem) + i
+                x0src = T.if_then_else(lane < T.int32(8), qv[i], pv[i])
+                x1src = T.if_then_else(lane < T.int32(8), pv[i], qv[i])
+                x0 = (T.fix.quant(x0src, scale=norm_qt[0], out_dtype="int32") * (W[src] >> T.int32(8))) >> T.int32(2)
+                x1 = (T.fix.quant(x1src, scale=norm_qt[0], out_dtype="int32") * (W[src + T.int32(half_dim)] >> T.int32(8))) >> T.int32(2)
+                c = COS[t, src] >> T.int32(8)
+                s = SIN[t, src] >> T.int32(8)
                 lo = ((x0 >> T.int32(8)) * c) - ((x1 >> T.int32(8)) * s)
                 hi = ((x0 >> T.int32(8)) * s) + ((x1 >> T.int32(8)) * c)
                 local[i] = T.if_then_else(d < T.int32(half_dim), lo >> T.int32(8), hi >> T.int32(8))
@@ -245,9 +265,9 @@ def qk_norm_rope_i8(seq_len, heads, dim):
                         b = local[chunkbase + k + chunksize // 2]
                         local[chunkbase + k] = a + b
                         local[chunkbase + k + chunksize // 2] = local[chunkbase + k] - T.int32(2) * b
-            _warp_hadamard_i32(local, other_val, thread_elem, threads, warp_round)
+            _warp_hadamard_i32(local, other, thread_elem, lanes, warp_round)
             for i in T.serial(thread_elem):
-                Y[h, t, tx * thread_elem + i] = T.fix.quant(local[i] * T.int32(22), scale=out_qt[0], out_dtype="int8")
+                Y[h, t, lane * T.int32(thread_elem) + i] = T.fix.quant(local[i] * T.int32(22), scale=out_qt[0], out_dtype="int8")
 
     return main
 

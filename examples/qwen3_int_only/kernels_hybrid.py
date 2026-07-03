@@ -89,14 +89,18 @@ def rms_hybrid(rows, cols):
     return main
 
 
-def qk_norm_rope_quant_hybrid(seq_len, heads, dim):
+def qk_norm_rope_quant_hybrid(seq_len, heads, dim, gpb=8):
     thread_elem = 8
-    threads = 16
+    lanes = 16
     thread_round = 3
     warp_round = 4
     half_dim = dim // 2
     inv_dim = 1.0 / dim
     inv_sqrt_dim = 1.0 / math.sqrt(dim)
+    total = seq_len * heads
+    while total % gpb != 0:
+        gpb //= 2
+    threads = lanes * gpb
 
     @T.prim_func
     def main(
@@ -107,26 +111,40 @@ def qk_norm_rope_quant_hybrid(seq_len, heads, dim):
         SCALE: T.Tensor((heads,), "float32"),
         Y: T.Tensor((heads, seq_len, dim), "int8"),
     ):
-        with T.Kernel(seq_len * heads, threads=threads) as r:
+        # Pack `gpb` independent (token, head) rows per block; each row uses its own
+        # 16-lane group with a hand-rolled warp-shuffle sum reduction. Numerically
+        # identical to the one-row-per-block version, ~10x higher occupancy.
+        with T.Kernel(total // gpb, threads=threads) as blk:
             tx = T.get_thread_binding(0)
+            grp = tx // lanes
+            lane = tx - grp * lanes
+            r = blk * gpb + grp
             t = r // heads
             h = r - t * heads
-            x = T.alloc_fragment((1, dim), "float32")
-            xx = T.alloc_fragment((1, dim), "float32")
-            ss = T.alloc_fragment((1,), "float32")
-            inv = T.alloc_fragment((1,), "float32")
+            xv = T.alloc_local((thread_elem,), "float32")
+            pv = T.alloc_local((thread_elem,), "float32")
             local = T.alloc_local((thread_elem,), "float32")
             other = T.alloc_local((thread_elem,), "float32")
-            for d in T.Parallel(dim):
-                x[0, d] = T.cast(X[r, d], "float32") / T.float32(Q15_16_F)
-                xx[0, d] = x[0, d] * x[0, d] * T.float32(inv_dim)
-            T.reduce_sum(xx, ss, dim=1, clear=True)
+            ss = T.alloc_local((1,), "float32")
+            inv = T.alloc_local((1,), "float32")
+            ss[0] = T.float32(0.0)
+            for i in T.serial(thread_elem):
+                xv[i] = T.cast(X[r, lane * T.int32(thread_elem) + i], "float32") / T.float32(Q15_16_F)
+                ss[0] += xv[i] * xv[i] * T.float32(inv_dim)
+            ss[0] += T.tvm_warp_shuffle(0xFFFFFFFF, ss[0], lane ^ T.int32(8), lanes, lanes)
+            ss[0] += T.tvm_warp_shuffle(0xFFFFFFFF, ss[0], lane ^ T.int32(4), lanes, lanes)
+            ss[0] += T.tvm_warp_shuffle(0xFFFFFFFF, ss[0], lane ^ T.int32(2), lanes, lanes)
+            ss[0] += T.tvm_warp_shuffle(0xFFFFFFFF, ss[0], lane ^ T.int32(1), lanes, lanes)
             inv[0] = T.rsqrt(ss[0] + T.float32(1.0e-6))
             for i in T.serial(thread_elem):
-                d = tx * thread_elem + i
-                src = T.if_then_else(d < T.int32(half_dim), d, d - T.int32(half_dim))
-                x0 = x[0, src] * inv[0] * (T.cast(W[src], "float32") / T.float32(Q15_16_F))
-                x1 = x[0, src + T.int32(half_dim)] * inv[0] * (T.cast(W[src + T.int32(half_dim)], "float32") / T.float32(Q15_16_F))
+                pv[i] = T.tvm_warp_shuffle(0xFFFFFFFF, xv[i], lane ^ T.int32(8), lanes, lanes)
+            for i in T.serial(thread_elem):
+                d = lane * T.int32(thread_elem) + i
+                src = (lane & T.int32(7)) * T.int32(thread_elem) + i
+                x0src = T.if_then_else(lane < T.int32(8), xv[i], pv[i])
+                x1src = T.if_then_else(lane < T.int32(8), pv[i], xv[i])
+                x0 = x0src * inv[0] * (T.cast(W[src], "float32") / T.float32(Q15_16_F))
+                x1 = x1src * inv[0] * (T.cast(W[src + T.int32(half_dim)], "float32") / T.float32(Q15_16_F))
                 c = T.cast(COS[t, src], "float32")
                 s = T.cast(SIN[t, src], "float32")
                 local[i] = T.if_then_else(d < T.int32(half_dim), x0 * c - x1 * s, x0 * s + x1 * c)
@@ -140,9 +158,9 @@ def qk_norm_rope_quant_hybrid(seq_len, heads, dim):
                         b = local[chunkbase + k + chunksize // 2]
                         local[chunkbase + k] = a + b
                         local[chunkbase + k + chunksize // 2] = local[chunkbase + k] - T.float32(2.0) * b
-            _warp_hadamard_f32(local, other, thread_elem, threads, warp_round)
+            _warp_hadamard_f32(local, other, thread_elem, lanes, warp_round)
             for i in T.serial(thread_elem):
-                Y[h, t, tx * thread_elem + i] = _quant_i8_f32(local[i] * T.float32(inv_sqrt_dim), SCALE[h])
+                Y[h, t, lane * T.int32(thread_elem) + i] = _quant_i8_f32(local[i] * T.float32(inv_sqrt_dim), SCALE[h])
 
     return main
 
