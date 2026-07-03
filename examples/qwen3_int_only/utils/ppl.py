@@ -183,9 +183,9 @@ class Qwen3FakeQuantModel:
         self.cos, self.sin, _ = rope_tables(seq_len + cache_len, config.head_dim, config.rope_theta)
         self.embed, self.lm_head, self.norm_weight, self.layers = load_packed_qwen3(packed_dir, config, layers=layers)
 
-    def qk_norm_rope_qdq(self, x, weight_q15, cos, sin, heads, scale):
+    def qk_norm_rope_qdq(self, x, weight, cos, sin, heads, scale):
         cfg = self.config
-        x = rmsnorm_torch(x.reshape(self.seq_len, heads, cfg.head_dim), weight_q15.float() / Q15_16)
+        x = rmsnorm_torch(x.reshape(self.seq_len, heads, cfg.head_dim), weight)
         x = rope_torch(x.reshape(self.seq_len, heads * cfg.head_dim), cos, sin, heads, cfg.head_dim)
         x = fast_hadamard(x.reshape(self.seq_len, heads, cfg.head_dim))
         return qdq_i8(x.permute(1, 0, 2).contiguous(), scale[:, None])
@@ -214,7 +214,7 @@ class Qwen3FakeQuantModel:
         residual = self.embed[input_ids].float()
         for layer_idx in range(n_layers):
             weights = self.layers[layer_idx]
-            h = rmsnorm_torch(residual, weights.input_layernorm.float() / Q15_16)
+            h = rmsnorm_torch(residual, weights.input_layernorm)
             h = qdq_i8(h, weights.input_qkv_i8_scale)
             qkv = linear_qdq(h, weights.qkv_proj)
             q = qkv[:, : cfg.q_size].contiguous()
@@ -230,7 +230,7 @@ class Qwen3FakeQuantModel:
             cache_v = None if layer_cache is None else layer_cache[1]
             attn = self.attention(q, k, v, cache_k, cache_v, weights)
             residual = residual + linear_qdq(attn, weights.o_proj)
-            h = rmsnorm_torch(residual, weights.post_attention_layernorm.float() / Q15_16)
+            h = rmsnorm_torch(residual, weights.post_attention_layernorm)
             h = qdq_i8(h, weights.post_mlp_i8_scale)
             gate_up = linear_qdq(h, weights.gate_up_proj)
             gate = gate_up[:, : cfg.intermediate_size]
@@ -238,7 +238,7 @@ class Qwen3FakeQuantModel:
             gated = fast_hadamard(torch.nn.functional.silu(gate) * up, cfg.head_dim)
             gated = qdq_i8(gated, weights.gated_mlp_i8_scale)
             residual = residual + linear_qdq(gated, weights.down_proj)
-        return rmsnorm_torch(residual, self.norm_weight.float() / Q15_16)
+        return rmsnorm_torch(residual, self.norm_weight)
 
     def logits(self, input_ids, layers=None, cache_kv=None):
         return self.hidden(input_ids, layers=layers, cache_kv=cache_kv) @ self.lm_head.float().T

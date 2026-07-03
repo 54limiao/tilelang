@@ -33,7 +33,7 @@ def rms_quant_hybrid(rows, cols):
     def main(
         A: T.Tensor((rows, cols), "float32"),
         B: T.Tensor((rows, cols), "int32"),
-        W: T.Tensor((cols,), "int32"),
+        W: T.Tensor((cols,), "float32"),
         SCALE: T.Tensor((1,), "float32"),
         Y: T.Tensor((rows, cols), "float32"),
         Q: T.Tensor((rows, cols), "int8"),
@@ -50,7 +50,7 @@ def rms_quant_hybrid(rows, cols):
             T.reduce_sum(xx, ss, dim=1, clear=True)
             inv[0] = T.rsqrt(ss[0] + T.float32(1.0e-6))
             for c in T.Parallel(cols):
-                Q[r, c] = _quant_i8_f32(x[0, c] * inv[0] * (T.cast(W[c], "float32") / T.float32(Q15_16_F)), SCALE[0])
+                Q[r, c] = _quant_i8_f32(x[0, c] * inv[0] * W[c], SCALE[0])
 
     return main
 
@@ -62,7 +62,7 @@ def rms_hybrid(rows, cols):
     def main(
         A: T.Tensor((rows, cols), "float32"),
         B: T.Tensor((rows, cols), "int32"),
-        W: T.Tensor((cols,), "int32"),
+        W: T.Tensor((cols,), "float32"),
         Y: T.Tensor((rows, cols), "float32"),
         N: T.Tensor((rows, cols), "int32"),
     ):
@@ -80,7 +80,7 @@ def rms_hybrid(rows, cols):
             for c in T.Parallel(cols):
                 N[r, c] = T.cast(
                     T.round(
-                        x[0, c] * inv[0] * (T.cast(W[c], "float32") / T.float32(Q15_16_F)) * T.float32(Q15_16_F),
+                        x[0, c] * inv[0] * W[c] * T.float32(Q15_16_F),
                         rounding_mode="ties-away-from-zero",
                     ),
                     "int32",
@@ -105,7 +105,7 @@ def qk_norm_rope_quant_hybrid(seq_len, heads, dim, gpb=8):
     @T.prim_func
     def main(
         X: T.Tensor((seq_len * heads, dim), "int32"),
-        W: T.Tensor((dim,), "int32"),
+        W: T.Tensor((dim,), "float32"),
         COS: T.Tensor((seq_len, half_dim), "float32"),
         SIN: T.Tensor((seq_len, half_dim), "float32"),
         SCALE: T.Tensor((heads,), "float32"),
@@ -143,8 +143,8 @@ def qk_norm_rope_quant_hybrid(seq_len, heads, dim, gpb=8):
                 src = (lane & T.int32(7)) * T.int32(thread_elem) + i
                 x0src = T.if_then_else(lane < T.int32(8), xv[i], pv[i])
                 x1src = T.if_then_else(lane < T.int32(8), pv[i], xv[i])
-                x0 = x0src * inv[0] * (T.cast(W[src], "float32") / T.float32(Q15_16_F))
-                x1 = x1src * inv[0] * (T.cast(W[src + T.int32(half_dim)], "float32") / T.float32(Q15_16_F))
+                x0 = x0src * inv[0] * W[src]
+                x1 = x1src * inv[0] * W[src + T.int32(half_dim)]
                 c = T.cast(COS[t, src], "float32")
                 s = T.cast(SIN[t, src], "float32")
                 local[i] = T.if_then_else(d < T.int32(half_dim), x0 * c - x1 * s, x0 * s + x1 * c)

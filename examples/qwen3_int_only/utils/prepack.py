@@ -16,6 +16,7 @@ from examples.qwen3_int_only.utils import (
     SafeTensorReader,
     per_channel_i8_weight,
     q15_16,
+    static_scale_from_amax,
     hadamard_rotation,
     fast_hadamard,
     random_hadamard_rotation,
@@ -72,7 +73,7 @@ def update_stats_amax(acc, stats):
 
 
 def scale_from_amax(amax, qmax):
-    return (amax.float() / float(qmax * Q15_16)).clamp(min=1.0 / Q15_16).to(torch.float32)
+    return static_scale_from_amax(amax, qmax)
 
 
 def scales_from_amax(layer):
@@ -281,7 +282,7 @@ def main():
             final_norm = torch.ones_like(final_norm)
         tensors["model.embed_tokens.weight"] = embed.cpu().contiguous()
         tensors["lm_head.weight"] = lm_head.cpu().contiguous()
-        tensors["model.norm.weight"] = q15_16(final_norm).cpu()
+        tensors["model.norm.weight"] = final_norm.cpu().contiguous()
         calib_x = None
         cos = sin = None
         if calib_tokens:
@@ -325,12 +326,12 @@ def main():
             if args.use_r1:
                 input_norm = torch.ones_like(input_norm)
                 post_norm = torch.ones_like(post_norm)
-            tensors[f"{dst}.input_layernorm"] = q15_16(input_norm).cpu()
-            tensors[f"{dst}.post_attention_layernorm"] = q15_16(post_norm).cpu()
+            tensors[f"{dst}.input_layernorm"] = input_norm.cpu().contiguous()
+            tensors[f"{dst}.post_attention_layernorm"] = post_norm.cpu().contiguous()
             q_norm = tensor(f"{src}.self_attn.q_norm.weight")
             k_norm = tensor(f"{src}.self_attn.k_norm.weight")
-            tensors[f"{dst}.q_norm"] = q15_16(q_norm).cpu()
-            tensors[f"{dst}.k_norm"] = q15_16(k_norm).cpu()
+            tensors[f"{dst}.q_norm"] = q_norm.cpu().contiguous()
+            tensors[f"{dst}.k_norm"] = k_norm.cpu().contiguous()
             layer_float["down_hadamard"] = down_hadamard
             if calib_x is not None:
                 next_x = torch.empty_like(calib_x)

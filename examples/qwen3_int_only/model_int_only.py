@@ -12,7 +12,16 @@ from examples.qwen3_int_only.kernels_int_only import (
     silu_hadamard_i8,
     quant_v_i8,
 )
-from examples.qwen3_int_only.utils import QWEN3_0_6B, Qwen3BlockWeights, Qwen3Config, load_packed_qwen3, q15_16, rope_tables_q15_16
+
+from examples.qwen3_int_only.utils import (
+    QWEN3_0_6B,
+    Qwen3BlockWeights,
+    Qwen3Config,
+    int_only_norm_weights,
+    load_packed_qwen3,
+    q15_16,
+    rope_tables_q15_16,
+)
 from examples.qwen3_int_only.utils.lut import exp_lut_neg, rsqrt_lut, sigmoid_lut
 
 Q15_16 = 1 << 16
@@ -29,8 +38,8 @@ class Qwen3IntOnlyBlock:
         self.zero_hidden = torch.zeros((seq_len, h), device="cuda", dtype=torch.int32)
         self.empty_cache_k = torch.empty((kvh, cache_len, hd), device="cuda", dtype=torch.int8)
         self.empty_cache_v = torch.empty((kvh, cache_len, hd), device="cuda", dtype=torch.int8)
-        self.rms_q15 = tilelang.compile(rms_q15(seq_len, h), out_idx=[4, 5], target="cuda")
-        self.rms_sq8 = tilelang.compile(rms_sq8(seq_len, h), out_idx=[5, 6, 7], target="cuda")
+        self.rms_q15 = tilelang.compile(rms_q15(seq_len, h), out_idx=[3, 4], target="cuda")
+        self.rms_sq8 = tilelang.compile(rms_sq8(seq_len, h), out_idx=[4, 5, 6], target="cuda")
         self.quant_v = tilelang.compile(quant_v_i8(seq_len, kvh, hd), out_idx=[2], target="cuda")
         self.qk_rope_q = tilelang.compile(qk_norm_rope_i8(seq_len, qh, hd), out_idx=[6], target="cuda")
         self.qk_rope_k = tilelang.compile(qk_norm_rope_i8(seq_len, kvh, hd), out_idx=[6], target="cuda")
@@ -45,7 +54,7 @@ class Qwen3IntOnlyBlock:
         self.lut_exp = torch.from_numpy(exp_lut_neg()).cuda()
 
     def input_rms_quant(self, x, weights: Qwen3BlockWeights):
-        _res, x8, _scale = self.rms_sq8(x, self.zero_hidden, weights.input_layernorm, self.lut_rsqrt, weights.input_qkv_i8_qt)
+        _res, x8, _scale = self.rms_sq8(x, self.zero_hidden, self.lut_rsqrt, weights.input_qkv_i8_qt)
         return x8
 
     def __call__(self, x, weights: Qwen3BlockWeights, cos, sin, cache_k=None, cache_v=None, x8=None):
@@ -72,7 +81,7 @@ class Qwen3IntOnlyBlock:
             weights.attn_out_qt,
         )
         attn_out = self.o_proj(attn8, weights.o_proj.weight, weights.o_out_qt)
-        residual, h8, _ = self.rms_sq8(x, attn_out, weights.post_attention_layernorm, self.lut_rsqrt, weights.post_mlp_i8_qt)
+        residual, h8, _ = self.rms_sq8(x, attn_out, self.lut_rsqrt, weights.post_mlp_i8_qt)
         gate_up = self.gate_up_proj(h8, weights.gate_up_proj.weight, weights.gate_up_out_qt)
         gate = gate_up[:, : cfg.intermediate_size].contiguous()
         up = gate_up[:, cfg.intermediate_size :].contiguous()
@@ -88,11 +97,12 @@ class Qwen3IntOnlyModel:
         self.cache_len = cache_len
         self.config = config
         self.block = Qwen3IntOnlyBlock(seq_len, config, cache_len=cache_len)
-        self.final_norm = tilelang.compile(rms_q15(seq_len, config.hidden_size), out_idx=[4, 5], target="cuda")
+        self.final_norm = tilelang.compile(rms_q15(seq_len, config.hidden_size), out_idx=[3, 4], target="cuda")
         self.zero_hidden = torch.zeros((seq_len, config.hidden_size), device="cuda", dtype=torch.int32)
         self.lut_rsqrt = torch.from_numpy(rsqrt_lut()).cuda()
         self.cos, self.sin, _ = rope_tables_q15_16(seq_len + cache_len, config.head_dim, config.rope_theta)
         self.embed, self.lm_head, self.norm_weight, self.layers = load_packed_qwen3(packed_dir, config, layers=layers)
+        self.layers = int_only_norm_weights(self.layers)
 
     def hidden(self, input_ids, layers=None, cache_kv=None):
         mlp = None
@@ -101,16 +111,16 @@ class Qwen3IntOnlyModel:
         x8 = None if n_layers == 0 else self.block.input_rms_quant(residual, self.layers[0])
         for layer_idx in range(n_layers):
             if layer_idx:
-                residual, x8, _ = self.block.rms_sq8(residual, mlp, self.layers[layer_idx].input_layernorm, self.lut_rsqrt, self.layers[layer_idx].input_qkv_i8_qt)
+                residual, x8, _ = self.block.rms_sq8(residual, mlp, self.lut_rsqrt, self.layers[layer_idx].input_qkv_i8_qt)
             layer_cache = None if cache_kv is None else cache_kv[layer_idx]
             if layer_cache is None:
                 residual, mlp = self.block(residual, self.layers[layer_idx], self.cos, self.sin, x8=x8)
             else:
                 residual, mlp = self.block(residual, self.layers[layer_idx], self.cos, self.sin, layer_cache[0], layer_cache[1], x8=x8)
         if n_layers == 0:
-            _hidden, norm = self.final_norm(residual, self.zero_hidden, self.norm_weight, self.lut_rsqrt)
+            _hidden, norm = self.final_norm(residual, self.zero_hidden, self.lut_rsqrt)
             return norm
-        _hidden, norm = self.final_norm(residual, mlp, self.norm_weight, self.lut_rsqrt)
+        _hidden, norm = self.final_norm(residual, mlp, self.lut_rsqrt)
         return norm
 
     def logits(self, input_ids, layers=None, cache_kv=None):

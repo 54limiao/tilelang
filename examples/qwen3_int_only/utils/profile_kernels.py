@@ -10,7 +10,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from examples.qwen3_int_only.model_int_only import Q15_16, Qwen3IntOnlyBlock
 from examples.qwen3_int_only.model_hybrid import Qwen3HybridBlock
 from examples.qwen3_int_only.utils.ppl import iter_texts, quant_i8_static_q15_16
-from examples.qwen3_int_only.utils import Qwen3Config, fast_hadamard, load_packed_qwen3, q15_16, rope_tables, rope_tables_q15_16
+from examples.qwen3_int_only.utils import Qwen3Config, fast_hadamard, int_only_norm_weights, load_packed_qwen3, q15_16, rope_tables, rope_tables_q15_16
 
 
 DEFAULT_MODEL_DIR = "/publicdata/huggingface.co/Qwen/Qwen3-0.6B"
@@ -185,7 +185,7 @@ def run_block(block, x, x8, xs8, weights, cos, sin, prof, cache_k=None, cache_v=
     cache_v = block.empty_cache_v if cache_v is None else cache_v
     attn8 = prof.time("attention_i8", lambda: block.attn(q_attn, cache_k, cache_v, k_attn, v_attn, weights.attn_score_qt, block.lut_exp, weights.attn_out_qt), ops["attention_i8"], tc_ops["attention_i8"])
     attn_out = prof.time("linear_i8", lambda: block.o_proj(attn8, weights.o_proj.weight, weights.o_out_qt), ops["linear_i8_o"], tc_ops["linear_i8_o"])
-    h, h8, _hs8 = prof.time("rms_sq8", lambda: block.rms_sq8(x, attn_out, weights.post_attention_layernorm, block.lut_rsqrt, weights.post_mlp_i8_qt))
+    h, h8, _hs8 = prof.time("rms_sq8", lambda: block.rms_sq8(x, attn_out, block.lut_rsqrt, weights.post_mlp_i8_qt))
     gate_up = prof.time("linear_i8", lambda: block.gate_up_proj(h8, weights.gate_up_proj.weight, weights.gate_up_out_qt), ops["linear_i8_gate_up"], tc_ops["linear_i8_gate_up"])
     gate = gate_up[:, : cfg.intermediate_size].contiguous()
     up = gate_up[:, cfg.intermediate_size :].contiguous()
@@ -251,6 +251,8 @@ def main():
     ids = torch.tensor(ids[:seq_len], device="cuda", dtype=torch.long)
     _packed_r1, packed_r2 = packed_flags(args.packed_dir)
     embed, _, _, weights = load_packed_qwen3(args.packed_dir, config)
+    if args.backend == "int-only":
+        weights = int_only_norm_weights(weights)
     r2_mats = load_r2_matrices(args.packed_dir, args.layers)
     cache_path = cache_file_name(args.packed_dir, args.model_dir, args.cache_prompt, tokenizer, args.layers, packed_r2)
     if (not args.no_cache_kv_file) and os.path.exists(cache_path):
@@ -278,7 +280,7 @@ def main():
             residual = q15_16(embed[ids])
             _res, x8, xs8 = prof.time(
                 "rms_sq8",
-                lambda: block.rms_sq8(residual, block.zero_hidden, weights[0].input_layernorm, block.lut_rsqrt, weights[0].input_qkv_i8_qt),
+                lambda: block.rms_sq8(residual, block.zero_hidden, block.lut_rsqrt, weights[0].input_qkv_i8_qt),
             )
         mlp = None
         for layer_idx in range(args.layers):
@@ -291,7 +293,7 @@ def main():
                 else:
                     residual, x8, xs8 = prof.time(
                         "rms_sq8",
-                        lambda: block.rms_sq8(residual, mlp, weights[layer_idx].input_layernorm, block.lut_rsqrt, weights[layer_idx].input_qkv_i8_qt),
+                        lambda: block.rms_sq8(residual, mlp, block.lut_rsqrt, weights[layer_idx].input_qkv_i8_qt),
                     )
             cache_k, cache_v = cache_kv[layer_idx]
             if args.backend == "hybrid":

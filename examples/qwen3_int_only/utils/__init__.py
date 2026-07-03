@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 from pathlib import Path
 
@@ -97,6 +97,10 @@ def q15_16(x):
     return torch.clamp(torch.round(x * Q15_16), -(1 << 31), (1 << 31) - 1).to(torch.int32)
 
 
+def norm_to_fp32(weight):
+    return (weight.float() / Q15_16).contiguous() if not weight.dtype.is_floating_point else weight.float().contiguous()
+
+
 def ratio_qt(numer, denom):
     n = numer.to(torch.int64).clamp(min=1)
     d = denom.to(torch.int64).clamp(min=1)
@@ -149,6 +153,25 @@ def reciprocal_sqrt_qt(scale, dim):
 def per_channel_i8_weight(w):
     scale = w.abs().amax(dim=1).clamp(min=1e-6) / 127.0
     return torch.round(w / scale[:, None]).clamp(-128, 127).to(torch.int8), scale.to(torch.float32)
+
+
+def per_tensor_i16_weight(w):
+    w = norm_to_fp32(w)
+    scale = w.abs().amax().clamp(min=1e-6) / 32767.0
+    q = torch.round(w / scale).clamp(-32768, 32767).to(torch.int32).contiguous()
+    return q, scale.to(torch.float32)
+
+
+def i16_weight_to_i8_qt(weight_scale, out_scale):
+    return pack_qt(weight_scale.to(torch.float64) / (out_scale.to(torch.float64) * 2.0))
+
+
+def unit_i16_weight_to_i8_qt(out_scale):
+    return pack_qt(1.0 / (out_scale.to(torch.float64) * 1024.0))
+
+
+def static_scale_from_amax(amax, qmax):
+    return (amax.float() / float(qmax * Q15_16)).clamp(min=1.0 / Q15_16).to(torch.float32)
 
 
 def rope_tables(seq_len, head_dim, rope_theta=1_000_000.0, device="cuda"):
@@ -212,6 +235,25 @@ class Qwen3BlockWeights:
     gated_mlp_i8_qt: torch.Tensor | None = None
 
 
+def int_only_norm_weights(weights):
+    out = []
+    for layer in weights:
+        q_norm, q_scale = per_tensor_i16_weight(layer.q_norm)
+        k_norm, k_scale = per_tensor_i16_weight(layer.k_norm)
+        out.append(
+            replace(
+                layer,
+                q_norm=q_norm,
+                k_norm=k_norm,
+                input_qkv_i8_qt=unit_i16_weight_to_i8_qt(layer.input_qkv_i8_scale),
+                post_mlp_i8_qt=unit_i16_weight_to_i8_qt(layer.post_mlp_i8_scale),
+                q_post_rope_i8_qt=i16_weight_to_i8_qt(q_scale, layer.q_post_rope_i8_scale),
+                k_post_rope_i8_qt=i16_weight_to_i8_qt(k_scale, layer.k_post_rope_i8_scale),
+            )
+        )
+    return out
+
+
 # Used by small standalone tests and by prepack-compatible float loading.
 def pack_block_weights(q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj, input_layernorm, post_attention_layernorm, q_norm, k_norm):
     return Qwen3BlockWeights(
@@ -241,6 +283,9 @@ def load_packed_qwen3(packed_dir, config=QWEN3_0_6B, device="cuda", layers=None)
 
         def tensor(name):
             return f.get_tensor(name)
+
+        def norm_tensor(name):
+            return norm_to_fp32(tensor(name))
 
         def optional(name):
             return tensor(name) if name in keys else None
@@ -288,10 +333,10 @@ def load_packed_qwen3(packed_dir, config=QWEN3_0_6B, device="cuda", layers=None)
                     up_proj=linear(f"{p}.up_proj"),
                     gate_up_proj=gate_up_proj,
                     down_proj=down_proj,
-                    input_layernorm=tensor(f"{p}.input_layernorm"),
-                    post_attention_layernorm=tensor(f"{p}.post_attention_layernorm"),
-                    q_norm=tensor(f"{p}.q_norm"),
-                    k_norm=tensor(f"{p}.k_norm"),
+                    input_layernorm=norm_tensor(f"{p}.input_layernorm"),
+                    post_attention_layernorm=norm_tensor(f"{p}.post_attention_layernorm"),
+                    q_norm=norm_tensor(f"{p}.q_norm"),
+                    k_norm=norm_tensor(f"{p}.k_norm"),
                     input_qkv_i8_scale=optional_scale(f"{p}.input_qkv_i8.scale"),
                     input_qkv_i8_qt=optional_qt(f"{p}.input_qkv_i8.scale"),
                     q_post_rope_i8_scale=optional_scale(f"{p}.q_post_rope_i8.scale"),
@@ -315,7 +360,7 @@ def load_packed_qwen3(packed_dir, config=QWEN3_0_6B, device="cuda", layers=None)
                     post_mlp_i8_qt=optional_qt(f"{p}.post_mlp_i8.scale"),
                 )
             )
-        return tensor("model.embed_tokens.weight"), tensor("lm_head.weight"), tensor("model.norm.weight"), blocks
+        return tensor("model.embed_tokens.weight"), tensor("lm_head.weight"), norm_tensor("model.norm.weight"), blocks
 
 
 def load_embed_tokens(model_dir="/publicdata/huggingface.co/Qwen/Qwen3-0.6B", device="cuda"):

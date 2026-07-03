@@ -38,7 +38,6 @@ def rms_q15(rows, cols, qmax=32767):
     def main(
         A: T.Tensor((rows, cols), "int32"),
         B: T.Tensor((rows, cols), "int32"),
-        W: T.Tensor((cols,), "int32"),
         RLUT: T.Tensor((1024,), "int16"),
         Y: T.Tensor((rows, cols), "int32"),
         N: T.Tensor((rows, cols), "int32"),
@@ -87,10 +86,9 @@ def rms_q15(rows, cols, qmax=32767):
                 ns[0] += T.int32(2)
             inv[0] = T.fix.lut_10bit(ss[0], RLUT, scale=((ns[0] - T.int32(7)) << T.int32(Q_MULTIPLIER_WIDTH)) | T.int32(1), out_dtype="int32")
             fold[0] = T.fix.quant(inv[0], scale=SCALE_1024, out_dtype="int32")
-            qt[0] = ((T.int32(6) + (ns[0] >> T.int32(1))) << T.int32(Q_MULTIPLIER_WIDTH)) | ((fold[0] >> T.int32(4)) & T.int32(MASK))
+            qt[0] = ((ns[0] >> T.int32(1)) << T.int32(Q_MULTIPLIER_WIDTH)) | ((fold[0] >> T.int32(4)) & T.int32(MASK))
             for c in T.Parallel(cols):
-                norm[c] = T.fix.quant(q[0, c], scale=qt[0], out_dtype="int32")
-                N[r, c] = (norm[c] * (W[c] >> T.int32(8))) >> T.int32(2)
+                N[r, c] = T.fix.quant(q[0, c], scale=qt[0], out_dtype="int32")
 
     return main
 
@@ -248,8 +246,8 @@ def qk_norm_rope_i8(seq_len, heads, dim, gpb=8):
                 src = (lane & T.int32(7)) * T.int32(thread_elem) + i
                 x0src = T.if_then_else(lane < T.int32(8), qv[i], pv[i])
                 x1src = T.if_then_else(lane < T.int32(8), pv[i], qv[i])
-                x0 = (T.fix.quant(x0src, scale=norm_qt[0], out_dtype="int32") * (W[src] >> T.int32(8))) >> T.int32(2)
-                x1 = (T.fix.quant(x1src, scale=norm_qt[0], out_dtype="int32") * (W[src + T.int32(half_dim)] >> T.int32(8))) >> T.int32(2)
+                x0 = (T.fix.quant(x0src, scale=norm_qt[0], out_dtype="int32") * W[src]) >> T.int32(9)
+                x1 = (T.fix.quant(x1src, scale=norm_qt[0], out_dtype="int32") * W[src + T.int32(half_dim)]) >> T.int32(9)
                 c = COS[t, src] >> T.int32(8)
                 s = SIN[t, src] >> T.int32(8)
                 lo = ((x0 >> T.int32(8)) * c) - ((x1 >> T.int32(8)) * s)
@@ -279,7 +277,6 @@ def rms_sq8(rows, cols, qmax=127):
     def main(
         A: T.Tensor((rows, cols), "int32"),
         B: T.Tensor((rows, cols), "int32"),
-        W: T.Tensor((cols,), "int32"),
         RLUT: T.Tensor((1024,), "int16"),
         QT: T.Tensor((1,), "uint32"),
         Y: T.Tensor((rows, cols), "int32"),
@@ -299,7 +296,6 @@ def rms_sq8(rows, cols, qmax=127):
             fold = T.alloc_fragment((1,), "int32")
             qt = T.alloc_fragment((1,), "int32")
             norm = T.alloc_fragment((cols,), "int32")
-            post = T.alloc_fragment((1, cols), "int32")
             post_qt = T.alloc_fragment((1,), "int32")
             post_qt[0] = T.cast(QT[0], "int32")
             S[r] = QT[0]
@@ -337,8 +333,7 @@ def rms_sq8(rows, cols, qmax=127):
             qt[0] = ((T.int32(6) + (ns[0] >> T.int32(1))) << T.int32(Q_MULTIPLIER_WIDTH)) | ((fold[0] >> T.int32(4)) & T.int32(MASK))
             for c in T.Parallel(cols):
                 norm[c] = T.fix.quant(q[0, c], scale=qt[0], out_dtype="int32")
-                post[0, c] = (norm[c] * (W[c] >> T.int32(8))) >> T.int32(2)
-                Q[r, c] = T.fix.quant(post[0, c], scale=post_qt[0], out_dtype="int8")
+                Q[r, c] = T.fix.quant(norm[c], scale=post_qt[0], out_dtype="int8")
 
     return main
 

@@ -43,13 +43,13 @@ class Qwen3HybridBlock:
         self.empty_cache_v = torch.empty((kvh, cache_len, hd), device="cuda", dtype=torch.int8)
         self.zero_hidden = torch.zeros((seq_len, h), device="cuda", dtype=torch.int32)
 
-    def rms_quant(self, residual_f32, linear_q15, weight_q15, out_scale):
+    def rms_quant(self, residual_f32, linear_q15, weight, out_scale):
         linear_q15 = self.zero_hidden if linear_q15 is None else linear_q15
-        return self.rms_quant_kernel(residual_f32, linear_q15, weight_q15, out_scale)
+        return self.rms_quant_kernel(residual_f32, linear_q15, weight, out_scale)
 
-    def qk_norm_rope_quant(self, x_q15, weight_q15, cos, sin, heads, out_scale):
+    def qk_norm_rope_quant(self, x_q15, weight, cos, sin, heads, out_scale):
         kernel = self.rope_q if heads == self.config.num_attention_heads else self.rope_k
-        return kernel(x_q15.reshape(self.seq_len * heads, self.config.head_dim).contiguous(), weight_q15, cos, sin, out_scale)
+        return kernel(x_q15.reshape(self.seq_len * heads, self.config.head_dim).contiguous(), weight, cos, sin, out_scale)
 
     def attention_hybrid(self, q8, k8, v8, cache_k, cache_v, weights):
         return self.attn(q8, cache_k, cache_v, k8, v8, weights.attn_score_scale, weights.v_i8_scale, weights.attn_i8_scale)
