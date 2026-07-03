@@ -36,75 +36,33 @@ Quality is reported against HF bf16 logits with PPL, cosine, MSE. `fake-quant` u
 
 ## Runtime Flow
 
-Hybrid uses the same integer GEMM dataflow but moves scalar-heavy work to TileLang fp32 kernels. The block order is RMSNorm, attention, RMSNorm, MLP. QK and PV are still integer GEMMs; fp32 is used only around them for residual accumulation, normalization, RoPE, SiLU, and online softmax state.
+Hybrid and int-only use the same graph below. The only semantic difference is the scalar/residual representation: hybrid uses fp32 residuals and fp32 scalar kernels, while int-only uses Q15.16 int32 residuals and fixed-point scalar kernels. All GEMMs are integer GEMMs in both paths.
 
 ```mermaid
 flowchart TD
-  TOK["token ids"] --> EMB["int8 embedding lookup<br/>embed_f32"]
-  EMB --> RES0["fp32 residual"]
+  EMB["Embedding"] --> A_RMS
 
   subgraph ATTN["Attention block"]
-    RES0 --> A_RMS["RMSNorm and QKV int8 quant<br/>fp32 residual plus Q15.16 input"]
+    A_RMS["residual RMSNorm + QKV quant"]
     A_RMS --> QKV["QKV int8 x int8 GEMM"]
-    QKV --> QKPRE["QK RMSNorm, RoPE, R3<br/>TileLang fp32 to int8"]
-    QKV --> VQ["V int8 quant"]
-    QKPRE --> QK["QK int8 x int8 GEMM"]
-    QK --> SM["single-pass online softmax<br/>TileLang fp32 to P int16"]
-    VQ --> PV["PV integer GEMM<br/>P int16 x V int8"]
-    SM --> PV
-    PV --> AQ["attention int8 quant<br/>TileLang fp32 scale"]
-    AQ --> OPROJ["O int8 x int8 GEMM"]
+    QKV --> QKPRE["QK norm + RoPE + R3"]
+    QKV --> VQ["V quant"]
+    QKPRE --> FA["FlashAttention<br/>QK int8 x int8, PV int16 x int8"]
+    VQ --> FA
+    FA --> OQ["O quant"]
+    OQ --> OPROJ["O int8 x int8 GEMM"]
   end
 
   subgraph MLP["MLP block"]
-    OPROJ --> M_RMS["RMSNorm and MLP int8 quant<br/>fp32 residual plus Q15.16 O output"]
+    OPROJ --> M_RMS["residual RMSNorm + MLP quant"]
     M_RMS --> GU["Gate Up int8 x int8 GEMM"]
-    GU --> ACT["SiLU, R4, int8 quant<br/>TileLang fp32"]
+    GU --> ACT["SiLU + R4 + quant"]
     ACT --> DOWN["Down int8 x int8 GEMM"]
   end
 
-  DOWN --> RES1["next fp32 residual"]
-  RES1 --> FINAL["final RMSNorm and final_i8 quant"]
+  DOWN --> FINAL["residual final RMSNorm + quant"]
   FINAL --> HEAD["lm_head int8 x int8 GEMM"]
-  HEAD --> LOGITS["logits"]
-  class A_RMS,QKPRE,VQ,AQ,M_RMS,ACT,FINAL quant;
-  style ATTN fill:#f6f8fa,stroke:#8c959f,stroke-width:1px,color:#24292f
-  style MLP fill:#f6f8fa,stroke:#8c959f,stroke-width:1px,color:#24292f
-  classDef quant fill:#fff3cd,stroke:#d39e00,stroke-width:2px,color:#24292f;
-```
-
-Int-only keeps the whole block in fixed-point integer form. The block order is RMSNorm, attention, RMSNorm, MLP. Every matrix multiply is an integer GEMM, including QK and PV in attention.
-
-```mermaid
-flowchart TD
-  TOK["token ids"] --> EMB["int8 embedding lookup<br/>embed_q15"]
-  EMB --> RES0["Q15.16 residual int32"]
-
-  subgraph ATTN["Attention block"]
-    RES0 --> A_RMS["Residual RMSNorm and QKV int8 quant<br/>T.fix rsqrt LUT"]
-    A_RMS --> QKV["QKV int8 x int8 GEMM"]
-    QKV --> QKPRE["QK RMSNorm, RoPE, R3<br/>T.fix to int8"]
-    QKV --> VQ["V int8 quant"]
-    QKPRE --> QK["QK int8 x int8 GEMM"]
-    QK --> SM["online softmax to P int16<br/>T.fix.lut_10bit"]
-    VQ --> PV["PV integer GEMM<br/>P int16 x V int8"]
-    SM --> PV
-    PV --> AQ["attention int8 quant"]
-    AQ --> OPROJ["O int8 x int8 GEMM"]
-  end
-
-  subgraph MLP["MLP block"]
-    OPROJ --> M_RMS["Residual RMSNorm and MLP int8 quant<br/>T.fix rsqrt LUT"]
-    M_RMS --> GU["Gate Up int8 x int8 GEMM"]
-    GU --> ACT["SiLU LUT, R4, int8 quant"]
-    ACT --> DOWN["Down int8 x int8 GEMM"]
-  end
-
-  DOWN --> RES1["next Q15.16 residual int32"]
-  RES1 --> FINAL["final residual RMSNorm and final_i8 quant"]
-  FINAL --> HEAD["lm_head int8 x int8 GEMM"]
-  HEAD --> LOGITS["logits"]
-  class A_RMS,QKPRE,VQ,AQ,M_RMS,ACT,FINAL quant;
+  class A_RMS,QKPRE,VQ,OQ,M_RMS,ACT,FINAL quant;
   style ATTN fill:#f6f8fa,stroke:#8c959f,stroke-width:1px,color:#24292f
   style MLP fill:#f6f8fa,stroke:#8c959f,stroke-width:1px,color:#24292f
   classDef quant fill:#fff3cd,stroke:#d39e00,stroke-width:2px,color:#24292f;
