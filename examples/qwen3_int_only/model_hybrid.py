@@ -37,7 +37,8 @@ class Qwen3HybridBlock:
         self.rope_q = tilelang.compile(qk_norm_rope_quant_hybrid(seq_len, qh, hd), out_idx=[5], target="cuda")
         self.rope_k = tilelang.compile(qk_norm_rope_quant_hybrid(seq_len, kvh, hd), out_idx=[5], target="cuda")
         self.silu_kernel = tilelang.compile(silu_hadamard_quant_hybrid(seq_len, im), out_idx=[3], target="cuda")
-        self.attn = tilelang.compile(attention_hybrid(qh, kvh, seq_len, cache_len, hd), out_idx=[8], target="cuda")
+        attn_block_n = 96 if h <= 1024 else 128
+        self.attn = tilelang.compile(attention_hybrid(qh, kvh, seq_len, cache_len, hd, block_n=attn_block_n), out_idx=[8], target="cuda")
         self.empty_cache_k = torch.empty((kvh, cache_len, hd), device="cuda", dtype=torch.int8)
         self.empty_cache_v = torch.empty((kvh, cache_len, hd), device="cuda", dtype=torch.int8)
         self.zero_hidden = torch.zeros((seq_len, h), device="cuda", dtype=torch.int32)

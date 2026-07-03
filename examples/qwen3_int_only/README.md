@@ -97,20 +97,20 @@ Kernel numpy prototypes live under `utils/proto/` and can be checked with `pytho
 | --- | ---: | ---: | ---: | ---: | ---: |
 | HF bf16 | 2048 | 3.801437 | 44.765483 | - | - |
 | fake-quant | 2048 | 3.818876 | 45.552979 | 0.99498089 | 1.18436021e-01 |
-| hybrid | 2048 | 3.823574 | 45.767492 | 0.99519182 | 1.12245756e-01 |
+| hybrid | 2048 | 3.813812 | 45.322882 | 0.99504820 | 1.16307650e-01 |
 | int-only | 2048 | 3.805970 | 44.968847 | 0.99117421 | 2.01085618e-01 |
 
 Kernel profile for the hybrid LLM block path: 2048 tokens, 28 layers, prefix KV cache enabled, 16 measured repeats.
 
 | kernel | total ms | math TOPS | tc TOPS | tc util | pct |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| attention_hybrid | 308.861 | 50.08 | 75.12 | 12.04% | 53.86% |
-| linear_i8 | 142.692 | 202.27 | 202.27 | 32.41% | 24.88% |
-| qk_norm_rope_quant_hybrid | 41.094 | - | - | - | 7.17% |
-| silu_hadamard_quant_hybrid | 34.303 | - | - | - | 5.98% |
-| rms_quant_hybrid | 30.966 | - | - | - | 5.40% |
-| quant_v_i8 | 15.503 | - | - | - | 2.70% |
-| total | 573.418 | 77.31 | 90.80 | 14.55% | 100.00% |
+| attention_hybrid | 291.200 | 53.12 | 79.68 | 12.77% | 51.79% |
+| linear_i8 | 145.697 | 198.10 | 198.10 | 31.75% | 25.91% |
+| qk_norm_rope_quant_hybrid | 42.017 | - | - | - | 7.47% |
+| silu_hadamard_quant_hybrid | 34.905 | - | - | - | 6.21% |
+| rms_quant_hybrid | 32.383 | - | - | - | 5.76% |
+| quant_v_i8 | 16.018 | - | - | - | 2.85% |
+| total | 562.220 | 78.85 | 92.61 | 14.84% | 100.00% |
 
 Kernel profile for the int-only LLM block path: 2048 tokens, 28 layers, prefix KV cache enabled, 16 measured repeats.
 
@@ -139,13 +139,13 @@ Kernel profile for the hybrid LLM block path: 2048 tokens, 40 layers, prefix KV 
 
 | kernel | total ms | math TOPS | tc TOPS | tc util | pct |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| linear_i8 | 2082.611 | 415.76 | 415.76 | 66.63% | 60.46% |
-| attention_hybrid | 950.633 | 58.11 | 87.17 | 13.97% | 27.60% |
-| silu_hadamard_quant_hybrid | 169.109 | - | - | - | 4.91% |
-| rms_quant_hybrid | 137.857 | - | - | - | 4.00% |
-| qk_norm_rope_quant_hybrid | 81.719 | - | - | - | 2.37% |
-| quant_v_i8 | 22.835 | - | - | - | 0.66% |
-| total | 3444.763 | 267.39 | 275.41 | 44.14% | 100.00% |
+| linear_i8 | 2080.764 | 416.13 | 416.13 | 66.69% | 60.52% |
+| attention_hybrid | 951.372 | 58.07 | 87.10 | 13.96% | 27.67% |
+| silu_hadamard_quant_hybrid | 168.165 | - | - | - | 4.89% |
+| rms_quant_hybrid | 136.022 | - | - | - | 3.96% |
+| qk_norm_rope_quant_hybrid | 79.822 | - | - | - | 2.32% |
+| quant_v_i8 | 21.913 | - | - | - | 0.64% |
+| total | 3438.058 | 267.92 | 275.95 | 44.22% | 100.00% |
 
 Kernel profile for the int-only LLM block path: 2048 tokens, 40 layers, prefix KV cache enabled, 16 measured repeats.
 
