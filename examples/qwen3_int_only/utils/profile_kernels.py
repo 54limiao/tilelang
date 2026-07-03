@@ -156,7 +156,9 @@ def save_cached_kv(path, cache_kv, cache_len):
         "cache_len": int(cache_len),
         "cache_kv": [(k.cpu(), v.cpu()) for k, v in cache_kv],
     }
-    torch.save(data, path)
+    tmp_path = f"{path}.{os.getpid()}.tmp"
+    torch.save(data, tmp_path)
+    os.replace(tmp_path, path)
 
 
 @torch.no_grad()
