@@ -3,11 +3,10 @@ from __future__ import annotations
 import torch
 import tilelang
 
-from examples.qwen3_int_only.kernels_int_only import linear_i8, quant_v_i8
+from examples.qwen3_int_only.kernels_int_only import embed_f32, linear_i8, quant_v_i8
 from examples.qwen3_int_only.kernels_hybrid import (
     attention_hybrid,
     qk_norm_rope_quant_hybrid,
-    rms_hybrid,
     rms_quant_hybrid,
     silu_hadamard_quant_hybrid,
 )
@@ -88,15 +87,16 @@ class Qwen3HybridModel:
         self.cache_len = cache_len
         self.config = config
         self.block = Qwen3HybridBlock(seq_len, config, cache_len=cache_len)
-        self.final_norm = tilelang.compile(rms_hybrid(seq_len, config.hidden_size), out_idx=[3, 4], target="cuda")
+        self.embed_kernel = tilelang.compile(embed_f32(seq_len, config.hidden_size, config.vocab_size), out_idx=[3], target="cuda")
+        self.lm_head_proj = tilelang.compile(linear_i8(seq_len, config.hidden_size, config.vocab_size), out_idx=[3], target="cuda")
         self.zero_hidden = torch.zeros((seq_len, config.hidden_size), device="cuda", dtype=torch.int32)
         self.cos, self.sin, _ = rope_tables(seq_len + cache_len, config.head_dim, config.rope_theta)
-        self.embed, self.lm_head, self.norm_weight, self.layers = load_packed_qwen3(packed_dir, config, layers=layers)
+        self.embed, self.embed_i8, _embed_i8_q15_scale, self.embed_i8_scale, self.lm_head, self.norm_weight, self.layers, self.lm_head_i8, self.final_i8_scale, _final_i8_qt, self.lm_head_out_qt, self.lm_head_out_scale = load_packed_qwen3(packed_dir, config, layers=layers)
 
     def hidden(self, input_ids, layers=None, cache_kv=None):
         mlp = None
         n_layers = self.config.num_hidden_layers if layers is None else layers
-        residual = self.embed[input_ids].float().contiguous()
+        residual = self.embed_kernel(input_ids.to(torch.int32).contiguous(), self.embed_i8, self.embed_i8_scale)
         x8 = None
         for layer_idx in range(n_layers):
             if layer_idx == 0:
@@ -108,9 +108,10 @@ class Qwen3HybridModel:
                 residual, mlp = self.block(residual, self.layers[layer_idx], self.cos, self.sin, x8=x8)
             else:
                 residual, mlp = self.block(residual, self.layers[layer_idx], self.cos, self.sin, layer_cache[0], layer_cache[1], x8)
-        _hidden, norm = self.final_norm(residual, self.zero_hidden if mlp is None else mlp, self.norm_weight)
-        return norm
+        _residual, x8 = self.block.rms_quant(residual, self.zero_hidden if mlp is None else mlp, self.norm_weight, self.final_i8_scale)
+        return x8
 
     def logits(self, input_ids, layers=None, cache_kv=None):
-        h = self.hidden(input_ids, layers=layers, cache_kv=cache_kv).float() / Q15_16
-        return h @ self.lm_head.T
+        x8 = self.hidden(input_ids, layers=layers, cache_kv=cache_kv)
+        y = self.lm_head_proj(x8, self.lm_head_i8.weight, self.lm_head_out_qt)
+        return y.float() / Q15_16

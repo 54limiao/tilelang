@@ -15,6 +15,44 @@ DYN_SCALE_SHIFT = 25
 DYN_SCALE_ONE = 1 << DYN_SCALE_SHIFT
 
 
+def embed_q15(tokens, hidden, vocab_size):
+    @T.prim_func
+    def main(
+        Ids: T.Tensor((tokens,), "int32"),
+        E: T.Tensor((vocab_size, hidden), "int8"),
+        Scale: T.Tensor((1,), "uint32"),
+        Y: T.Tensor((tokens, hidden), "int32"),
+    ):
+        with T.Kernel(tokens, threads=128) as t:
+            token = T.alloc_local((1,), "int32")
+            scale = T.alloc_local((1,), "int32")
+            token[0] = Ids[t]
+            scale[0] = T.cast(Scale[0], "int32")
+            for c in T.Parallel(hidden):
+                Y[t, c] = T.cast(E[token[0], c], "int32") * scale[0]
+
+    return main
+
+
+def embed_f32(tokens, hidden, vocab_size):
+    @T.prim_func
+    def main(
+        Ids: T.Tensor((tokens,), "int32"),
+        E: T.Tensor((vocab_size, hidden), "int8"),
+        Scale: T.Tensor((1,), "float32"),
+        Y: T.Tensor((tokens, hidden), "float32"),
+    ):
+        with T.Kernel(tokens, threads=128) as t:
+            token = T.alloc_local((1,), "int32")
+            scale = T.alloc_local((1,), "float32")
+            token[0] = Ids[t]
+            scale[0] = Scale[0]
+            for c in T.Parallel(hidden):
+                Y[t, c] = T.cast(E[token[0], c], "float32") * scale[0]
+
+    return main
+
+
 def quant_v_i8(tokens, heads, head_dim):
     @T.prim_func
     def main(
@@ -31,7 +69,7 @@ def quant_v_i8(tokens, heads, head_dim):
     return main
 
 
-def rms_q15(rows, cols, qmax=32767):
+def rms_residual(rows, cols):
     mean_shift = int(math.log2(cols))
 
     @T.prim_func
@@ -39,8 +77,9 @@ def rms_q15(rows, cols, qmax=32767):
         A: T.Tensor((rows, cols), "int32"),
         B: T.Tensor((rows, cols), "int32"),
         RLUT: T.Tensor((1024,), "int16"),
+        QT: T.Tensor((1,), "uint32"),
         Y: T.Tensor((rows, cols), "int32"),
-        N: T.Tensor((rows, cols), "int32"),
+        Q: T.Tensor((rows, cols), "int8"),
     ):
         with T.Kernel(rows, threads=128) as r:
             q = T.alloc_fragment((1, cols), "int32")
@@ -53,15 +92,17 @@ def rms_q15(rows, cols, qmax=32767):
             wk = T.alloc_fragment((1,), "int32")
             inv = T.alloc_fragment((1,), "int32")
             fold = T.alloc_fragment((1,), "int32")
-            qt = T.alloc_fragment((1,), "int32")
+            qt_i8 = T.alloc_fragment((1,), "int32")
             norm = T.alloc_fragment((cols,), "int32")
+            post_qt = T.alloc_fragment((1,), "int32")
+            post_qt[0] = T.cast(QT[0], "int32")
             for c in T.Parallel(cols):
                 Y[r, c] = A[r, c] + B[r, c]
                 q[0, c] = Y[r, c]
                 if q[0, c] < T.int32(0):
                     q[0, c] = T.int32(0) - q[0, c]
             T.reduce_max(q, amax, dim=1, clear=True)
-            scale[0] = T.max((amax[0] + T.int32(qmax - 1)) // T.int32(qmax), T.int32(1))
+            scale[0] = T.max((amax[0] + T.int32(32766)) // T.int32(32767), T.int32(1))
             row_qt[0] = (T.int32(DYN_SCALE_SHIFT) << T.int32(Q_MULTIPLIER_WIDTH)) | T.min(
                 (T.int32(DYN_SCALE_ONE) + (scale[0] >> T.int32(1))) // scale[0],
                 T.int32(MASK),
@@ -86,9 +127,10 @@ def rms_q15(rows, cols, qmax=32767):
                 ns[0] += T.int32(2)
             inv[0] = T.fix.lut_10bit(ss[0], RLUT, scale=((ns[0] - T.int32(7)) << T.int32(Q_MULTIPLIER_WIDTH)) | T.int32(1), out_dtype="int32")
             fold[0] = T.fix.quant(inv[0], scale=SCALE_1024, out_dtype="int32")
-            qt[0] = ((ns[0] >> T.int32(1)) << T.int32(Q_MULTIPLIER_WIDTH)) | ((fold[0] >> T.int32(4)) & T.int32(MASK))
+            qt_i8[0] = ((T.int32(6) + (ns[0] >> T.int32(1))) << T.int32(Q_MULTIPLIER_WIDTH)) | ((fold[0] >> T.int32(4)) & T.int32(MASK))
             for c in T.Parallel(cols):
-                N[r, c] = T.fix.quant(q[0, c], scale=qt[0], out_dtype="int32")
+                norm[c] = T.fix.quant(q[0, c], scale=qt_i8[0], out_dtype="int32")
+                Q[r, c] = T.fix.quant(norm[c], scale=post_qt[0], out_dtype="int8")
 
     return main
 
@@ -103,56 +145,6 @@ def _warp_hadamard_i32(local, buf, thread_elem, warp_size, rounds):
         for j in T.Pipelined(thread_elem, num_stages=1):
             buf[j] = T.tvm_warp_shuffle(0xFFFFFFFF, local[j], other % warp_size, warp_size, warp_size)
             local[j] = T.if_then_else(sign == 0, local[j] + buf[j], buf[j] - local[j])
-
-
-def rope_sq8(seq_len, heads, dim, qmax=127):
-    thread_elem = 8
-    threads = 16
-    thread_round = 3
-    warp_round = 4
-
-    @T.prim_func
-    def main(
-        X: T.Tensor((seq_len * heads, dim), "int32"),
-        COS: T.Tensor((seq_len, dim // 2), "int32"),
-        SIN: T.Tensor((seq_len, dim // 2), "int32"),
-        QT: T.Tensor((heads,), "uint32"),
-        Y: T.Tensor((heads, seq_len, dim), "int8"),
-    ):
-        with T.Kernel(seq_len * heads, threads=threads) as r:
-            tx = T.get_thread_binding(0)
-            t = r // heads
-            h = r - t * heads
-            local = T.alloc_local((thread_elem,), "int32")
-            other_val = T.alloc_local((thread_elem,), "int32")
-            qt = T.alloc_local((1,), "int32")
-            qt[0] = T.cast(QT[h], "int32")
-            for i in T.serial(thread_elem):
-                d = tx * thread_elem + i
-                src_d = T.if_then_else(d < T.int32(dim // 2), d, d - T.int32(dim // 2))
-                x0 = X[r, src_d]
-                x1 = X[r, src_d + dim // 2]
-                c = COS[t, src_d] >> T.int32(8)
-                s = SIN[t, src_d] >> T.int32(8)
-                lo = ((x0 >> T.int32(8)) * c) - ((x1 >> T.int32(8)) * s)
-                hi = ((x0 >> T.int32(8)) * s) + ((x1 >> T.int32(8)) * c)
-                local[i] = T.if_then_else(d < T.int32(dim // 2), lo >> T.int32(8), hi >> T.int32(8))
-            for i in T.serial(thread_round):
-                chunksize = 1 << (i + 1)
-                chunknum = thread_elem // chunksize
-                for j in T.serial(chunknum):
-                    chunkbase = j * chunksize
-                    for k in T.serial(chunksize // 2):
-                        a = local[chunkbase + k]
-                        b = local[chunkbase + k + chunksize // 2]
-                        local[chunkbase + k] = a + b
-                        local[chunkbase + k + chunksize // 2] = local[chunkbase + k] - T.int32(2) * b
-            _warp_hadamard_i32(local, other_val, thread_elem, threads, warp_round)
-            for i in T.serial(thread_elem):
-                v = local[i] * T.int32(22)
-                Y[h, t, tx * thread_elem + i] = T.fix.quant(v, scale=qt[0], out_dtype="int8")
-
-    return main
 
 
 def qk_norm_rope_i8(seq_len, heads, dim, gpb=8):
@@ -266,74 +258,6 @@ def qk_norm_rope_i8(seq_len, heads, dim, gpb=8):
             _warp_hadamard_i32(local, other, thread_elem, lanes, warp_round)
             for i in T.serial(thread_elem):
                 Y[h, t, lane * T.int32(thread_elem) + i] = T.fix.quant(local[i] * T.int32(22), scale=out_qt[0], out_dtype="int8")
-
-    return main
-
-
-def rms_sq8(rows, cols, qmax=127):
-    mean_shift = int(math.log2(cols))
-
-    @T.prim_func
-    def main(
-        A: T.Tensor((rows, cols), "int32"),
-        B: T.Tensor((rows, cols), "int32"),
-        RLUT: T.Tensor((1024,), "int16"),
-        QT: T.Tensor((1,), "uint32"),
-        Y: T.Tensor((rows, cols), "int32"),
-        Q: T.Tensor((rows, cols), "int8"),
-        S: T.Tensor((rows,), "uint32"),
-    ):
-        with T.Kernel(rows, threads=128) as r:
-            q = T.alloc_fragment((1, cols), "int32")
-            xx = T.alloc_fragment((1, cols), "int32")
-            amax = T.alloc_fragment((1,), "int32")
-            scale = T.alloc_fragment((1,), "int32")
-            row_qt = T.alloc_fragment((1,), "int32")
-            ss = T.alloc_fragment((1,), "int32")
-            ns = T.alloc_fragment((1,), "int32")
-            wk = T.alloc_fragment((1,), "int32")
-            inv = T.alloc_fragment((1,), "int32")
-            fold = T.alloc_fragment((1,), "int32")
-            qt = T.alloc_fragment((1,), "int32")
-            norm = T.alloc_fragment((cols,), "int32")
-            post_qt = T.alloc_fragment((1,), "int32")
-            post_qt[0] = T.cast(QT[0], "int32")
-            S[r] = QT[0]
-            for c in T.Parallel(cols):
-                Y[r, c] = A[r, c] + B[r, c]
-                q[0, c] = Y[r, c]
-                if q[0, c] < T.int32(0):
-                    q[0, c] = T.int32(0) - q[0, c]
-            T.reduce_max(q, amax, dim=1, clear=True)
-            scale[0] = T.max((amax[0] + T.int32(32766)) // T.int32(32767), T.int32(1))
-            row_qt[0] = (T.int32(DYN_SCALE_SHIFT) << T.int32(Q_MULTIPLIER_WIDTH)) | T.min(
-                (T.int32(DYN_SCALE_ONE) + (scale[0] >> T.int32(1))) // scale[0],
-                T.int32(MASK),
-            )
-            for c in T.Parallel(cols):
-                q[0, c] = T.fix.quant(Y[r, c], scale=row_qt[0], out_dtype="int16")
-                xx[0, c] = (q[0, c] * q[0, c]) >> T.int32(mean_shift)
-            T.reduce_sum(xx, ss, dim=1, clear=True)
-            ss[0] += T.int32(1)
-            ns[0] = T.int32(0)
-            wk[0] = ss[0]
-            if (wk[0] & T.int32(-65536)) != T.int32(0):
-                ns[0] += T.int32(16)
-                wk[0] = wk[0] >> T.int32(16)
-            if (wk[0] & T.int32(0xFF00)) != T.int32(0):
-                ns[0] += T.int32(8)
-                wk[0] = wk[0] >> T.int32(8)
-            if (wk[0] & T.int32(0xF0)) != T.int32(0):
-                ns[0] += T.int32(4)
-                wk[0] = wk[0] >> T.int32(4)
-            if (wk[0] & T.int32(0xC)) != T.int32(0):
-                ns[0] += T.int32(2)
-            inv[0] = T.fix.lut_10bit(ss[0], RLUT, scale=((ns[0] - T.int32(7)) << T.int32(Q_MULTIPLIER_WIDTH)) | T.int32(1), out_dtype="int32")
-            fold[0] = T.fix.quant(inv[0], scale=SCALE_1024, out_dtype="int32")
-            qt[0] = ((T.int32(6) + (ns[0] >> T.int32(1))) << T.int32(Q_MULTIPLIER_WIDTH)) | ((fold[0] >> T.int32(4)) & T.int32(MASK))
-            for c in T.Parallel(cols):
-                norm[c] = T.fix.quant(q[0, c], scale=qt[0], out_dtype="int32")
-                Q[r, c] = T.fix.quant(norm[c], scale=post_qt[0], out_dtype="int8")
 
     return main
 

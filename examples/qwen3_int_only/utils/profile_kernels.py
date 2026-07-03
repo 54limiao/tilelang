@@ -4,9 +4,11 @@ import json
 import os
 
 import torch
+import tilelang
 from safetensors import safe_open
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from examples.qwen3_int_only.kernels_int_only import embed_f32, embed_q15
 from examples.qwen3_int_only.model_int_only import Q15_16, Qwen3IntOnlyBlock
 from examples.qwen3_int_only.model_hybrid import Qwen3HybridBlock
 from examples.qwen3_int_only.utils.ppl import iter_texts, quant_i8_static_q15_16
@@ -185,7 +187,7 @@ def run_block(block, x, x8, xs8, weights, cos, sin, prof, cache_k=None, cache_v=
     cache_v = block.empty_cache_v if cache_v is None else cache_v
     attn8 = prof.time("attention_i8", lambda: block.attn(q_attn, cache_k, cache_v, k_attn, v_attn, weights.attn_score_qt, block.lut_exp, weights.attn_out_qt), ops["attention_i8"], tc_ops["attention_i8"])
     attn_out = prof.time("linear_i8", lambda: block.o_proj(attn8, weights.o_proj.weight, weights.o_out_qt), ops["linear_i8_o"], tc_ops["linear_i8_o"])
-    h, h8, _hs8 = prof.time("rms_sq8", lambda: block.rms_sq8(x, attn_out, block.lut_rsqrt, weights.post_mlp_i8_qt))
+    h, h8 = prof.time("rms_residual", lambda: block.rms_residual(x, attn_out, block.lut_rsqrt, weights.post_mlp_i8_qt))
     gate_up = prof.time("linear_i8", lambda: block.gate_up_proj(h8, weights.gate_up_proj.weight, weights.gate_up_out_qt), ops["linear_i8_gate_up"], tc_ops["linear_i8_gate_up"])
     gate = gate_up[:, : cfg.intermediate_size].contiguous()
     up = gate_up[:, cfg.intermediate_size :].contiguous()
@@ -250,7 +252,8 @@ def main():
     seq_len -= seq_len % 32
     ids = torch.tensor(ids[:seq_len], device="cuda", dtype=torch.long)
     _packed_r1, packed_r2 = packed_flags(args.packed_dir)
-    embed, _, _, weights = load_packed_qwen3(args.packed_dir, config)
+    packed = load_packed_qwen3(args.packed_dir, config)
+    embed, embed_i8, embed_i8_q15_scale, embed_i8_fp32_scale, weights = packed[0], packed[1], packed[2], packed[3], packed[6]
     if args.backend == "int-only":
         weights = int_only_norm_weights(weights)
     r2_mats = load_r2_matrices(args.packed_dir, args.layers)
@@ -264,24 +267,27 @@ def main():
             save_cached_kv(cache_path, cache_kv, cache_len)
             print(f"wrote profile cache kv: {cache_path}")
     block = Qwen3HybridBlock(seq_len, config, cache_len=cache_len) if args.backend == "hybrid" else Qwen3IntOnlyBlock(seq_len, config, cache_len=cache_len)
+    embed_q15_kernel = tilelang.compile(embed_q15(seq_len, config.hidden_size, config.vocab_size), out_idx=[3], target="cuda")
+    embed_f32_kernel = tilelang.compile(embed_f32(seq_len, config.hidden_size, config.vocab_size), out_idx=[3], target="cuda")
     cos, sin, _ = rope_tables(seq_len + cache_len, config.head_dim, config.rope_theta) if args.backend == "hybrid" else rope_tables_q15_16(seq_len + cache_len, config.head_dim, config.rope_theta)
     if args.backend == "hybrid":
         cos = cos.contiguous()
         sin = sin.contiguous()
     def run_layers(prof):
         if args.backend == "hybrid":
-            residual = embed[ids].float().contiguous()
+            residual = prof.time("embed_f32", lambda: embed_f32_kernel(ids.to(torch.int32).contiguous(), embed_i8, embed_i8_fp32_scale))
             _res, x8 = prof.time(
                 "rms_quant_hybrid",
                 lambda: block.rms_quant(residual, None, weights[0].input_layernorm, weights[0].input_qkv_i8_scale),
             )
             xs8 = None
         else:
-            residual = q15_16(embed[ids])
-            _res, x8, xs8 = prof.time(
-                "rms_sq8",
-                lambda: block.rms_sq8(residual, block.zero_hidden, block.lut_rsqrt, weights[0].input_qkv_i8_qt),
+            residual = prof.time("embed_q15", lambda: embed_q15_kernel(ids.to(torch.int32).contiguous(), embed_i8, embed_i8_q15_scale))
+            _res, x8 = prof.time(
+                "rms_residual",
+                lambda: block.rms_residual(residual, block.zero_hidden, block.lut_rsqrt, weights[0].input_qkv_i8_qt),
             )
+            xs8 = None
         mlp = None
         for layer_idx in range(args.layers):
             if layer_idx:
@@ -291,10 +297,11 @@ def main():
                         lambda: block.rms_quant(residual, mlp, weights[layer_idx].input_layernorm, weights[layer_idx].input_qkv_i8_scale),
                     )
                 else:
-                    residual, x8, xs8 = prof.time(
-                        "rms_sq8",
-                        lambda: block.rms_sq8(residual, mlp, block.lut_rsqrt, weights[layer_idx].input_qkv_i8_qt),
+                    residual, x8 = prof.time(
+                        "rms_residual",
+                        lambda: block.rms_residual(residual, mlp, block.lut_rsqrt, weights[layer_idx].input_qkv_i8_qt),
                     )
+                    xs8 = None
             cache_k, cache_v = cache_kv[layer_idx]
             if args.backend == "hybrid":
                 residual, mlp = run_block_hybrid(block, residual, x8, weights[layer_idx], cos, sin, prof, cache_k, cache_v)

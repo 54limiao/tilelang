@@ -15,6 +15,7 @@ from examples.qwen3_int_only.utils import (
     Qwen3Config,
     SafeTensorReader,
     per_channel_i8_weight,
+    per_tensor_i8_weight,
     q15_16,
     static_scale_from_amax,
     hadamard_rotation,
@@ -171,6 +172,9 @@ def current_pack_metadata(path, args, config):
             "layers.0.attn_i8.scale",
             "layers.0.post_mlp_i8.scale",
             "layers.0.gated_mlp_i8.scale",
+            "model.final_i8.scale",
+            "lm_head.i8.weight",
+            "lm_head.i8.scale",
             "quarot.r1",
             "quarot.r4",
             "layers.0.r2",
@@ -283,6 +287,12 @@ def main():
         tensors["model.embed_tokens.weight"] = embed.cpu().contiguous()
         tensors["lm_head.weight"] = lm_head.cpu().contiguous()
         tensors["model.norm.weight"] = final_norm.cpu().contiguous()
+        embed_i8, embed_i8_scale = per_tensor_i8_weight(embed.to(torch.float32))
+        tensors["model.embed_tokens.i8.weight"] = embed_i8.cpu().contiguous()
+        tensors["model.embed_tokens.i8.scale"] = embed_i8_scale.cpu().reshape(1).contiguous()
+        lm_head_i8, lm_head_i8_scale = per_channel_i8_weight(lm_head.to(torch.float32))
+        tensors["lm_head.i8.weight"] = lm_head_i8.cpu().contiguous()
+        tensors["lm_head.i8.scale"] = lm_head_i8_scale.cpu().contiguous()
         calib_x = None
         cos = sin = None
         if calib_tokens:
@@ -344,6 +354,9 @@ def main():
                 calib_x = next_x
                 for name, scale in scales_from_amax(stats_amax).items():
                     tensors[f"{dst}.{name}.scale"] = scale.cpu().contiguous()
+        if calib_x is not None:
+            final_h = rmsnorm_torch(calib_x, final_norm)
+            tensors["model.final_i8.scale"] = scale_from_amax(q15_16(final_h[:, args.calib_prefix_tokens:]).abs().amax().reshape(1), 127).cpu().contiguous()
 
     save_file(
         tensors,

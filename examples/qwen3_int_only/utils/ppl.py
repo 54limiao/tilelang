@@ -181,7 +181,8 @@ class Qwen3FakeQuantModel:
         self.cache_len = cache_len
         self.config = config
         self.cos, self.sin, _ = rope_tables(seq_len + cache_len, config.head_dim, config.rope_theta)
-        self.embed, self.lm_head, self.norm_weight, self.layers = load_packed_qwen3(packed_dir, config, layers=layers)
+        packed = load_packed_qwen3(packed_dir, config, layers=layers)
+        self.embed, self.lm_head, self.norm_weight, self.layers = packed[0], packed[4], packed[5], packed[6]
 
     def qk_norm_rope_qdq(self, x, weight, cos, sin, heads, scale):
         cfg = self.config

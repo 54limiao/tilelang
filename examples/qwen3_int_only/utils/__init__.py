@@ -162,6 +162,13 @@ def per_tensor_i16_weight(w):
     return q, scale.to(torch.float32)
 
 
+def per_tensor_i8_weight(w):
+    w = norm_to_fp32(w)
+    scale = w.abs().amax().clamp(min=1e-6) / 127.0
+    q = torch.round(w / scale).clamp(-128, 127).to(torch.int8).contiguous()
+    return q, scale.to(torch.float32)
+
+
 def i16_weight_to_i8_qt(weight_scale, out_scale):
     return pack_qt(weight_scale.to(torch.float64) / (out_scale.to(torch.float64) * 2.0))
 
@@ -360,7 +367,34 @@ def load_packed_qwen3(packed_dir, config=QWEN3_0_6B, device="cuda", layers=None)
                     post_mlp_i8_qt=optional_qt(f"{p}.post_mlp_i8.scale"),
                 )
             )
-        return tensor("model.embed_tokens.weight"), tensor("lm_head.weight"), norm_tensor("model.norm.weight"), blocks
+        final_i8_scale = optional_scale("model.final_i8.scale")
+        final_i8_qt = unit_i16_weight_to_i8_qt(final_i8_scale)
+        lm_head_i8 = linear("lm_head.i8")
+        lm_head_out_scale = final_i8_scale.to(torch.float64) * lm_head_i8.scale.to(torch.float64)
+        lm_head_out_qt = pack_qt(scale_to_q15(final_i8_scale).to(torch.float64) * lm_head_i8.scale.to(torch.float64))
+        return (
+            tensor("model.embed_tokens.weight"),
+            tensor("model.embed_tokens.i8.weight"),
+            scale_to_q15(tensor("model.embed_tokens.i8.scale")).reshape(1),
+            scale_to_fp32(tensor("model.embed_tokens.i8.scale")).reshape(1),
+            tensor("lm_head.weight"),
+            norm_tensor("model.norm.weight"),
+            blocks,
+            lm_head_i8,
+            final_i8_scale,
+            final_i8_qt,
+            lm_head_out_qt,
+            lm_head_out_scale.to(torch.float32),
+        )
+
+
+def load_embed_i8(packed_dir, device="cuda"):
+    path = f"{packed_dir}/qwen3_int_only.safetensors"
+    with safe_open(path, framework="pt", device=device) as f:
+        keys = set(f.keys())
+        if "model.embed_tokens.i8.weight" not in keys:
+            return None, None
+        return f.get_tensor("model.embed_tokens.i8.weight"), scale_to_q15(f.get_tensor("model.embed_tokens.i8.scale")).reshape(1)
 
 
 def load_embed_tokens(model_dir="/publicdata/huggingface.co/Qwen/Qwen3-0.6B", device="cuda"):

@@ -55,40 +55,6 @@ def rms_quant_hybrid(rows, cols):
     return main
 
 
-def rms_hybrid(rows, cols):
-    inv_cols = 1.0 / cols
-
-    @T.prim_func
-    def main(
-        A: T.Tensor((rows, cols), "float32"),
-        B: T.Tensor((rows, cols), "int32"),
-        W: T.Tensor((cols,), "float32"),
-        Y: T.Tensor((rows, cols), "float32"),
-        N: T.Tensor((rows, cols), "int32"),
-    ):
-        with T.Kernel(rows, threads=128) as r:
-            x = T.alloc_fragment((1, cols), "float32")
-            xx = T.alloc_fragment((1, cols), "float32")
-            ss = T.alloc_fragment((1,), "float32")
-            inv = T.alloc_fragment((1,), "float32")
-            for c in T.Parallel(cols):
-                x[0, c] = A[r, c] + T.cast(B[r, c], "float32") / T.float32(Q15_16_F)
-                Y[r, c] = x[0, c]
-                xx[0, c] = x[0, c] * x[0, c] * T.float32(inv_cols)
-            T.reduce_sum(xx, ss, dim=1, clear=True)
-            inv[0] = T.rsqrt(ss[0] + T.float32(1.0e-6))
-            for c in T.Parallel(cols):
-                N[r, c] = T.cast(
-                    T.round(
-                        x[0, c] * inv[0] * W[c] * T.float32(Q15_16_F),
-                        rounding_mode="ties-away-from-zero",
-                    ),
-                    "int32",
-                )
-
-    return main
-
-
 def qk_norm_rope_quant_hybrid(seq_len, heads, dim, gpb=8):
     thread_elem = 8
     lanes = 16
